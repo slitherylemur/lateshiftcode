@@ -1,0 +1,40 @@
+name: Deploy Slither Cloud
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: slither-cloud-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy hosted T3 UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.T3CLOUD_DEPLOY_SSH_KEY }}
+
+      - name: Trust deploy host
+        env:
+          DEPLOY_HOST: ${{ secrets.T3CLOUD_DEPLOY_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy to t3cloud
+        env:
+          DEPLOY_HOST: ${{ secrets.T3CLOUD_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.T3CLOUD_DEPLOY_USER }}
+          PRODUCTION_DIR: ${{ secrets.T3CLOUD_PRODUCTION_DIR }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" "cd \"$PRODUCTION_DIR\" && ./scripts/deploy-slither-cloud.sh"
