@@ -298,6 +298,11 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:server:process-resource-history",
       tag: WS_METHODS.serverGetProcessResourceHistory,
     }),
+    usageBudget: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:usage-budget",
+      tag: WS_METHODS.serverGetUsageBudget,
+      refreshIntervalMs: 30_000,
+    }),
     configProjection,
     welcome: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "environment-data:server:welcome",

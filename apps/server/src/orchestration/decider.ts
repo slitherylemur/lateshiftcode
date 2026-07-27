@@ -8,6 +8,7 @@ import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import type * as PlatformError from "effect/PlatformError";
+import * as Option from "effect/Option";
 
 import { OrchestrationCommandInvariantError } from "./Errors.ts";
 import {
@@ -21,6 +22,7 @@ import {
   requireThreadNotArchived,
 } from "./commandInvariants.ts";
 import { projectEvent } from "./projector.ts";
+import { TurnBudgetGuard } from "./Services/TurnBudgetGuard.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -765,6 +767,26 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           commandType: command.type,
           detail: `Proposed plan '${sourceProposedPlan?.planId}' belongs to thread '${sourceThread.id}' in a different project.`,
         });
+      }
+      // LateShift Cloud: per-provider soft budget gate. Consulted here so every
+      // dispatch path (WS RPC, HTTP dispatch, CLI, auto-clone) hits the same
+      // choke point that enforces T3CODE_MAX_PROJECTS. Read via serviceOption so
+      // builds/tests without the guard layer simply skip gating.
+      const budgetGuard = yield* Effect.serviceOption(TurnBudgetGuard);
+      if (Option.isSome(budgetGuard)) {
+        const budgetInstanceId =
+          command.modelSelection?.instanceId ?? targetThread.modelSelection.instanceId;
+        const budgetNowIso = yield* nowIso;
+        const budgetRejection = yield* budgetGuard.value.evaluateTurnStart({
+          instanceId: budgetInstanceId,
+          nowIso: budgetNowIso,
+        });
+        if (Option.isSome(budgetRejection)) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: budgetRejection.value,
+          });
+        }
       }
       const userMessageEvent: Omit<OrchestrationEvent, "sequence"> = {
         ...(yield* withEventBase({

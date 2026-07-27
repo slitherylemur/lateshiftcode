@@ -3,7 +3,7 @@ import { SettingsIcon } from "lucide-react";
 import { memo, useCallback } from "react";
 import { Link, useNavigate } from "@tanstack/react-router";
 
-import { APP_STAGE_LABEL } from "../../branding";
+import { APP_STAGE_LABEL, LSC_BRAND_NAME } from "../../branding";
 import { cn } from "../../lib/utils";
 import { primaryServerConfigAtom } from "../../state/server";
 import { resolveSidebarStageBadgeLabel } from "../Sidebar.logic";
@@ -17,6 +17,7 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "../ui/sidebar";
+import { SidebarAccountUsage } from "./SidebarAccountUsage";
 import { SidebarProviderUpdatePill } from "./SidebarProviderUpdatePill";
 import { SidebarUpdatePill } from "./SidebarUpdatePill";
 
@@ -49,6 +50,28 @@ export const SidebarChromeHeader = memo(function SidebarChromeHeader({
 });
 
 function SidebarBrand({ onBackdrop }: { onBackdrop: boolean }) {
+  if (LSC_BRAND_NAME !== null) {
+    return (
+      <Link
+        aria-label="Go to threads"
+        className={cn(
+          "sidebar-brand relative z-10 ml-[var(--workspace-titlebar-content-left)] h-7 w-fit min-w-0 shrink-0 items-center gap-1.5 overflow-hidden rounded-md outline-hidden ring-ring focus-visible:ring-2",
+          onBackdrop ? "text-white" : "text-foreground",
+        )}
+        to="/"
+      >
+        <img alt="" className="h-4 w-4 shrink-0 rounded-sm" src="/lateshift-logo.png" />
+        <span
+          className={cn(
+            "truncate text-sm font-semibold tracking-tight",
+            onBackdrop ? "text-white" : "text-foreground",
+          )}
+        >
+          {LSC_BRAND_NAME}
+        </span>
+      </Link>
+    );
+  }
   return (
     <Link
       aria-label="Go to threads"
@@ -111,6 +134,7 @@ export const SidebarChromeFooter = memo(function SidebarChromeFooter() {
     <SidebarFooter className="p-2">
       <SidebarProviderUpdatePill />
       <SidebarUpdatePill />
+      <SidebarAccountUsage />
       <SidebarMenu>
         <SidebarMenuItem>
           <SidebarMenuButton

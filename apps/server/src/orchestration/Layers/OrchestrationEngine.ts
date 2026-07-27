@@ -38,6 +38,7 @@ import {
   type OrchestrationProjectorDecodeError,
 } from "../Errors.ts";
 import { decideOrchestrationCommand } from "../decider.ts";
+import { TurnBudgetGuard } from "../Services/TurnBudgetGuard.ts";
 import { createEmptyReadModel, projectEvent } from "../projector.ts";
 import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
@@ -83,6 +84,9 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const projectionPipeline = yield* OrchestrationProjectionPipeline;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const crypto = yield* Crypto.Crypto;
+  // LateShift Cloud budget gate, optional: present only when TurnBudgetGuardLive
+  // is wired into this runtime. When absent, turn budget gating is disabled.
+  const budgetGuard = yield* Effect.serviceOption(TurnBudgetGuard);
 
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   let commandReadModel = createEmptyReadModel(yield* nowIso);
@@ -150,11 +154,15 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           });
         }
 
-        const eventBase = yield* decideOrchestrationCommand({
+        const decideEffect = decideOrchestrationCommand({
           command: envelope.command,
           readModel: commandReadModel,
-        }).pipe(
-          Effect.provideService(Crypto.Crypto, crypto),
+        }).pipe(Effect.provideService(Crypto.Crypto, crypto));
+        const eventBase = yield* (
+          Option.isSome(budgetGuard)
+            ? decideEffect.pipe(Effect.provideService(TurnBudgetGuard, budgetGuard.value))
+            : decideEffect
+        ).pipe(
           Effect.mapError((cause) =>
             isOrchestrationCommandInvariantError(cause)
               ? cause
