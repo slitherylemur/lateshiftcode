@@ -13,12 +13,39 @@ export const CONFIG_PATH = `${LATESHIFT_ROOT}/portal.config.json`;
 export const NAME_RE = /^[a-z0-9-]{2,20}$/;
 export const TS_LOGIN_RE = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$/;
 
+// Positive number or null (absence / non-positive is "no cap configured").
+function posNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/**
+ * portal.config.json (all fields optional):
+ *   adminLogins        string[]  — tailnet logins that are portal admins
+ *   sharedWorkspaceUrl string    — origin of the shared production workspace
+ *   sharedStateDb      string    — path to the shared instance state DB
+ *   subscriptionLimits object    — provider spend caps used by the admin
+ *                                   subscription-totals panel. Keys:
+ *       claude    usd/month cap for Claude-backed usage    (optional)
+ *       codex     usd/month cap for Codex/OpenAI usage      (optional)
+ *       claude5h  usd cap per 5-hour session window, Claude  (optional)
+ *       codex5h   usd cap per 5-hour session window, Codex   (optional)
+ *   Absence of subscriptionLimits (or any key) is tolerated: the panel shows
+ *   raw totals without a percentage ring for the missing cap.
+ */
 export function loadConfig() {
   const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+  const sl = raw.subscriptionLimits && typeof raw.subscriptionLimits === "object" ? raw.subscriptionLimits : {};
   return {
     adminLogins: Array.isArray(raw.adminLogins) ? raw.adminLogins : [],
     sharedWorkspaceUrl: raw.sharedWorkspaceUrl || null,
     sharedStateDb: raw.sharedStateDb || null,
+    subscriptionLimits: {
+      claude: posNum(sl.claude),
+      codex: posNum(sl.codex),
+      claude5h: posNum(sl.claude5h),
+      codex5h: posNum(sl.codex5h),
+    },
   };
 }
 
