@@ -33,6 +33,18 @@ export const TurnUsageRecord = Schema.Struct({
 export type TurnUsageRecord = typeof TurnUsageRecord.Type;
 
 /**
+ * TurnUsageLedgerRow - Slim projection of a ledger row for budget aggregation
+ * (provider, cost, completion time). Read by month-to-date / session-window
+ * budget queries and the LateShift usage RPC.
+ */
+export const TurnUsageLedgerRow = Schema.Struct({
+  providerName: Schema.NullOr(Schema.String),
+  totalCostUsd: Schema.NullOr(Schema.Number),
+  completedAt: IsoDateTime,
+});
+export type TurnUsageLedgerRow = typeof TurnUsageLedgerRow.Type;
+
+/**
  * TurnUsageRepositoryShape - Service API for the per-turn usage ledger.
  */
 export interface TurnUsageRepositoryShape {
@@ -42,6 +54,14 @@ export interface TurnUsageRepositoryShape {
    * runtime events are ignored (INSERT OR IGNORE on the unique event_id).
    */
   readonly insert: (row: TurnUsageRecord) => Effect.Effect<void, ProjectionRepositoryError>;
+
+  /**
+   * Ledger rows whose `completed_at` is >= `sinceIso`, ordered oldest-first.
+   * Used to aggregate month-to-date and rolling 5-hour-session budget totals.
+   */
+  readonly listCompletedSince: (
+    sinceIso: string,
+  ) => Effect.Effect<ReadonlyArray<TurnUsageLedgerRow>, ProjectionRepositoryError>;
 }
 
 /**
