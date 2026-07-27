@@ -202,6 +202,53 @@ Notable contents:
 The admin's personal scratch area is simply their own instance's default
 project area (nothing extra is provisioned for it).
 
+### Shared-repo git identity (owner override)
+
+Per-instance GitHub identity (above) is right for a user's **own** repos, but a
+checkout under `/home/dev/shared/` is opened by **several** users' instances at
+once. By the owner's decision, git activity in shared repos is attributed to,
+and pushed as, the **owner** (`slitherylemur`) rather than each sharer — the AI
+chat is visible to every sharer anyway, so per-person attribution there adds
+nothing, and it means **no teammate needs push rights** to the owner's repos.
+
+This is enforced with **local (per-repo) git config**, which overrides the
+per-instance `GIT_CONFIG_GLOBAL` inside every sandbox:
+
+- `user.name` = `slitherylemur`, `user.email` =
+  `67226924+slitherylemur@users.noreply.github.com` (owner's GitHub no-reply,
+  id from the public API).
+- `credential.helper` is **reset** (an empty helper clears the inherited list,
+  including the per-instance `gh` helper) and set to **only**
+  `store --file=/home/dev/shared/.lsc-git-credentials`, so pushes use the
+  shared owner token regardless of who the sandbox's `gh` CLI is logged in as.
+  `gh` itself stays per-user (it reads `GH_CONFIG_DIR`, not git's helpers).
+
+`bin/lsc-shared-git-setup <repo-dir>` applies this (idempotent) and is called
+**best-effort** by `t3user share` for any granted path under `/home/dev/shared`
+(a failure — e.g. the path is not a git repo — warns but never fails the share).
+
+**The shared token** lives in `/home/dev/shared/.lsc-git-credentials`
+(git-credential-store format, `https://x-access-token:<TOKEN>@github.com`, mode
+`600` `dev:dev`, created **empty**; pushes fail until a token is installed).
+The owner installs it with:
+
+```sh
+/home/dev/services/lateshift/bin/lsc-shared-git-token <token>
+# or, to be prompted (input hidden):
+/home/dev/services/lateshift/bin/lsc-shared-git-token
+```
+
+It validates the token against `api.github.com/user` (rejecting an invalid one
+with no write) and stores it atomically at mode `600`.
+
+> **Security tradeoff — read this.** `/home/dev/shared` is a `ReadWritePath` in
+> **every** sharer's sandbox, so **any sharer's instance can read this token**.
+> Whatever the token can do, every sharer can do. Use a GitHub **fine-grained
+> PAT scoped to only the shared repositories**, granting only *Contents:
+> read/write* and *Pull requests: read/write*. Do **not** use a classic PAT or
+> any account-wide token here — a leak would expose far more than the shared
+> repos.
+
 ## Budgets
 
 Two independent budget mechanisms:
