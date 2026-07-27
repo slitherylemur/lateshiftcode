@@ -216,6 +216,16 @@ export function readEnvironmentSupportsSnooze(environmentId: EnvironmentId): boo
   );
 }
 
+/** Whether the environment's server can transcribe recorded audio (an OpenAI
+    transcription credential is configured). Missing capability decodes to
+    absent/false, so clients hide the voice-input mic button when unsupported. */
+export function readEnvironmentSupportsTranscription(environmentId: EnvironmentId): boolean {
+  return (
+    appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId)?.environment.capabilities
+      .speechTranscription === true
+  );
+}
+
 export function readThreadDetail(ref: ScopedThreadRef): EnvironmentThread | null {
   return appAtomRegistry.get(environmentThreadDetails.detailAtom(ref));
 }

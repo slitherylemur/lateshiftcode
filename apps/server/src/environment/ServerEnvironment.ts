@@ -11,6 +11,7 @@ import * as Schema from "effect/Schema";
 import packageJson from "../../package.json" with { type: "json" };
 import { resolveServerSelfUpdateCapability } from "../cloud/selfUpdate.ts";
 import * as ServerConfig from "../config.ts";
+import { resolveOpenAiApiKey } from "../transcription/openAiApiKey.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import { resolveServerEnvironmentLabel } from "./ServerEnvironmentLabel.ts";
 
@@ -128,6 +129,9 @@ export const make = Effect.gen(function* () {
   const serverSelfUpdate = yield* resolveServerSelfUpdateCapability({
     desktopManaged: serverConfig.mode === "desktop",
   });
+  // Feature-detect voice transcription once at startup: present only when a
+  // usable OpenAI API key is resolvable from the environment or Codex auth.
+  const openAiApiKey = yield* resolveOpenAiApiKey;
 
   const descriptor: ExecutionEnvironmentDescriptor = {
     environmentId,
@@ -142,6 +146,7 @@ export const make = Effect.gen(function* () {
       connectionProbe: true,
       threadSettlement: true,
       threadSnooze: true,
+      speechTranscription: openAiApiKey !== null,
       ...(serverSelfUpdate === null ? {} : { serverSelfUpdate }),
     },
   };

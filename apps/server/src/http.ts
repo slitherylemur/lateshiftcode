@@ -15,6 +15,7 @@ import { cast } from "effect/Function";
 import {
   HttpBody,
   HttpClient,
+  HttpClientRequest,
   HttpClientResponse,
   HttpRouter,
   HttpServerResponse,
@@ -37,6 +38,7 @@ import {
 } from "./auth/http.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import { browserApiCorsAllowedHeaders, browserApiCorsAllowedMethods } from "./httpCors.ts";
+import { resolveOpenAiApiKey } from "./transcription/openAiApiKey.ts";
 
 const OTLP_TRACES_PROXY_PATH = "/api/observability/v1/traces";
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
@@ -160,6 +162,150 @@ export const otlpTracesProxyRouteLayer = HttpRouter.add(
           HttpServerResponse.text("Trace export failed.", { status: 502 }),
         ),
       );
+  }).pipe(
+    Effect.catchTags({
+      EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
+      EnvironmentInternalError: HttpServerRespondable.toResponse,
+      EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
+    }),
+  ),
+);
+
+const TRANSCRIPTION_AUDIO_PATH = "/api/transcription/audio";
+const OPENAI_TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions";
+const OPENAI_TRANSCRIPTION_MODEL = "gpt-4o-transcribe";
+// OpenAI's audio transcription API rejects payloads larger than 25 MB.
+const MAX_TRANSCRIPTION_AUDIO_BYTES = 25 * 1024 * 1024;
+const TRANSCRIPTION_REQUEST_TIMEOUT = "60 seconds";
+
+// Container/codec combinations OpenAI accepts, mapped to the file extension we
+// present so the API can sniff the format from the multipart filename.
+const TRANSCRIBABLE_AUDIO_TYPES = new Map<string, string>([
+  ["audio/webm", "webm"],
+  ["audio/ogg", "ogg"],
+  ["audio/oga", "ogg"],
+  ["audio/mp4", "mp4"],
+  ["audio/m4a", "m4a"],
+  ["audio/x-m4a", "m4a"],
+  ["audio/mpeg", "mp3"],
+  ["audio/mpga", "mp3"],
+  ["audio/wav", "wav"],
+  ["audio/x-wav", "wav"],
+  ["audio/flac", "flac"],
+]);
+
+function transcriptionErrorResponse(status: number, code: string, message: string) {
+  return HttpServerResponse.jsonUnsafe({ error: { code, message } }, { status });
+}
+
+function extractTranscriptText(body: unknown): string | null {
+  if (typeof body !== "object" || body === null) {
+    return null;
+  }
+  const text = (body as { text?: unknown }).text;
+  return typeof text === "string" ? text : null;
+}
+
+// Proxies a recorded audio blob to OpenAI's transcription API so the browser
+// never holds the API key. The web client persists the recording locally and
+// retries on any non-2xx here, so failures return a typed JSON error body
+// ({ error: { code, message } }) rather than crashing the composer.
+export const transcriptionAudioRouteLayer = HttpRouter.add(
+  "POST",
+  TRANSCRIPTION_AUDIO_PATH,
+  Effect.gen(function* () {
+    yield* authenticateRawRouteWithScope(AuthOrchestrationOperateScope);
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const httpClient = yield* HttpClient.HttpClient;
+
+    const apiKey = yield* resolveOpenAiApiKey;
+    if (apiKey === null) {
+      return transcriptionErrorResponse(
+        503,
+        "transcription_not_configured",
+        "Voice transcription is not configured on this server.",
+      );
+    }
+
+    const mimeType =
+      (request.headers["content-type"] ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
+    const extension = TRANSCRIBABLE_AUDIO_TYPES.get(mimeType);
+    if (extension === undefined) {
+      return transcriptionErrorResponse(
+        415,
+        "unsupported_media_type",
+        `Unsupported audio content type: ${mimeType.length > 0 ? mimeType : "unknown"}.`,
+      );
+    }
+
+    // Reject oversized uploads by declared length before buffering the body.
+    const declaredLength = Number(request.headers["content-length"]);
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_TRANSCRIPTION_AUDIO_BYTES) {
+      return transcriptionErrorResponse(
+        413,
+        "audio_too_large",
+        "The recording exceeds the 25 MB transcription limit.",
+      );
+    }
+
+    const audioBuffer = yield* request.arrayBuffer.pipe(
+      Effect.orElseSucceed((): ArrayBuffer | null => null),
+    );
+    if (audioBuffer === null) {
+      return transcriptionErrorResponse(400, "invalid_audio", "Could not read the audio payload.");
+    }
+    const audioBytes = new Uint8Array(audioBuffer);
+    if (audioBytes.byteLength === 0) {
+      return transcriptionErrorResponse(400, "invalid_audio", "The audio payload was empty.");
+    }
+    if (audioBytes.byteLength > MAX_TRANSCRIPTION_AUDIO_BYTES) {
+      return transcriptionErrorResponse(
+        413,
+        "audio_too_large",
+        "The recording exceeds the 25 MB transcription limit.",
+      );
+    }
+
+    const formData = new FormData();
+    formData.append("model", OPENAI_TRANSCRIPTION_MODEL);
+    formData.append("response_format", "json");
+    formData.append("file", new Blob([audioBytes], { type: mimeType }), `audio.${extension}`);
+
+    const openAiRequest = HttpClientRequest.post(OPENAI_TRANSCRIPTION_URL).pipe(
+      HttpClientRequest.bearerToken(apiKey),
+      HttpClientRequest.bodyFormData(formData),
+    );
+
+    const outcome = yield* httpClient.execute(openAiRequest).pipe(
+      Effect.flatMap(HttpClientResponse.filterStatusOk),
+      Effect.flatMap((response) => response.json),
+      Effect.timeout(TRANSCRIPTION_REQUEST_TIMEOUT),
+      Effect.map((body): { readonly ok: true; readonly body: unknown } => ({ ok: true, body })),
+      Effect.catch((cause) =>
+        Effect.logWarning("OpenAI transcription request failed", { cause }).pipe(
+          Effect.as({ ok: false as const }),
+        ),
+      ),
+    );
+
+    if (!outcome.ok) {
+      return transcriptionErrorResponse(
+        502,
+        "transcription_failed",
+        "The transcription service did not respond successfully.",
+      );
+    }
+
+    const text = extractTranscriptText(outcome.body);
+    if (text === null) {
+      return transcriptionErrorResponse(
+        502,
+        "transcription_failed",
+        "The transcription service returned an unexpected response.",
+      );
+    }
+
+    return HttpServerResponse.jsonUnsafe({ text }, { status: 200 });
   }).pipe(
     Effect.catchTags({
       EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,

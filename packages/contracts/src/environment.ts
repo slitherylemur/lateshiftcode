@@ -51,6 +51,12 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
       servers that must be relaunched manually (dev checkouts, Windows
       foreground runs, pre-update servers). */
   serverSelfUpdate: Schema.optionalKey(ServerSelfUpdateCapability),
+  /** Server can transcribe recorded audio to text because an OpenAI
+      transcription credential is configured (OPENAI_API_KEY env var, or a
+      usable API key in the Codex CLI auth file). Absent/false when no usable
+      key exists, so clients hide the voice-input mic button (version-skew and
+      not-configured share the same "treat missing as unsupported" contract). */
+  speechTranscription: Schema.optionalKey(Schema.Boolean),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 
