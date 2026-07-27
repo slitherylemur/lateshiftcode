@@ -11,7 +11,10 @@ import { execFile } from "node:child_process";
 import { NAME_RE, TS_LOGIN_RE } from "./registry.mjs";
 
 const T3USER = "/home/dev/services/lateshift/bin/t3user";
-const SHARED_SERVER_BIN = "/home/dev/services/lateshift/checkout/apps/server/dist/bin.mjs";
+// Stock production binary — NEVER the patched checkout: running the checkout
+// build against production's default base dir would apply fork migrations to
+// production's state database.
+const SHARED_SERVER_BIN = "/usr/bin/t3";
 
 const SAFE_UNIT_RE = /^t3code@[a-z0-9-]{2,20}(\.service)?$/;
 
@@ -93,8 +96,7 @@ export async function mintSharedPairing(name, sharedWorkspaceUrl) {
     return { ok: false, url: null, detail: "shared workspace not configured" };
   }
   const baseUrl = sharedWorkspaceUrl.replace(/\/+$/, "");
-  const r = await run("node", [
-    SHARED_SERVER_BIN,
+  const r = await run(SHARED_SERVER_BIN, [
     "auth",
     "pairing",
     "create",
@@ -128,16 +130,39 @@ export async function addUser({ name, tsLogin, projectLimit }) {
   return run(T3USER, args, { timeoutMs: 180_000 });
 }
 
+export function assertBudget(value) {
+  const n = Number(value);
+  if (Number.isFinite(n) && n >= 0 && n <= 100000) return Math.round(n * 100) / 100;
+  throw new Error("budget must be a number 0-100000 (0 = unlimited)");
+}
+
+const SHARED_PATH_RE = /^\/home\/dev\/(shared|projects)\/[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
+
+export function assertSharedPath(path) {
+  if (typeof path === "string" && path.length <= 300 && SHARED_PATH_RE.test(path)) return path;
+  throw new Error("shared path must be under /home/dev/shared/ or /home/dev/projects/");
+}
+
 /** t3user set <name> <key> <value> (allowed keys enforced by the CLI too). */
 export async function setUserField(name, key, value) {
-  if (!["projectLimit", "sharedAccess", "tsLogin", "admin"].includes(key))
+  if (!["projectLimit", "sharedAccess", "tsLogin", "admin", "monthlyBudgetUsd"].includes(key))
     throw new Error(`key '${key}' is not settable`);
   let v;
   if (key === "projectLimit") v = String(assertLimit(value));
+  else if (key === "monthlyBudgetUsd") v = String(assertBudget(value));
   else if (key === "sharedAccess" || key === "admin")
     v = value === true || value === "true" ? "true" : "false";
   else v = assertTsLogin(value);
   return run(T3USER, ["set", assertName(name), key, v]);
+}
+
+/** t3user share/unshare <name> <path> — grant or revoke a shared project dir. */
+export async function shareProject(name, path) {
+  return run(T3USER, ["share", assertName(name), assertSharedPath(path)], { timeoutMs: 60_000 });
+}
+
+export async function unshareProject(name, path) {
+  return run(T3USER, ["unshare", assertName(name), assertSharedPath(path)], { timeoutMs: 60_000 });
 }
 
 /** t3user remove <name> [--force] */

@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""LateShift Cloud budget enforcer.
+
+Runs from lateshift-budget.timer every 10 minutes. For every registered user
+with monthlyBudgetUsd > 0:
+  - sums turn_usage cost for the current UTC calendar month from the user's
+    instance DB (read-only; missing DB/table counts as $0);
+  - over budget  -> stop t3code@<user> and write <baseDir>/BUDGET_PAUSED
+    (a JSON marker the portal renders);
+  - under budget AND marker present -> remove marker and start the instance.
+
+Instances stopped by an admin WITHOUT a marker are never started by this tool,
+and users with budget 0 (unlimited) are never touched. Only t3code@<name>
+template units are ever named — never the production `t3code` unit.
+"""
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import datetime
+
+ROOT = "/home/dev/services/lateshift"
+REGISTRY = f"{ROOT}/users.json"
+NAME_RE = re.compile(r"^[a-z0-9-]{2,20}$")
+
+
+def month_start_iso() -> str:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def month_cost_usd(db_path: str, since_iso: str) -> float:
+    if not os.path.exists(db_path):
+        return 0.0
+    try:
+        db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+        try:
+            row = db.execute(
+                "SELECT COALESCE(SUM(total_cost_usd), 0) FROM turn_usage WHERE completed_at >= ?",
+                (since_iso,),
+            ).fetchone()
+            return float(row[0] or 0.0)
+        finally:
+            db.close()
+    except sqlite3.Error as e:
+        # Missing table / locked / corrupt: treat as $0 but say so.
+        print(f"warning: could not read {db_path}: {e}", file=sys.stderr)
+        return 0.0
+
+
+def systemctl(*args: str) -> bool:
+    r = subprocess.run(
+        ["sudo", "-n", "systemctl", *args], capture_output=True, text=True, timeout=90
+    )
+    if r.returncode != 0:
+        print(f"warning: systemctl {' '.join(args)} failed: {r.stderr.strip()}", file=sys.stderr)
+    return r.returncode == 0
+
+
+def unit_active(unit: str) -> bool:
+    r = subprocess.run(
+        ["systemctl", "is-active", unit], capture_output=True, text=True, timeout=15
+    )
+    return r.stdout.strip() == "active"
+
+
+def main() -> int:
+    with open(REGISTRY) as f:
+        reg = json.load(f)
+
+    since = month_start_iso()
+    problems = 0
+    for name, u in sorted(reg.get("users", {}).items()):
+        if not NAME_RE.fullmatch(name):
+            print(f"warning: skipping invalid registry name '{name}'", file=sys.stderr)
+            continue
+        budget = float(u.get("monthlyBudgetUsd") or 0)
+        if budget <= 0:
+            continue
+        base_dir = u.get("baseDir") or f"{ROOT}/users/{name}"
+        marker = os.path.join(base_dir, "BUDGET_PAUSED")
+        unit = f"t3code@{name}.service"  # never the bare production unit
+        cost = month_cost_usd(os.path.join(base_dir, "userdata", "state.sqlite"), since)
+
+        if cost >= budget:
+            if unit_active(unit):
+                print(f"{name}: ${cost:.2f} >= ${budget:.2f} — pausing {unit}")
+                if systemctl("stop", unit):
+                    with open(marker, "w") as f:
+                        json.dump(
+                            {
+                                "pausedAt": datetime.datetime.now(datetime.timezone.utc)
+                                .strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                "monthCostUsd": round(cost, 4),
+                                "monthlyBudgetUsd": budget,
+                                "monthStart": since,
+                            },
+                            f,
+                            indent=2,
+                        )
+                else:
+                    problems += 1
+            elif not os.path.exists(marker):
+                # Over budget but admin already stopped it manually — leave as-is.
+                pass
+        elif os.path.exists(marker):
+            # Back under budget (new month or raised budget): resume.
+            print(f"{name}: ${cost:.2f} < ${budget:.2f} — resuming {unit}")
+            os.unlink(marker)
+            if not systemctl("start", unit):
+                problems += 1
+
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

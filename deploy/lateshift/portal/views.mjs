@@ -274,6 +274,15 @@ const CSS = `
     border: 1px solid rgba(74, 222, 128, 0.3);
     color: var(--green);
   }
+  .banner-warn {
+    background: rgba(248, 113, 113, 0.08);
+    border: 1px solid rgba(248, 113, 113, 0.35);
+    color: var(--red);
+  }
+  .shared-list { list-style: none; margin: 0; padding: 0; }
+  .shared-list li { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--border); }
+  .shared-list li:last-child { border-bottom: none; }
+  .shared-list .path { flex: 1; min-width: 0; word-break: break-all; }
 
   /* Hero */
   .hero { flex: 1; display: flex; align-items: center; justify-content: center; text-align: center; padding: 60px 24px; }
@@ -386,12 +395,47 @@ export function renderHero({ identityLogin } = {}) {
 
 // 2) User dashboard.
 export function renderDashboard(props) {
-  const { csrf, identity, user, instanceStatus, projects, usage, isAdmin } = props;
+  const {
+    csrf,
+    identity,
+    user,
+    instanceStatus,
+    projects,
+    usage,
+    isAdmin,
+    budgetPaused,
+    monthCostUsd,
+  } = props;
 
   const navHtml = nav({
     identity,
     links: isAdmin ? [{ href: "/admin", label: "Admin" }] : [],
   });
+
+  const pausedBanner = budgetPaused
+    ? `<div class="banner banner-warn">Your workspace is paused: this month's usage
+       (${esc(money(budgetPaused.monthCostUsd))}) reached your
+       ${esc(money(budgetPaused.monthlyBudgetUsd))} budget. It resumes automatically
+       next month, or ask your admin to raise the budget.</div>`
+    : "";
+
+  const budgetLine =
+    user.monthlyBudgetUsd > 0
+      ? `<p class="muted" style="margin:10px 0 0;font-size:13px">This month:
+         ${esc(money(monthCostUsd ?? 0))} of ${esc(money(user.monthlyBudgetUsd))} budget.</p>`
+      : "";
+
+  const sharedProjectsHtml = user.sharedProjects?.length
+    ? `<div class="card">
+        <h2>Shared projects</h2>
+        <ul class="shared-list">
+          ${user.sharedProjects
+            .map((p) => `<li><span class="path mono">${esc(p)}</span></li>`)
+            .join("")}
+        </ul>
+        <p class="muted" style="font-size:13px;margin:12px 0 0">These appear inside your workspace. Work in worktree mode to avoid clashing with teammates in the same project.</p>
+      </div>`
+    : "";
 
   const openForms = `<div class="actions-row">
     <form method="POST" action="/open" class="inline">
@@ -453,17 +497,21 @@ export function renderDashboard(props) {
   const body = `<main class="container">
     <div class="greeting">
       <h1 style="margin:0">Welcome back, ${esc(user.name)}</h1>
-      ${statusChip(instanceStatus)}
+      ${statusChip(budgetPaused ? "paused (budget)" : instanceStatus)}
     </div>
+    ${pausedBanner}
 
     <div class="card">
       <h2>Workspace</h2>
       ${openForms}
     </div>
 
+    ${sharedProjectsHtml}
+
     <div class="card">
       <h2>Usage</h2>
       ${usageHtml}
+      ${budgetLine}
     </div>
 
     <div class="section-title">Work history</div>
@@ -502,7 +550,20 @@ export function renderAdmin(props) {
             <button type="submit" class="btn btn-sm">Toggle</button>
           </form>
         </td>
-        <td>${statusChip(u.instanceStatus)}</td>
+        <td>${statusChip(u.budgetPaused ? "paused (budget)" : u.instanceStatus)}</td>
+        <td>
+          <form method="POST" action="/admin/set-budget" class="inline">
+            ${hiddenInput("name", u.name)}
+            ${hiddenInput("csrf", csrf)}
+            <input type="number" name="budget" min="0" max="100000" step="0.01" value="${esc(u.monthlyBudgetUsd || 0)}" class="narrow" style="width:80px">
+            <button type="submit" class="btn btn-sm">Set</button>
+          </form>
+          ${
+            u.monthlyBudgetUsd > 0
+              ? `<div class="muted" style="font-size:11.5px;margin-top:3px">${esc(money(u.monthCostUsd ?? 0))} used</div>`
+              : ""
+          }
+        </td>
         <td>${u.cost30dUsd != null ? esc(money(u.cost30dUsd)) : '<span class="muted">—</span>'}</td>
         <td>
           <div class="cell-forms">
@@ -539,14 +600,53 @@ export function renderAdmin(props) {
           <thead>
             <tr>
               <th>Name</th><th>Tailnet login</th><th>Ports</th><th>Limit</th>
-              <th>Shared</th><th>Status</th><th>Cost 30d</th><th>Actions</th>
+              <th>Shared</th><th>Status</th><th>Budget/mo</th><th>Cost 30d</th><th>Actions</th>
             </tr>
           </thead>
           <tbody>
-            ${rows || '<tr><td colspan="8" class="muted">No users yet.</td></tr>'}
+            ${rows || '<tr><td colspan="9" class="muted">No users yet.</td></tr>'}
           </tbody>
         </table>
       </div>
+    </div>
+
+    <div class="card">
+      <h2>Shared projects</h2>
+      ${
+        users.some((u) => u.sharedProjects?.length)
+          ? `<ul class="shared-list">${users
+              .flatMap((u) =>
+                (u.sharedProjects ?? []).map(
+                  (p) => `<li>
+                    <span class="path mono">${esc(p)}</span>
+                    <span class="tag">${esc(u.name)}</span>
+                    <form method="POST" action="/admin/unshare-project" class="inline">
+                      ${hiddenInput("name", u.name)}
+                      ${hiddenInput("path", p)}
+                      ${hiddenInput("csrf", csrf)}
+                      <button type="submit" class="btn btn-sm btn-danger">Unshare</button>
+                    </form>
+                  </li>`,
+                ),
+              )
+              .join("")}</ul>`
+          : `<p class="muted" style="margin:0 0 14px">No shared project grants yet.</p>`
+      }
+      <form method="POST" action="/admin/share-project" style="margin-top:14px">
+        ${hiddenInput("csrf", csrf)}
+        <div class="row" style="align-items:flex-end">
+          <div class="field">
+            <label for="sp-name">User</label>
+            <input type="text" id="sp-name" name="name" pattern="[a-z0-9-]{2,20}" required>
+          </div>
+          <div class="field" style="flex:1;min-width:260px">
+            <label for="sp-path">Absolute project path</label>
+            <input type="text" id="sp-path" name="path" placeholder="/home/dev/shared/ronopoly" required style="width:100%">
+          </div>
+          <button type="submit" class="btn btn-primary">Share</button>
+        </div>
+      </form>
+      <p class="muted" style="font-size:13px;margin:12px 0 0">Paths must live under <code>/home/dev/shared/</code> or <code>/home/dev/projects/</code>. The project appears in the user's workspace immediately.</p>
     </div>
 
     <div class="card">

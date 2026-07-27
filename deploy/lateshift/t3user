@@ -7,8 +7,10 @@
 #   t3user remove <name> [--force]                    stop instance, archive its data
 #   t3user list                                       show all registered users
 #   t3user set <name> <key> <value>                   update a registry field
-#                                                     (keys: projectLimit, sharedAccess, tsLogin, admin)
+#                                                     (keys: projectLimit, sharedAccess, tsLogin, admin, monthlyBudgetUsd)
 #   t3user pair <name> [--ttl 1h]                     mint a one-time pairing URL
+#   t3user share <name> <abs-path>                    grant a shared project dir (t3 project add on their instance)
+#   t3user unshare <name> <abs-path>                  revoke a shared project dir
 #
 # State lives under /home/dev/services/lateshift:
 #   users.json           port/user registry (contract consumed by the portal)
@@ -179,6 +181,8 @@ elif op == "commit":
         "sharedAccess": False,
         "admin": admin,
         "tsLogin": ts_login,
+        "monthlyBudgetUsd": 0,
+        "sharedProjects": [],
         "createdAt": datetime.datetime.now(datetime.timezone.utc)
             .strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
@@ -232,10 +236,52 @@ elif op == "set":
                     print(f"tsLogin '{value}' is already mapped to user '{other}'", file=sys.stderr)
                     sys.exit(3)
             user[key] = value
+    elif key == "monthlyBudgetUsd":
+        try:
+            n = float(value)
+        except ValueError:
+            print("monthlyBudgetUsd must be a number", file=sys.stderr)
+            sys.exit(2)
+        if not (0 <= n <= 100000):
+            print("monthlyBudgetUsd must be 0-100000 (0 = unlimited)", file=sys.stderr)
+            sys.exit(2)
+        user[key] = round(n, 2)
     else:
-        print(f"key '{key}' is not settable (allowed: projectLimit, sharedAccess, tsLogin, admin)", file=sys.stderr)
+        print(f"key '{key}' is not settable (allowed: projectLimit, sharedAccess, tsLogin, admin, monthlyBudgetUsd)", file=sys.stderr)
         sys.exit(2)
     save()
+
+elif op == "share":
+    # share <name> <abs-path> — record a shared project grant (idempotent).
+    name, path = args[0], args[1]
+    user = reg["users"].get(name)
+    if user is None:
+        print(f"user '{name}' not found", file=sys.stderr)
+        sys.exit(1)
+    shared = user.setdefault("sharedProjects", [])
+    if path not in shared:
+        shared.append(path)
+        save()
+
+elif op == "unshare":
+    # unshare <name> <abs-path> — drop a shared project grant (idempotent).
+    name, path = args[0], args[1]
+    user = reg["users"].get(name)
+    if user is None:
+        print(f"user '{name}' not found", file=sys.stderr)
+        sys.exit(1)
+    shared = user.setdefault("sharedProjects", [])
+    if path in shared:
+        shared.remove(path)
+        save()
+
+elif op == "shares":
+    # shares <name> — print grants one per line.
+    user = reg["users"].get(args[0])
+    if user is None:
+        sys.exit(1)
+    for p in user.get("sharedProjects", []):
+        print(p)
 
 elif op == "list":
     fmt = "{:<20} {:>9} {:>7} {:>13} {:>6} {:>6}  {:<28} {}"
@@ -483,7 +529,10 @@ cmd_set() {
         tsLogin)
             [[ -n "${value}" ]] && validate_ts_login "${value}"
             ;;
-        *) die "key '${key}' is not settable (allowed: projectLimit, sharedAccess, tsLogin, admin)" ;;
+        monthlyBudgetUsd)
+            [[ "${value}" =~ ^[0-9]+(\.[0-9]{1,2})?$ ]] || die "monthlyBudgetUsd must be a number (0 = unlimited)"
+            ;;
+        *) die "key '${key}' is not settable (allowed: projectLimit, sharedAccess, tsLogin, admin, monthlyBudgetUsd)" ;;
     esac
 
     registry_py set "${name}" "${key}" "${value}"
@@ -509,6 +558,49 @@ cmd_set() {
         fi
     fi
     echo "set ${name}.${key} = ${value}"
+}
+
+# Validate a shared-project path: absolute, exists, and under an allowed root.
+# Realpath resolution prevents symlink/.. escapes out of the allowed roots.
+validate_shared_path() {
+    local path="$1" real
+    [[ "${path}" == /* ]] || die "shared project path must be absolute"
+    real=$(realpath -e "${path}" 2>/dev/null) || die "path '${path}' does not exist"
+    case "${real}" in
+        /home/dev/shared/*|/home/dev/projects/*) ;;
+        *) die "shared projects must live under /home/dev/shared/ or /home/dev/projects/ (got ${real})" ;;
+    esac
+    [[ -d "${real}" ]] || die "'${real}' is not a directory"
+    echo "${real}"
+}
+
+cmd_share() {
+    [[ $# -eq 2 ]] || die "usage: t3user share <name> <abs-path>"
+    local name="$1" path real base_dir
+    validate_name "${name}"
+    registry_py exists "${name}" || die "user '${name}' not found"
+    real=$(validate_shared_path "$2")
+    base_dir=$(registry_py get "${name}" baseDir)
+
+    "${T3_CLI}" project add "${real}" --base-dir "${base_dir}" \
+        || die "t3 project add failed for '${real}' on ${name}'s instance"
+    registry_py share "${name}" "${real}"
+    echo "shared '${real}' with '${name}'"
+}
+
+cmd_unshare() {
+    [[ $# -eq 2 ]] || die "usage: t3user unshare <name> <abs-path>"
+    local name="$1" path real base_dir
+    validate_name "${name}"
+    registry_py exists "${name}" || die "user '${name}' not found"
+    # Resolve without -e: the target dir may already be gone; fall back to raw.
+    real=$(realpath -m "$2" 2>/dev/null || echo "$2")
+    base_dir=$(registry_py get "${name}" baseDir)
+
+    "${T3_CLI}" project remove "${real}" --base-dir "${base_dir}" \
+        || echo "warning: t3 project remove failed (project may not be registered); clearing grant anyway" >&2
+    registry_py unshare "${name}" "${real}"
+    echo "unshared '${real}' from '${name}'"
 }
 
 cmd_pair() {
@@ -539,7 +631,7 @@ main() {
     [[ $# -ge 1 ]] || usage 1
     local cmd="$1"; shift
     case "${cmd}" in
-        add|remove|pair|list|set)
+        add|remove|pair|list|set|share|unshare)
             # Serialize ALL registry access (reads included) across concurrent
             # invocations; lock is taken before first-time registry creation.
             mkdir -p "${LATESHIFT_ROOT}"

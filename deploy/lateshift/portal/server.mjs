@@ -17,7 +17,14 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import { loadConfig, loadRegistry, resolveIdentity, NAME_RE } from "./lib/registry.mjs";
-import { readWorkHistory, readUsageSummary, readCostSince, stateDbPath } from "./lib/history.mjs";
+import {
+  readWorkHistory,
+  readUsageSummary,
+  readCostSince,
+  readCostThisMonth,
+  readBudgetPaused,
+  stateDbPath,
+} from "./lib/history.mjs";
 import * as actions from "./lib/actions.mjs";
 import * as views from "./views.mjs";
 
@@ -151,8 +158,12 @@ async function dashboardProps(ctx, csrf) {
       projectLimit: user.projectLimit,
       sharedAccess: user.sharedAccess,
       admin: user.admin,
+      monthlyBudgetUsd: user.monthlyBudgetUsd,
+      sharedProjects: user.sharedProjects,
     },
     instanceStatus: await actions.instanceStatus(user.name),
+    budgetPaused: readBudgetPaused(user.baseDir),
+    monthCostUsd: readCostThisMonth(dbPath),
     projects: readWorkHistory(dbPath),
     usage: readUsageSummary(dbPath),
     isAdmin: ctx.principal.isAdmin,
@@ -179,6 +190,10 @@ async function adminProps(ctx, csrf, flash) {
       admin: u.admin,
       instanceStatus: status,
       cost30dUsd: cost30d,
+      monthlyBudgetUsd: u.monthlyBudgetUsd,
+      monthCostUsd: readCostThisMonth(stateDbPath(u.baseDir)),
+      budgetPaused: readBudgetPaused(u.baseDir),
+      sharedProjects: u.sharedProjects,
     });
   }
   return {
@@ -419,6 +434,34 @@ async function handlePost(req, res, url) {
         const r = await actions.restartInstance(name);
         if (!r.ok) return errPage("Limit saved but restart failed", r.stderr || r.stdout);
         return flashTo(`Limit for '${name}' set to ${limit}; instance restarted.`);
+      }
+
+      case "/admin/set-budget": {
+        if (!validName || !(name in ctx.users)) return errPage("Unknown user", name);
+        const budget = actions.assertBudget(form.budget);
+        const s = await actions.setUserField(name, "monthlyBudgetUsd", budget);
+        if (!s.ok) return errPage("Setting budget failed", s.stderr || s.stdout);
+        return flashTo(
+          budget === 0
+            ? `Budget for '${name}' removed (unlimited).`
+            : `Budget for '${name}' set to $${budget}/month (enforced within ~10 min).`,
+        );
+      }
+
+      case "/admin/share-project": {
+        if (!validName || !(name in ctx.users)) return errPage("Unknown user", name);
+        const path = actions.assertSharedPath((form.path ?? "").trim());
+        const r = await actions.shareProject(name, path);
+        if (!r.ok) return errPage("Sharing failed", r.stderr || r.stdout);
+        return flashTo(`Shared '${path}' with '${name}'.`);
+      }
+
+      case "/admin/unshare-project": {
+        if (!validName || !(name in ctx.users)) return errPage("Unknown user", name);
+        const path = actions.assertSharedPath((form.path ?? "").trim());
+        const r = await actions.unshareProject(name, path);
+        if (!r.ok) return errPage("Unsharing failed", r.stderr || r.stdout);
+        return flashTo(`Unshared '${path}' from '${name}'.`);
       }
 
       case "/admin/toggle-shared": {

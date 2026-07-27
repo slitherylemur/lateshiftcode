@@ -36,6 +36,8 @@ export function loadRegistry() {
       sharedAccess: Boolean(u.sharedAccess),
       admin: Boolean(u.admin),
       tsLogin: typeof u.tsLogin === "string" && u.tsLogin ? u.tsLogin : null,
+      monthlyBudgetUsd: Number(u.monthlyBudgetUsd ?? 0),
+      sharedProjects: Array.isArray(u.sharedProjects) ? u.sharedProjects.map(String) : [],
       createdAt: u.createdAt ?? null,
     };
   }

@@ -1,0 +1,7 @@
+[Unit]
+Description=LateShift Cloud budget enforcement pass
+
+[Service]
+Type=oneshot
+User=dev
+ExecStart=/usr/bin/python3 /home/dev/services/lateshift/bin/budget-check

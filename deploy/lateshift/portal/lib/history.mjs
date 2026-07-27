@@ -7,7 +7,7 @@
 // probing sqlite_master first.
 
 import { DatabaseSync } from "node:sqlite";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 function withDb(dbPath, fn, fallback) {
   if (!dbPath || !existsSync(dbPath)) return fallback;
@@ -140,4 +140,26 @@ export function readCostSince(dbPath, days = 30) {
 
 export function stateDbPath(baseDir) {
   return `${baseDir}/userdata/state.sqlite`;
+}
+
+/** Cost since the start of the current UTC calendar month (null = no data). */
+export function readCostThisMonth(dbPath) {
+  const now = new Date();
+  const since = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+  const summary = readUsageSummary(dbPath, since);
+  return summary ? summary.totalCostUsd : null;
+}
+
+/** Budget-pause marker written by bin/budget-check, or null. */
+export function readBudgetPaused(baseDir) {
+  try {
+    const raw = JSON.parse(readFileSync(`${baseDir}/BUDGET_PAUSED`, "utf8"));
+    return {
+      pausedAt: raw.pausedAt ?? null,
+      monthCostUsd: Number(raw.monthCostUsd ?? 0),
+      monthlyBudgetUsd: Number(raw.monthlyBudgetUsd ?? 0),
+    };
+  } catch {
+    return null;
+  }
 }
