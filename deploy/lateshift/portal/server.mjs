@@ -12,7 +12,7 @@
 
 import http from "node:http";
 import crypto from "node:crypto";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -23,6 +23,9 @@ import {
   readCostSince,
   readCostThisMonth,
   readBudgetPaused,
+  readMonthProviderCost,
+  readProviderTurns,
+  computeProviderWindows,
   stateDbPath,
 } from "./lib/history.mjs";
 import * as actions from "./lib/actions.mjs";
@@ -42,6 +45,11 @@ const LOGO_PATHS = [
   "/home/dev/services/lateshift/assets/lateshift-logo.png",
 ];
 const CSRF_COOKIE = "lsc_csrf";
+
+// The single share root. Directories directly under it are the universe of
+// shareable projects; grants (registry sharedProjects) are absolute paths here.
+const SHARED_ROOT = "/home/dev/shared";
+const SHARE_DIR_RE = /^[A-Za-z0-9._-]+$/;
 
 // ---------------------------------------------------------------- helpers
 
@@ -133,6 +141,18 @@ function ensureCsrf(cookies, res) {
   return token;
 }
 
+/** Directories directly under the share root, as {name, path}. */
+function listSharedDirs() {
+  try {
+    return readdirSync(SHARED_ROOT, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.name.startsWith(".") && SHARE_DIR_RE.test(d.name))
+      .map((d) => ({ name: d.name, path: `${SHARED_ROOT}/${d.name}` }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  } catch {
+    return [];
+  }
+}
+
 // ---------------------------------------------------------------- context
 
 function buildContext(req) {
@@ -170,16 +190,34 @@ async function dashboardProps(ctx, csrf) {
   };
 }
 
-async function adminProps(ctx, csrf, flash) {
-  const users = Object.values(ctx.users).sort((a, b) => a.name.localeCompare(b.name));
+async function adminProps(ctx, csrf, flash, selectedParam) {
+  const adminLogin = ctx.principal.login;
+  const adminLower = adminLogin ? adminLogin.toLowerCase() : null;
+  const registryUsers = Object.values(ctx.users).sort((a, b) => a.name.localeCompare(b.name));
+
   const rows = [];
+  const leaderboard = [];
+  const subTotals = { claude: 0, codex: 0, other: 0, total: 0 };
   let totalCost30d = 0;
   let activeCount = 0;
-  for (const u of users) {
+  let allTurns = [];
+  // 7d lookback is more than enough to locate the current 5h window anchor.
+  const windowSince = new Date(Date.now() - 7 * 86400_000).toISOString();
+
+  for (const u of registryUsers) {
+    const dbPath = stateDbPath(u.baseDir);
     const status = await actions.instanceStatus(u.name);
     if (status === "active") activeCount += 1;
-    const cost30d = readCostSince(stateDbPath(u.baseDir), 30);
+    const cost30d = readCostSince(dbPath, 30);
     if (cost30d != null) totalCost30d += cost30d;
+    const monthProv = readMonthProviderCost(dbPath);
+    subTotals.claude += monthProv.claude;
+    subTotals.codex += monthProv.codex;
+    subTotals.other += monthProv.other;
+    subTotals.total += monthProv.total;
+    allTurns = allTurns.concat(readProviderTurns(dbPath, windowSince));
+
+    const isSelf = Boolean(u.tsLogin && adminLower && u.tsLogin.toLowerCase() === adminLower);
     rows.push({
       name: u.name,
       tsLogin: u.tsLogin,
@@ -191,11 +229,39 @@ async function adminProps(ctx, csrf, flash) {
       instanceStatus: status,
       cost30dUsd: cost30d,
       monthlyBudgetUsd: u.monthlyBudgetUsd,
-      monthCostUsd: readCostThisMonth(stateDbPath(u.baseDir)),
+      monthCostUsd: readCostThisMonth(dbPath),
       budgetPaused: readBudgetPaused(u.baseDir),
       sharedProjects: u.sharedProjects,
+      monthProviderCost: monthProv,
+      isSelf,
+    });
+    leaderboard.push({
+      name: u.name,
+      total: monthProv.total,
+      claude: monthProv.claude,
+      codex: monthProv.codex,
+      other: monthProv.other,
     });
   }
+
+  leaderboard.sort((a, b) => b.total - a.total);
+  const windows = computeProviderWindows(allTurns);
+
+  const selfRow = rows.find((r) => r.isSelf) || null;
+  const self = {
+    present: Boolean(selfRow),
+    name: selfRow ? selfRow.name : null,
+    login: adminLogin,
+    workspaceConfigured: Boolean(ctx.config.sharedWorkspaceUrl),
+  };
+
+  // Selection: a registry user name, or "@self" for the admin's own account.
+  const SELF_KEY = "@self";
+  let selectedKey;
+  if (selectedParam && selectedParam in ctx.users) selectedKey = selectedParam;
+  else if (selectedParam === SELF_KEY) selectedKey = SELF_KEY;
+  else selectedKey = self.present ? self.name : SELF_KEY;
+
   return {
     csrf,
     identity: {
@@ -204,6 +270,15 @@ async function adminProps(ctx, csrf, flash) {
       profilePic: ctx.identity.profilePic,
     },
     users: rows,
+    self,
+    selectedKey,
+    sharedDirs: listSharedDirs(),
+    subscription: {
+      totals: subTotals,
+      windows,
+      limits: ctx.config.subscriptionLimits,
+    },
+    leaderboard,
     aggregate: {
       totalCost30dUsd: totalCost30d,
       userCount: rows.length,
@@ -262,7 +337,8 @@ async function handleGet(req, res, url) {
       return;
     }
     const flash = url.searchParams.get("flash")?.slice(0, 300) ?? null;
-    html(res, 200, views.renderAdmin(await adminProps(ctx, csrf, flash)));
+    const selectedParam = url.searchParams.get("u")?.slice(0, 40) ?? null;
+    html(res, 200, views.renderAdmin(await adminProps(ctx, csrf, flash, selectedParam)));
     return;
   }
 
@@ -371,9 +447,42 @@ async function handlePost(req, res, url) {
     return;
   }
 
+  // Admin opens the shared production workspace (their own "workspace" card).
+  // Not keyed by a registry user — uses the admin's own registry name when
+  // present, else a static label. No `name` field required.
+  if (url.pathname === "/admin/open-workspace") {
+    const adminLower = ctx.principal.login ? ctx.principal.login.toLowerCase() : null;
+    const selfUser = Object.values(ctx.users).find(
+      (u) => u.tsLogin && adminLower && u.tsLogin.toLowerCase() === adminLower,
+    );
+    const label = selfUser ? selfUser.name : "admin";
+    const r = await actions.mintSharedPairing(label, ctx.config.sharedWorkspaceUrl);
+    if (!r.ok) {
+      html(
+        res,
+        502,
+        views.renderMessage({
+          title: "Error",
+          heading: "Could not open workspace",
+          bodyHtml: `<p>Pairing failed:</p><pre>${views.esc(r.detail ?? "unknown error")}</pre>`,
+          backHref: "/admin",
+          error: true,
+        }),
+      );
+      return;
+    }
+    redirect(res, r.url);
+    return;
+  }
+
   const name = typeof form.name === "string" ? form.name.trim() : "";
   const validName = NAME_RE.test(name);
-  const flashTo = (msg) => redirect(res, `/admin?flash=${encodeURIComponent(msg)}`);
+  // Redirect back to the acted-on user's detail (preserving selection) + flash.
+  const flashTo = (msg) =>
+    redirect(
+      res,
+      `/admin?${validName ? `u=${encodeURIComponent(name)}&` : ""}flash=${encodeURIComponent(msg)}`,
+    );
   const errPage = (heading, detail) =>
     html(
       res,
@@ -446,6 +555,23 @@ async function handlePost(req, res, url) {
             ? `Budget for '${name}' removed (unlimited).`
             : `Budget for '${name}' set to $${budget}/month (enforced within ~10 min).`,
         );
+      }
+
+      case "/admin/set-tslogin": {
+        if (!validName || !(name in ctx.users)) return errPage("Unknown user", name);
+        const login = (form.tsLogin ?? "").trim();
+        if (!login) return errPage("Invalid tailnet login", "Tailnet login cannot be empty.");
+        const s = await actions.setUserField(name, "tsLogin", login);
+        if (!s.ok) return errPage("Setting tailnet login failed", s.stderr || s.stdout);
+        return flashTo(`Tailnet login for '${name}' set to ${login}.`);
+      }
+
+      case "/admin/toggle-admin": {
+        if (!validName || !(name in ctx.users)) return errPage("Unknown user", name);
+        const next = ctx.users[name].admin ? "false" : "true";
+        const s = await actions.setUserField(name, "admin", next);
+        if (!s.ok) return errPage("Toggle failed", s.stderr || s.stdout);
+        return flashTo(`admin flag for '${name}' is now ${next}.`);
       }
 
       case "/admin/share-project": {
@@ -527,7 +653,7 @@ async function handlePost(req, res, url) {
           );
           return;
         }
-        return flashTo(`User '${name}' removed (data archived).`);
+        return redirect(res, `/admin?flash=${encodeURIComponent(`User '${name}' removed (data archived).`)}`);
       }
 
       default:
