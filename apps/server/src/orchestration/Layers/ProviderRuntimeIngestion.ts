@@ -22,14 +22,18 @@ import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
+import { TurnUsageRepository } from "../../persistence/Services/TurnUsage.ts";
+import { TurnUsageRepositoryLive } from "../../persistence/Layers/TurnUsage.ts";
 import { isGitRepository } from "../../git/Utils.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
@@ -41,6 +45,38 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 
 const providerTurnKey = (threadId: ThreadId, turnId: TurnId) => `${threadId}:${turnId}`;
 const providerTaskKey = (threadId: ThreadId, taskId: string) => `${threadId}:${taskId}`;
+
+// Usage ledger helpers: `turn.completed` usage payloads are provider-shaped
+// and untyped (claude emits raw snake_case CLI usage, codex emits none), so
+// normalization is strictly best-effort and never fails.
+const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.UnknownFromJsonString);
+
+function toUsageJson(value: unknown): string | null {
+  const result = encodeUnknownJsonStringExit(value);
+  return Exit.isSuccess(result) ? result.value : null;
+}
+
+function asUsageRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function readUsageInteger(
+  usage: Record<string, unknown> | undefined,
+  keys: ReadonlyArray<string>,
+): number | null {
+  if (!usage) {
+    return null;
+  }
+  for (const key of keys) {
+    const value = usage[key];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      return Math.round(value);
+    }
+  }
+  return null;
+}
 
 // Fallback when the in-memory description cache no longer has the task name
 // (server restart, session-exit sweep, TTL/capacity eviction): earlier
@@ -692,6 +728,7 @@ const make = Effect.gen(function* () {
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
   const projectionTurnRepository = yield* ProjectionTurnRepository;
+  const turnUsageRepository = yield* TurnUsageRepository;
   const serverSettingsService = yield* ServerSettingsService;
   const providerCommandId = (event: ProviderRuntimeEvent, tag: string) =>
     crypto.randomUUIDv4.pipe(
@@ -1453,6 +1490,57 @@ const make = Effect.gen(function* () {
         }
       }
 
+      // Usage ledger: append one row per accepted turn completion. A ledger
+      // failure must never break turn ingestion — log and continue.
+      if (event.type === "turn.completed" && shouldApplyThreadLifecycle) {
+        const usageRecord = asUsageRecord(event.payload.usage);
+        const modelUsageKeys =
+          event.payload.modelUsage !== undefined ? Object.keys(event.payload.modelUsage) : [];
+        const usageJson =
+          event.payload.usage !== undefined || event.payload.modelUsage !== undefined
+            ? toUsageJson({
+                ...(event.payload.usage !== undefined ? { usage: event.payload.usage } : {}),
+                ...(event.payload.modelUsage !== undefined
+                  ? { modelUsage: event.payload.modelUsage }
+                  : {}),
+              })
+            : null;
+        yield* turnUsageRepository
+          .insert({
+            threadId: thread.id,
+            projectId: thread.projectId,
+            turnId: eventTurnId ?? null,
+            providerName: event.provider,
+            model: modelUsageKeys.length > 0 ? modelUsageKeys.join(",") : null,
+            totalCostUsd: event.payload.totalCostUsd ?? null,
+            inputTokens: readUsageInteger(usageRecord, ["input_tokens", "inputTokens"]),
+            outputTokens: readUsageInteger(usageRecord, ["output_tokens", "outputTokens"]),
+            cachedInputTokens: readUsageInteger(usageRecord, [
+              "cache_read_input_tokens",
+              "cached_input_tokens",
+              "cachedInputTokens",
+              "cacheReadInputTokens",
+            ]),
+            reasoningOutputTokens: readUsageInteger(usageRecord, [
+              "reasoning_output_tokens",
+              "reasoningOutputTokens",
+            ]),
+            durationMs: readUsageInteger(usageRecord, ["duration_ms", "durationMs"]),
+            usageJson,
+            completedAt: now,
+          })
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("turn usage ledger insert failed", {
+                eventId: event.eventId,
+                eventType: event.type,
+                threadId: thread.id,
+                cause: Cause.pretty(cause),
+              }),
+            ),
+          );
+      }
+
       const assistantDelta =
         event.type === "content.delta" && event.payload.streamKind === "assistant_text"
           ? event.payload.delta
@@ -1828,4 +1916,4 @@ const make = Effect.gen(function* () {
 export const ProviderRuntimeIngestionLive = Layer.effect(
   ProviderRuntimeIngestionService,
   make,
-).pipe(Layer.provide(ProjectionTurnRepositoryLive));
+).pipe(Layer.provide([ProjectionTurnRepositoryLive, TurnUsageRepositoryLive]));

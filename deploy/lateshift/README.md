@@ -30,12 +30,12 @@ t3code@<user>.service              one templated unit per LateShift user
 
 ## Files
 
-| Repo file          | Installed at                                        |
-|--------------------|-----------------------------------------------------|
-| `t3code@.service`  | `/etc/systemd/system/t3code@.service`               |
-| `run-instance.sh`  | `/home/dev/services/lateshift/bin/run-instance.sh`  |
-| `t3user`           | `/home/dev/services/lateshift/bin/t3user`           |
-| `README.md`        | `/home/dev/services/lateshift/README.md`            |
+| Repo file         | Installed at                                       |
+| ----------------- | -------------------------------------------------- |
+| `t3code@.service` | `/etc/systemd/system/t3code@.service`              |
+| `run-instance.sh` | `/home/dev/services/lateshift/bin/run-instance.sh` |
+| `t3user`          | `/home/dev/services/lateshift/bin/t3user`          |
+| `README.md`       | `/home/dev/services/lateshift/README.md`           |
 
 Runtime-only paths (not in the repo):
 
@@ -90,11 +90,72 @@ Consumed by `t3code@<name>.service` via `EnvironmentFile=`:
 ```
 T3CODE_INSTANCE_PORT=3780   # local HTTP port
 TS_SERVE_PORT=8460          # tailnet HTTPS port
-T3CODE_MAX_PROJECTS=3       # reserved for the project-limit phase
+T3CODE_MAX_PROJECTS=3       # per-user project limit (unset/0/invalid = unlimited)
+T3CODE_SERVER_ROOT=...      # optional: override the server build checkout
 ```
 
 The CLI takes flags rather than env vars, so `run-instance.sh` translates these
 into `--port` / `--tailscale-serve-port` and execs node.
+
+## Server build (patched fork)
+
+User instances run the **LateShift build**, not the production bundle:
+`run-instance.sh` execs `${T3CODE_SERVER_ROOT:-/home/dev/services/lateshift/checkout}/apps/server/dist/bin.mjs`.
+The checkout tracks branch `lateshift-cloud` and carries two patches on top of
+the production server:
+
+1. **Project limit** — `T3CODE_MAX_PROJECTS` is read by the orchestration
+   decider on every `project.create` command; once the count of live
+   (non-deleted) projects reaches the limit, the command is rejected with
+   `Project limit reached (N). Ask your admin to raise it.` (surfaced as a
+   normal command error in the UI). Unset, empty, `0`, negative, or
+   non-numeric values mean unlimited. Restart the instance after changing it.
+2. **Usage ledger** — every accepted provider `turn.completed` event appends a
+   row to the `turn_usage` table (migration `035_TurnUsageLedger`).
+
+To update the build:
+
+```sh
+cd /home/dev/services/lateshift/checkout
+git pull origin lateshift-cloud
+corepack pnpm install --frozen-lockfile
+corepack pnpm build          # produces apps/server/dist/bin.mjs
+# then: sudo systemctl restart t3code@<user>   (NEVER t3code.service)
+```
+
+## Usage ledger: `turn_usage` table
+
+Read directly from each instance's `userdata/state.sqlite` by the portal
+(no API surface). One row per completed agent turn; append-only.
+
+| Column                    | Type    | Notes                                                        |
+| ------------------------- | ------- | ------------------------------------------------------------ |
+| `row_id`                  | INTEGER | primary key, autoincrement                                   |
+| `thread_id`               | TEXT    | not null                                                     |
+| `project_id`              | TEXT    | resolved from the thread projection; nullable                |
+| `turn_id`                 | TEXT    | nullable (not every provider reports it)                     |
+| `provider_name`           | TEXT    | e.g. `claude`, `codex`; nullable                             |
+| `model`                   | TEXT    | comma-joined keys of the provider `modelUsage` map; nullable |
+| `total_cost_usd`          | REAL    | nullable (claude reports it; codex does not)                 |
+| `input_tokens`            | INTEGER | nullable, best-effort parse of provider usage                |
+| `output_tokens`           | INTEGER | nullable                                                     |
+| `cached_input_tokens`     | INTEGER | nullable                                                     |
+| `reasoning_output_tokens` | INTEGER | nullable                                                     |
+| `duration_ms`             | INTEGER | nullable                                                     |
+| `usage_json`              | TEXT    | raw `{usage, modelUsage}` JSON from the provider; nullable   |
+| `completed_at`            | TEXT    | ISO timestamp, not null; indexed                             |
+
+Indexes: `idx_turn_usage_completed_at`, `idx_turn_usage_thread_id`,
+`idx_turn_usage_project_id`. Ledger writes are fail-open: an insert failure is
+logged and never breaks turn ingestion, so gaps are possible if the DB is
+unhealthy.
+
+## Headless test client
+
+`tools/t3client.mjs` is a dependency-free Node client used to smoke-test
+instances end to end (pairing-token exchange → wsTicket → WebSocket RPC). See
+`node tools/t3client.mjs --help`; pairing tokens are one-time, mint with
+`t3user pair <name>`.
 
 ## `t3user` CLI
 

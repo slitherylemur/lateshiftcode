@@ -5,13 +5,24 @@
 # (/home/dev/services/lateshift/users/<username>/instance.env), which must define:
 #   T3CODE_INSTANCE_PORT  local HTTP port the server binds on 127.0.0.1
 #   TS_SERVE_PORT         HTTPS port exposed on the tailnet via `tailscale serve`
-# Optional (reserved for later phases):
-#   T3CODE_MAX_PROJECTS   per-user project limit
+# Optional:
+#   T3CODE_MAX_PROJECTS   per-user project limit (enforced by the patched
+#                         server build; unset/0 = unlimited)
+#   T3CODE_SERVER_ROOT    monorepo checkout whose apps/server/dist/bin.mjs is
+#                         executed (defaults to the LateShift build checkout;
+#                         user instances must NOT run the production build,
+#                         which lacks the LateShift patches)
 set -euo pipefail
 
 name="${1:?usage: run-instance.sh <username>}"
 base_dir="/home/dev/services/lateshift/users/${name}"
-server_bin="/home/dev/services/t3code-production/apps/server/dist/bin.mjs"
+server_root="${T3CODE_SERVER_ROOT:-/home/dev/services/lateshift/checkout}"
+server_bin="${server_root}/apps/server/dist/bin.mjs"
+
+if [[ ! -f "${server_bin}" ]]; then
+    echo "refusing to start: server bundle not found at ${server_bin}" >&2
+    exit 1
+fi
 
 # Normalize a port to a canonical decimal integer: strips one leading '+' and
 # leading zeros, requires digits only, range 1-65535. Prints the normalized

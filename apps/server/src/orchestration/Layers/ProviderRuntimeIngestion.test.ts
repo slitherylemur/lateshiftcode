@@ -29,6 +29,7 @@ import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as Stream from "effect/Stream";
 import { it as effectIt } from "@effect/vitest";
 import { afterEach, describe, expect, it } from "vite-plus/test";
@@ -192,7 +193,10 @@ async function waitForThread(
 
 describe("ProviderRuntimeIngestion", () => {
   let runtime: ManagedRuntime.ManagedRuntime<
-    OrchestrationEngineService | ProviderRuntimeIngestionService | ProjectionSnapshotQuery,
+    | OrchestrationEngineService
+    | ProviderRuntimeIngestionService
+    | ProjectionSnapshotQuery
+    | SqlClient.SqlClient,
     unknown
   > | null = null;
   let scope: Scope.Closeable | null = null;
@@ -310,12 +314,34 @@ describe("ProviderRuntimeIngestion", () => {
       updatedAt: createdAt,
     });
 
+    const harnessRuntime = runtime;
     return {
       engine,
       readModel: () => Effect.runPromise(snapshotQuery.getSnapshot()),
       emit: provider.emit,
       setProviderSession: provider.setSession,
       drain,
+      queryTurnUsage: () =>
+        harnessRuntime.runPromise(
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            return yield* sql<{
+              readonly thread_id: string;
+              readonly project_id: string | null;
+              readonly turn_id: string | null;
+              readonly provider_name: string | null;
+              readonly model: string | null;
+              readonly total_cost_usd: number | null;
+              readonly input_tokens: number | null;
+              readonly output_tokens: number | null;
+              readonly cached_input_tokens: number | null;
+              readonly reasoning_output_tokens: number | null;
+              readonly duration_ms: number | null;
+              readonly usage_json: string | null;
+              readonly completed_at: string;
+            }>`SELECT * FROM turn_usage ORDER BY row_id ASC`;
+          }),
+        ),
     };
   }
 
@@ -359,6 +385,74 @@ describe("ProviderRuntimeIngestion", () => {
     );
     expect(thread.session?.status).toBe("error");
     expect(thread.session?.lastError).toBe("turn failed");
+  });
+
+  it("appends a turn_usage ledger row for accepted turn completions", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-ledger-turn-started"),
+      provider: ProviderDriverKind.make("claude"),
+      threadId: asThreadId("thread-1"),
+      createdAt: now,
+      turnId: asTurnId("turn-ledger-1"),
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) => thread.session?.activeTurnId === "turn-ledger-1",
+    );
+
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-ledger-turn-completed"),
+      provider: ProviderDriverKind.make("claude"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:30.000Z",
+      turnId: asTurnId("turn-ledger-1"),
+      payload: {
+        state: "completed",
+        usage: {
+          input_tokens: 120,
+          output_tokens: 45,
+          cache_read_input_tokens: 1000,
+          duration_ms: 5400,
+        },
+        modelUsage: { "claude-opus-5": { inputTokens: 120 } },
+        totalCostUsd: 0.1234,
+      },
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) => thread.session?.status === "ready" && thread.session?.activeTurnId === null,
+    );
+    await harness.drain();
+
+    const rows = await harness.queryTurnUsage();
+    expect(rows).toHaveLength(1);
+    const row = rows[0];
+    expect(row?.thread_id).toBe("thread-1");
+    expect(row?.project_id).toBe("project-1");
+    expect(row?.turn_id).toBe("turn-ledger-1");
+    expect(row?.provider_name).toBe("claude");
+    expect(row?.model).toBe("claude-opus-5");
+    expect(row?.total_cost_usd).toBeCloseTo(0.1234);
+    expect(row?.input_tokens).toBe(120);
+    expect(row?.output_tokens).toBe(45);
+    expect(row?.cached_input_tokens).toBe(1000);
+    expect(row?.reasoning_output_tokens).toBeNull();
+    expect(row?.duration_ms).toBe(5400);
+    expect(row?.completed_at).toBe("2026-01-01T00:00:30.000Z");
+    expect(JSON.parse(row?.usage_json ?? "{}")).toEqual({
+      usage: {
+        input_tokens: 120,
+        output_tokens: 45,
+        cache_read_input_tokens: 1000,
+        duration_ms: 5400,
+      },
+      modelUsage: { "claude-opus-5": { inputTokens: 120 } },
+    });
   });
 
   it("applies provider session.state.changed transitions directly", async () => {

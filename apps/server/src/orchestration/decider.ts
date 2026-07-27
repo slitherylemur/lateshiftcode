@@ -24,6 +24,18 @@ import { projectEvent } from "./projector.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
+// LateShift Cloud: optional per-instance cap on live (non-deleted) projects.
+// T3CODE_MAX_PROJECTS unset, empty, zero, negative, or non-numeric means
+// unlimited. Read per dispatch so tests (and instance restarts) pick up
+// changes without a module reload.
+const resolveMaxProjects = (): number | null => {
+  const raw = process.env["T3CODE_MAX_PROJECTS"];
+  if (raw === undefined || raw.trim() === "") return null;
+  const parsed = Number.parseInt(raw.trim(), 10);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return null;
+  return parsed;
+};
+
 // Session adoption takes seconds; a user message still unadopted after this
 // window is a failed/stale start, not pending work. Mirrors the client's
 // QUEUED_TURN_START_GRACE_MS in client-runtime threadSettled.ts.
@@ -236,6 +248,19 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         workspaceRoot: command.workspaceRoot,
         exceptProjectId: command.projectId,
       });
+
+      const maxProjects = resolveMaxProjects();
+      if (maxProjects !== null) {
+        const liveProjectCount = readModel.projects.filter(
+          (project) => project.deletedAt === null,
+        ).length;
+        if (liveProjectCount >= maxProjects) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `Project limit reached (${maxProjects}). Ask your admin to raise it.`,
+          });
+        }
+      }
 
       return {
         ...(yield* withEventBase({
