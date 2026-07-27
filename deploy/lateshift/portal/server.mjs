@@ -176,7 +176,9 @@ function buildContext(req) {
   const identity = tsIdentity.login
     ? tsIdentity
     : { login: session?.gh ?? null, name: null, profilePic: null };
-  return { config, users, identity, principal, session };
+  const fwdHost = typeof req.headers["x-forwarded-host"] === "string" ? req.headers["x-forwarded-host"] : "";
+  const isPublic = fwdHost === "lateshiftcloud.com" || fwdHost.endsWith(".lateshiftcloud.com");
+  return { config, users, identity, principal, session, isPublic };
 }
 
 async function dashboardProps(ctx, csrf) {
@@ -540,7 +542,7 @@ async function handlePost(req, res, url) {
       html(res, 403, views.renderForbidden({ identity: { login: ctx.principal.login } }));
       return;
     }
-    const r = await actions.mintUserPairing(user.name);
+    const r = await actions.mintUserPairing(user.name, "15m", { publicHost: ctx.isPublic });
     if (!r.ok) {
       html(
         res,
@@ -615,7 +617,7 @@ async function handlePost(req, res, url) {
     // Default: the admin's OWN instance when they have one; production only
     // when explicitly requested (shared=1) or when no own workspace exists.
     if (selfUser && form.shared !== "1") {
-      const own = await actions.mintUserPairing(selfUser.name);
+      const own = await actions.mintUserPairing(selfUser.name, "15m", { publicHost: ctx.isPublic });
       if (own.ok) {
         redirect(res, own.url);
         return;
@@ -767,7 +769,7 @@ async function handlePost(req, res, url) {
 
       case "/admin/pair": {
         if (!validName || !(name in ctx.users)) return errPage("Unknown user", name);
-        const r = await actions.mintUserPairing(name, "1h");
+        const r = await actions.mintUserPairing(name, "1h", { publicHost: ctx.isPublic });
         if (!r.ok) return errPage("Pairing failed", r.detail);
         html(res, 200, views.renderPairResult({ name, url: r.url, backHref: "/admin" }));
         return;

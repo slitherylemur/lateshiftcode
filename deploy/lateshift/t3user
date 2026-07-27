@@ -289,6 +289,19 @@ elif op == "set":
                     print(f"tsLogin '{value}' is already mapped to user '{other}'", file=sys.stderr)
                     sys.exit(3)
             user[key] = value
+    elif key == "githubLogin":
+        import re
+        if value == "":
+            user[key] = None
+        else:
+            if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", value):
+                print(f"invalid githubLogin: {value}", file=sys.stderr)
+                sys.exit(2)
+            for other, u in reg["users"].items():
+                if other != name and (u.get("githubLogin") or "").lower() == value.lower():
+                    print(f"githubLogin already mapped to user: {other}", file=sys.stderr)
+                    sys.exit(3)
+            user[key] = value
     elif key == "monthlyBudgetUsd":
         try:
             n = float(value)
@@ -352,7 +365,7 @@ elif op == "set":
             print(f"invalid providerBudgets key '{key}'", file=sys.stderr)
             sys.exit(2)
     else:
-        print(f"key '{key}' is not settable (allowed: projectLimit, sharedAccess, tsLogin, admin, monthlyBudgetUsd, providerBudgets[.<provider>[.<monthly|fiveHour>]])", file=sys.stderr)
+        print(f"key '{key}' is not settable (allowed: projectLimit, sharedAccess, tsLogin, githubLogin, admin, monthlyBudgetUsd, providerBudgets[.<provider>[.<monthly|fiveHour>]])", file=sys.stderr)
         sys.exit(2)
     save()
 
@@ -705,6 +718,9 @@ cmd_set() {
         tsLogin)
             [[ -n "${value}" ]] && validate_ts_login "${value}"
             ;;
+        githubLogin)
+            [[ -z "${value}" || "${value}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]] || die "invalid githubLogin"
+            ;;
         monthlyBudgetUsd)
             [[ "${value}" =~ ^[0-9]+(\.[0-9]{1,2})?$ ]] || die "monthlyBudgetUsd must be a number (0 = unlimited)"
             ;;
@@ -712,7 +728,7 @@ cmd_set() {
             # Shape/provider/amount validation happens in registry_py (JSON and
             # numeric parsing live there); nothing to pre-check here.
             ;;
-        *) die "key '${key}' is not settable (allowed: projectLimit, sharedAccess, tsLogin, admin, monthlyBudgetUsd, providerBudgets[.<provider>[.<monthly|fiveHour>]])" ;;
+        *) die "key '${key}' is not settable (allowed: projectLimit, sharedAccess, tsLogin, githubLogin, admin, monthlyBudgetUsd, providerBudgets[.<provider>[.<monthly|fiveHour>]])" ;;
     esac
 
     registry_py set "${name}" "${key}" "${value}"
