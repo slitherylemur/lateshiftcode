@@ -41,12 +41,16 @@ cd "${CHECKOUT}"
 git fetch origin "${BRANCH}"
 git reset --hard FETCH_HEAD
 
-echo "== 3/4 rebuild server bundle =="
+echo "== 3/4 rebuild server bundle + web client =="
 corepack pnpm install --prefer-offline 2>&1 | tail -2
-cd "${CHECKOUT}/apps/server"
-"${CHECKOUT}/node_modules/.bin/vp" pack
-[[ -f dist/bin.mjs ]] || die "build finished but dist/bin.mjs is missing"
-bash /home/dev/services/lateshift/tools/apply-branding.sh "${CHECKOUT}/apps/server/dist/client" || echo "warning: branding pass failed" >&2
+cd "${CHECKOUT}"
+( cd apps/server && "${CHECKOUT}/node_modules/.bin/vp" pack )
+[[ -f apps/server/dist/bin.mjs ]] || die "server build finished but apps/server/dist/bin.mjs is missing"
+# The instance serves the web UI from apps/web/dist (see apps/server config
+# monorepoClient = ../../web/dist) — it must be rebuilt too, not just the server.
+"${CHECKOUT}/node_modules/.bin/vp" run --filter ./apps/web build
+[[ -f apps/web/dist/index.html ]] || die "web build finished but apps/web/dist/index.html is missing"
+bash /home/dev/services/lateshift/tools/apply-branding.sh "${CHECKOUT}/apps/web/dist" || echo "warning: branding pass failed" >&2
 
 echo "== 4/4 restart instances =="
 python3 - <<'PYEOF'
