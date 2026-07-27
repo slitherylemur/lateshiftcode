@@ -1,14 +1,18 @@
 import { useAtomValue } from "@effect/atom-react";
+import type { EnvironmentId } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 
+import { openCommandPalette } from "../commandPaletteBus";
 import { isElectron } from "../env";
+import { onOpenNewProjectDialog } from "../newProjectDialogBus";
 import { getLocalStorageItem } from "../hooks/useLocalStorage";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import { cn, isMacPlatform } from "../lib/utils";
 import { primaryServerKeybindingsAtom } from "../state/server";
 import { useClientSettings } from "../hooks/useSettings";
+import { NewProjectDialog } from "./NewProjectDialog";
 import ThreadSidebar from "./Sidebar";
 import ThreadSidebarV2 from "./SidebarV2";
 import { useSidebarStageBackdropVariant } from "./SidebarStageBackdrop";
@@ -100,6 +104,25 @@ function SidebarControl() {
 
 export function AppSidebarLayout({ children }: { children: ReactNode }) {
   const navigate = useNavigate();
+  // The New project dialog is mounted app-wide (independent of which sidebar
+  // variant is active) so the add-project palette's "Roblox game" source can
+  // open it via the bus in both the v1 and v2 sidebars.
+  const [isNewProjectDialogOpen, setIsNewProjectDialogOpen] = useState(false);
+  const [newProjectInitialMode, setNewProjectInitialMode] = useState<"default" | "roblox">(
+    "default",
+  );
+  const [newProjectEnvironmentId, setNewProjectEnvironmentId] = useState<EnvironmentId | null>(
+    null,
+  );
+  useEffect(
+    () =>
+      onOpenNewProjectDialog((detail) => {
+        setNewProjectInitialMode(detail.mode ?? "default");
+        setNewProjectEnvironmentId(detail.environmentId ?? null);
+        setIsNewProjectDialogOpen(true);
+      }),
+    [],
+  );
   const sidebarV2Enabled = useClientSettings((settings) => settings.sidebarV2Enabled);
   // Settings routes render the settings nav, which lives in the v1 component
   // and is identical for both sidebars — so v1 stays mounted there.
@@ -183,6 +206,13 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
       </Sidebar>
       {children}
       <SidebarControl />
+      <NewProjectDialog
+        open={isNewProjectDialogOpen}
+        onOpenChange={setIsNewProjectDialogOpen}
+        onBrowseExisting={() => openCommandPalette({ open: "add-project" })}
+        initialMode={newProjectInitialMode}
+        environmentIdOverride={newProjectEnvironmentId}
+      />
     </SidebarProvider>
   );
 }
