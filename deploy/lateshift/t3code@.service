@@ -23,5 +23,64 @@ MemoryMax=1536M
 CPUQuota=150%
 TasksMax=512
 
+# --- Sandbox (LateShift Cloud hardening) --------------------------------------
+# Worker instances run as `dev` and spawn agent CLIs (claude/codex) that used to
+# have passwordless sudo and full write access to the box. These directives
+# confine an instance (and every process it spawns) to its own base dir plus a
+# small, explicit set of shared/credential paths. See README.md ("Sandbox") for
+# the full block/allow matrix and the credential-exposure tradeoffs.
+
+# Kills sudo/setuid escalation inside instances (required). No agent can regain
+# privileges even though /usr/bin/sudo still exists on the box.
+NoNewPrivileges=yes
+
+# Whole filesystem read-only except the ReadWritePaths carve-outs below. This
+# alone blocks writes to /etc, /home/dev/projects, /home/dev/services/t3code-production,
+# and everything else outside the instance's own area.
+ProtectSystem=strict
+ProtectHome=read-only
+
+# Writable carve-outs (the ONLY paths an instance may modify):
+#   - its own base dir (all instance state: userdata, projects, worktrees, caches)
+#   - the shared collaboration root
+#   - the shared agent credential/state dirs (claude/codex write sessions,
+#     caches and refreshed OAuth tokens here — see README tradeoffs)
+#   - /run/tailscale so the server can (re)configure `tailscale serve`
+ReadWritePaths=/home/dev/services/lateshift/users/%i
+ReadWritePaths=/home/dev/shared
+ReadWritePaths=/home/dev/.claude
+ReadWritePaths=/home/dev/.claude.json
+ReadWritePaths=/home/dev/.codex
+ReadWritePaths=/home/dev/.cache
+ReadWritePaths=/run/tailscale
+
+# Private /tmp and /var/tmp per instance (no cross-instance tmp leakage).
+PrivateTmp=yes
+
+# Kernel/host hardening: block module loading, kernel-tunable and clock writes,
+# cgroup tampering, raw kernel-log access, hostname changes, and new SUID/SGID
+# or realtime privileges. None of these are needed by the server or the agents.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+
+# Restrict syscalls to the service baseline (blocks @mount, @swap, @reboot,
+# @module, @raw-io, @obsolete, ...). node's JIT needs W^X-writable memory, so
+# MemoryDenyWriteExecute is deliberately NOT set.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# dev is a login user with a live production process; do not reap its IPC on
+# instance stop.
+RemoveIPC=no
+
 [Install]
 WantedBy=multi-user.target
