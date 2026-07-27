@@ -102,5 +102,9 @@ export function createProjectEnvironmentAtoms<R, E>(
           JSON.stringify([environmentId, input.cwd, input.relativePath]),
       },
     }),
+    createRoblox: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:commands:project:create-roblox",
+      tag: WS_METHODS.projectsCreateRoblox,
+    }),
   };
 }
