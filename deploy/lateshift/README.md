@@ -47,7 +47,9 @@ Runtime-only paths (not in the repo):
 ## Registry: `users.json`
 
 This file is the contract the LateShift portal reads. `t3user` is its only
-writer (mutations are serialized with an flock).
+writer. All subcommands (including `list`) take an exclusive flock on
+`.registry.lock` before touching the file, and every write is crash-safe:
+temp file in the same directory, `fsync`, atomic rename.
 
 ```json
 {
@@ -74,8 +76,12 @@ writer (mutations are serialized with an flock).
   (enforcement lands in a later phase).
 - `sharedAccess` — reserved: whether the user can see shared Roblox project dirs.
 - `admin` — reserved: portal admin flag.
-- `nextLocalPort` / `nextTsPort` — monotonic allocators; ports of removed users
-  are intentionally not reused.
+- `nextLocalPort` / `nextTsPort` — allocator cursors. Allocation starts at the
+  cursor and skips ports that are reserved (3773/443), already in registry
+  entries, currently listening (`ss -ltn`), or mapped by `tailscale serve`;
+  cursors only advance past committed ports, so ports of removed users are
+  not reused. All port values are numerically normalized (leading zeros/`+`
+  stripped, 1-65535 enforced) before any comparison or use.
 
 ## `instance.env`
 
@@ -94,14 +100,25 @@ into `--port` / `--tailscale-serve-port` and execs node.
 
 ```
 t3user add <name> [--project-limit N] [--admin]  # provision + enable + start + health-wait
-t3user remove <name>                             # stop+disable unit, archive base dir (no rm -rf)
+t3user remove <name> [--force]                   # stop+disable unit, archive base dir (no rm -rf of live data)
 t3user list                                      # table of registered users
 t3user pair <name> [--ttl 1h]                    # one-time pairing URL for the instance
 ```
 
-- Names must match `[a-z0-9-]{2,20}`; `add` refuses existing users.
-- `remove` archives to `/home/dev/services/lateshift/archive/<name>-<utc-ts>` and
-  clears the instance's `tailscale serve` HTTPS mapping (guarded to never touch 443).
+- Names must match `[a-z0-9-]{2,20}`; `add` refuses existing users; extra
+  positional arguments are rejected on every subcommand.
+- `add` only commits to `users.json` after the instance is healthy: unit
+  `is-active`, local HTTP 200, and the listening PID confirmed inside the
+  unit's cgroup. On any failure it stops/disables the unit, clears the serve
+  mapping, deletes the just-created dir, and exits nonzero with the registry
+  untouched (the flock held across the whole `add` keeps the port pair
+  reserved meanwhile). After commit it also probes the tailnet HTTPS URL and
+  warns (does not fail) if unreachable.
+- `remove` aborts before archiving/deregistering if `systemctl disable --now`
+  fails, unless `--force` is given. It archives to
+  `/home/dev/services/lateshift/archive/<name>-<utc-ts>-<nanos>` (fails rather
+  than overwrite an existing destination) and clears the instance's
+  `tailscale serve` HTTPS mapping (numerically guarded to never touch 443).
 - `pair` uses `t3 auth pairing create` with
   `--base-url https://t3cloud.taild7c97b.ts.net:<tsPort>` (works via direct
   SQLite access while the instance runs).

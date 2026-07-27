@@ -3,7 +3,7 @@
 #
 # Usage:
 #   t3user add <name> [--project-limit N] [--admin]   provision + start an instance
-#   t3user remove <name>                              stop instance, archive its data
+#   t3user remove <name> [--force]                    stop instance, archive its data
 #   t3user list                                       show all registered users
 #   t3user pair <name> [--ttl 1h]                     mint a one-time pairing URL
 #
@@ -25,12 +25,28 @@ LOCK_FILE="${LATESHIFT_ROOT}/.registry.lock"
 TAILNET_HOST="t3cloud.taild7c97b.ts.net"
 T3_CLI="/usr/bin/t3"
 HEALTH_TIMEOUT_SECS=60
+RESERVED_LOCAL_PORT=3773   # production t3code local port
+RESERVED_TS_PORT=443       # production tailscale serve HTTPS port
 
 die() { echo "t3user: $*" >&2; exit 1; }
 
 usage() {
     sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
+}
+
+# Normalize a port to a canonical decimal integer: strips one leading '+' and
+# leading zeros, requires digits only, range 1-65535. Prints the normalized
+# value; fails otherwise. Every port read from the registry, env, or CLI must
+# pass through this before comparison or use, so "0443"/"+443" cannot bypass
+# the reserved-port guards.
+normalize_port() {
+    local raw="$1" v
+    v="${raw#+}"
+    [[ "${v}" =~ ^[0-9]+$ ]] || { echo "t3user: invalid port '${raw}': not a positive integer" >&2; return 1; }
+    v=$((10#${v}))
+    (( v >= 1 && v <= 65535 )) || { echo "t3user: invalid port '${raw}': out of range 1-65535" >&2; return 1; }
+    echo "${v}"
 }
 
 ensure_registry() {
@@ -55,12 +71,15 @@ validate_name() {
     esac
 }
 
-# registry_py <op> [args...]  -- all registry mutations go through python3 (no jq on box)
+# registry_py <op> [args...]  -- all registry access goes through python3 (no jq
+# on box). Writes are atomic: temp file in the same directory, fsync, rename.
 registry_py() {
     python3 - "$@" <<'PYEOF'
-import json, sys, datetime
+import json, os, sys, datetime, tempfile
 
 REGISTRY = "/home/dev/services/lateshift/users.json"
+RESERVED_LOCAL = {3773}
+RESERVED_TS = {443}
 op = sys.argv[1]
 args = sys.argv[2:]
 
@@ -68,21 +87,73 @@ with open(REGISTRY) as f:
     reg = json.load(f)
 
 def save():
-    with open(REGISTRY, "w") as f:
-        json.dump(reg, f, indent=2, sort_keys=False)
-        f.write("\n")
+    # Crash-safe write: temp file in same dir -> fsync -> atomic rename.
+    reg_dir = os.path.dirname(REGISTRY)
+    fd, tmp = tempfile.mkstemp(prefix="users.json.tmp.", dir=reg_dir)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(reg, f, indent=2, sort_keys=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(tmp, REGISTRY)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    # Persist the rename itself.
+    dfd = os.open(reg_dir, os.O_DIRECTORY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+def taken(kind):
+    key = "localPort" if kind == "local" else "tsPort"
+    return {int(u[key]) for u in reg["users"].values()}
+
+def parse_busy(s):
+    out = set()
+    for tok in s.split(","):
+        tok = tok.strip()
+        if tok.isdigit():
+            out.add(int(tok))
+    return out
 
 if op == "exists":
     sys.exit(0 if args[0] in reg["users"] else 1)
 
-elif op == "add":
-    name, project_limit, admin = args[0], int(args[1]), args[2] == "true"
+elif op == "alloc":
+    # alloc <busy_local_csv> <busy_ts_csv>
+    # Pick the next free port pair WITHOUT persisting anything. The caller
+    # holds the registry flock for the whole `add`, so the pair stays reserved
+    # until `commit` (or is simply dropped on failure, leaving no state).
+    busy_local = parse_busy(args[0]) | taken("local") | RESERVED_LOCAL
+    busy_ts = parse_busy(args[1]) | taken("ts") | RESERVED_TS
+    def pick(start, busy):
+        p = int(start)
+        for _ in range(2000):
+            if 1 <= p <= 65535 and p not in busy:
+                return p
+            p += 1
+        print("no free port found within search window", file=sys.stderr)
+        sys.exit(2)
+    local_port = pick(reg["nextLocalPort"], busy_local)
+    ts_port = pick(reg["nextTsPort"], busy_ts)
+    print(f"{local_port} {ts_port}")
+
+elif op == "commit":
+    # commit <name> <localPort> <tsPort> <projectLimit> <admin>
+    # Persist a user AFTER its instance passed health checks.
+    name, local_port, ts_port = args[0], int(args[1]), int(args[2])
+    project_limit, admin = int(args[3]), args[4] == "true"
     if name in reg["users"]:
+        print(f"user '{name}' already present at commit time", file=sys.stderr)
         sys.exit(1)
-    local_port = reg["nextLocalPort"]
-    ts_port = reg["nextTsPort"]
-    if ts_port == 443 or local_port == 3773:
-        print("port allocation collided with production reservation", file=sys.stderr)
+    if local_port in RESERVED_LOCAL or ts_port in RESERVED_TS:
+        print("refusing to commit reserved production port", file=sys.stderr)
         sys.exit(2)
     reg["users"][name] = {
         "localPort": local_port,
@@ -94,10 +165,9 @@ elif op == "add":
         "createdAt": datetime.datetime.now(datetime.timezone.utc)
             .strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    reg["nextLocalPort"] = local_port + 1
-    reg["nextTsPort"] = ts_port + 1
+    reg["nextLocalPort"] = max(reg["nextLocalPort"], local_port + 1)
+    reg["nextTsPort"] = max(reg["nextTsPort"], ts_port + 1)
     save()
-    print(f"{local_port} {ts_port}")
 
 elif op == "get":
     name, field = args[0], args[1]
@@ -127,17 +197,71 @@ else:
 PYEOF
 }
 
+# CSV of local TCP ports currently in LISTEN state.
+listening_ports_csv() {
+    ss -ltnH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' \
+        | grep -E '^[0-9]+$' | sort -un | paste -sd, - || true
+}
+
+# CSV of HTTPS ports currently mapped by tailscale serve (443 implied when
+# the URL carries no explicit port).
+serve_ports_csv() {
+    {
+        tailscale serve status 2>/dev/null \
+            | grep -oE '^https://[^ ]+' \
+            | sed -E 's|^https://[^:/]+:?([0-9]*).*|\1|' \
+            | sed 's/^$/443/'
+    } | grep -E '^[0-9]+$' | sort -un | paste -sd, - || true
+}
+
 wait_for_health() {
-    local port="$1" deadline=$((SECONDS + HEALTH_TIMEOUT_SECS)) code
+    local name="$1" port="$2" deadline=$((SECONDS + HEALTH_TIMEOUT_SECS)) code
     while (( SECONDS < deadline )); do
         code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:${port}/" || true)
-        if [[ "${code}" == "200" ]]; then
-            echo "healthy (HTTP ${code} on 127.0.0.1:${port})"
+        if [[ "${code}" == "200" ]] && [[ "$(systemctl is-active "t3code@${name}.service" 2>/dev/null)" == "active" ]]; then
+            echo "healthy (HTTP ${code} on 127.0.0.1:${port}, unit active)"
             return 0
         fi
         sleep 2
     done
     return 1
+}
+
+# Confirm the process listening on <port> belongs to the t3code@<name> unit's
+# cgroup. Returns 0 on confirmed ownership, 0 with a warning if ownership
+# cannot be determined (is-active + curl already passed), 1 on a confirmed
+# foreign listener.
+verify_unit_owns_port() {
+    local name="$1" port="$2" listener_pid cgroup_procs
+    listener_pid=$(ss -ltnpH "sport = :${port}" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1 || true)
+    cgroup_procs="/sys/fs/cgroup/system.slice/system-t3code.slice/t3code@${name}.service/cgroup.procs"
+    if [[ -z "${listener_pid}" || ! -r "${cgroup_procs}" ]]; then
+        echo "warning: could not attribute listener on port ${port} to a cgroup; relying on is-active + HTTP checks" >&2
+        return 0
+    fi
+    if grep -qx "${listener_pid}" "${cgroup_procs}"; then
+        echo "listener pid ${listener_pid} confirmed inside t3code@${name}.service cgroup"
+        return 0
+    fi
+    echo "port ${port} is served by pid ${listener_pid}, which is NOT in t3code@${name}.service's cgroup" >&2
+    return 1
+}
+
+# Roll back a failed `add`: stop/disable the unit, clear its serve mapping,
+# delete the directory this invocation created. The registry was never
+# touched (commit happens only after health), so nothing to undo there.
+rollback_add() {
+    local name="$1" ts_port="$2" created_dir="$3"
+    echo "rolling back failed provision of '${name}' ..." >&2
+    sudo systemctl disable --now "t3code@${name}.service" >/dev/null 2>&1 || true
+    if [[ -n "${ts_port}" ]] && (( ts_port != RESERVED_TS_PORT )); then
+        sudo tailscale serve --https="${ts_port}" off 2>/dev/null || true
+    fi
+    # Safe: this exact path was verified absent at the start of this add and
+    # created by this invocation; the instance never became healthy.
+    if [[ -n "${created_dir}" && -d "${created_dir}" ]]; then
+        rm -rf "${created_dir}"
+    fi
 }
 
 cmd_add() {
@@ -159,13 +283,22 @@ cmd_add() {
     fi
     [[ -e "${USERS_DIR}/${name}" ]] && die "base dir ${USERS_DIR}/${name} already exists; resolve manually"
 
+    # Allocate ports (no registry write yet; the held flock reserves the pair
+    # for the duration of this add). Skips listening ports, existing registry
+    # entries, live tailscale serve mappings, and production's 3773/443.
     local ports
-    ports=$(registry_py add "${name}" "${project_limit}" "${admin}") || die "registry allocation failed"
+    ports=$(registry_py alloc "$(listening_ports_csv)" "$(serve_ports_csv),$(listening_ports_csv)") \
+        || die "port allocation failed"
     local local_port ts_port
     read -r local_port ts_port <<< "${ports}"
+    local_port=$(normalize_port "${local_port}") || die "allocator returned bad local port"
+    ts_port=$(normalize_port "${ts_port}") || die "allocator returned bad ts port"
+    (( local_port != RESERVED_LOCAL_PORT )) || die "allocator returned reserved local port ${RESERVED_LOCAL_PORT}"
+    (( ts_port != RESERVED_TS_PORT )) || die "allocator returned reserved HTTPS port ${RESERVED_TS_PORT}"
 
-    mkdir -p "${USERS_DIR}/${name}"
-    cat > "${USERS_DIR}/${name}/instance.env" <<EOF
+    local base_dir="${USERS_DIR}/${name}"
+    mkdir -p "${base_dir}"
+    cat > "${base_dir}/instance.env" <<EOF
 # LateShift Cloud instance config for '${name}' (consumed by t3code@${name}.service)
 T3CODE_INSTANCE_PORT=${local_port}
 TS_SERVE_PORT=${ts_port}
@@ -173,14 +306,40 @@ T3CODE_MAX_PROJECTS=${project_limit}
 EOF
 
     echo "provisioning '${name}': local port ${local_port}, tailnet HTTPS port ${ts_port}"
-    sudo systemctl enable --now "t3code@${name}.service"
+    if ! sudo systemctl enable --now "t3code@${name}.service"; then
+        rollback_add "${name}" "${ts_port}" "${base_dir}"
+        die "systemctl enable --now t3code@${name} failed; rolled back (registry untouched)"
+    fi
 
     echo -n "waiting for health on 127.0.0.1:${local_port} ... "
-    if ! wait_for_health "${local_port}"; then
+    if ! wait_for_health "${name}" "${local_port}"; then
         echo "FAILED"
         echo "instance did not become healthy within ${HEALTH_TIMEOUT_SECS}s; recent logs:" >&2
         sudo journalctl -u "t3code@${name}" -n 20 --no-pager >&2 || true
-        exit 1
+        rollback_add "${name}" "${ts_port}" "${base_dir}"
+        die "provision failed; rolled back (registry untouched)"
+    fi
+    if ! verify_unit_owns_port "${name}" "${local_port}"; then
+        rollback_add "${name}" "${ts_port}" "${base_dir}"
+        die "port ${local_port} answered but is not owned by t3code@${name}; rolled back (registry untouched)"
+    fi
+
+    # Instance is healthy and verified: persist it to the registry (atomic write).
+    registry_py commit "${name}" "${local_port}" "${ts_port}" "${project_limit}" "${admin}" \
+        || { rollback_add "${name}" "${ts_port}" "${base_dir}"; die "registry commit failed; rolled back"; }
+
+    # Best-effort tailnet reachability check (warn only: tailscale serve can
+    # lag a moment, and local health is the provisioning gate).
+    local ts_code
+    ts_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://${TAILNET_HOST}:${ts_port}/" || true)
+    if [[ "${ts_code}" != "200" ]]; then
+        sleep 3
+        ts_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://${TAILNET_HOST}:${ts_port}/" || true)
+    fi
+    if [[ "${ts_code}" == "200" ]]; then
+        echo "tailnet endpoint healthy (HTTP 200 on https://${TAILNET_HOST}:${ts_port}/)"
+    else
+        echo "warning: https://${TAILNET_HOST}:${ts_port}/ returned '${ts_code:-none}'; check 'tailscale serve status'" >&2
     fi
 
     systemctl status "t3code@${name}" --no-pager -n 0 | head -6 || true
@@ -192,24 +351,50 @@ EOF
 }
 
 cmd_remove() {
-    local name="${1:?usage: t3user remove <name>}"
+    local name="" force=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force) force=true; shift ;;
+            -*) die "unknown flag for remove: $1" ;;
+            *) [[ -n "${name}" ]] && die "unexpected argument: $1"; name="$1"; shift ;;
+        esac
+    done
+    [[ -n "${name}" ]] || die "usage: t3user remove <name> [--force]"
     validate_name "${name}"
     registry_py exists "${name}" || die "user '${name}' not found"
 
-    local ts_port
-    ts_port=$(registry_py get "${name}" tsPort)
+    local ts_port_raw ts_port=""
+    ts_port_raw=$(registry_py get "${name}" tsPort)
+    if ! ts_port=$(normalize_port "${ts_port_raw}"); then
+        ${force} || die "registry tsPort '${ts_port_raw}' for '${name}' is invalid; refusing (use --force to skip serve cleanup)"
+        echo "warning: invalid tsPort '${ts_port_raw}'; skipping tailscale serve cleanup" >&2
+        ts_port=""
+    fi
 
     echo "stopping and disabling t3code@${name} ..."
-    sudo systemctl disable --now "t3code@${name}.service" || true
+    if ! sudo systemctl disable --now "t3code@${name}.service"; then
+        if ${force}; then
+            echo "warning: 'systemctl disable --now t3code@${name}' failed; continuing due to --force" >&2
+        else
+            die "failed to stop/disable t3code@${name}; aborting before archive/deregister (use --force to override)"
+        fi
+    fi
 
-    # Best-effort: clear the tailscale serve mapping this instance created.
-    if [[ -n "${ts_port}" && "${ts_port}" != "443" ]]; then
+    # Clear any residual failed state so a removed user leaves no unit debris.
+    sudo systemctl reset-failed "t3code@${name}.service" 2>/dev/null || true
+
+    # Clear the tailscale serve mapping this instance created. Numeric guard:
+    # never touch production's HTTPS 443.
+    if [[ -n "${ts_port}" ]] && (( ts_port != RESERVED_TS_PORT )); then
         sudo tailscale serve --https="${ts_port}" off 2>/dev/null || true
     fi
 
     if [[ -d "${USERS_DIR}/${name}" ]]; then
-        local dest="${ARCHIVE_DIR}/${name}-$(date -u +%Y%m%d-%H%M%S)"
-        mv "${USERS_DIR}/${name}" "${dest}"
+        # Collision-safe archive destination: UTC timestamp + nanoseconds, and
+        # hard-fail if it somehow already exists (never merge/nest archives).
+        local dest="${ARCHIVE_DIR}/${name}-$(date -u +%Y%m%d-%H%M%S)-$(date +%N)"
+        [[ -e "${dest}" ]] && die "archive destination ${dest} already exists; refusing to overwrite"
+        mv -T "${USERS_DIR}/${name}" "${dest}"
         echo "archived base dir to ${dest}"
     fi
 
@@ -218,6 +403,7 @@ cmd_remove() {
 }
 
 cmd_list() {
+    [[ $# -eq 0 ]] || die "list takes no arguments"
     registry_py list
 }
 
@@ -236,7 +422,7 @@ cmd_pair() {
 
     local base_dir ts_port
     base_dir=$(registry_py get "${name}" baseDir)
-    ts_port=$(registry_py get "${name}" tsPort)
+    ts_port=$(normalize_port "$(registry_py get "${name}" tsPort)") || die "registry tsPort for '${name}' is invalid"
 
     "${T3_CLI}" auth pairing create \
         --base-dir "${base_dir}" \
@@ -248,15 +434,16 @@ cmd_pair() {
 main() {
     [[ $# -ge 1 ]] || usage 1
     local cmd="$1"; shift
-    ensure_registry
     case "${cmd}" in
-        add|remove|pair)
-            # Serialize registry mutations/reads across concurrent invocations.
+        add|remove|pair|list)
+            # Serialize ALL registry access (reads included) across concurrent
+            # invocations; lock is taken before first-time registry creation.
+            mkdir -p "${LATESHIFT_ROOT}"
             exec 9> "${LOCK_FILE}"
             flock 9
+            ensure_registry
             "cmd_${cmd}" "$@"
             ;;
-        list) cmd_list "$@" ;;
         -h|--help|help) usage 0 ;;
         *) die "unknown command '${cmd}' (try: add, remove, list, pair)" ;;
     esac

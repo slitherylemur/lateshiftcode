@@ -13,16 +13,36 @@ name="${1:?usage: run-instance.sh <username>}"
 base_dir="/home/dev/services/lateshift/users/${name}"
 server_bin="/home/dev/services/t3code-production/apps/server/dist/bin.mjs"
 
+# Normalize a port to a canonical decimal integer: strips one leading '+' and
+# leading zeros, requires digits only, range 1-65535. Prints the normalized
+# value; fails otherwise. All comparisons below use the normalized value so
+# strings like "0443" or "+443" cannot slip past the reserved-port guards.
+normalize_port() {
+    local raw="$1" v
+    v="${raw#+}"                            # strip a single leading '+'
+    [[ "${v}" =~ ^[0-9]+$ ]] || { echo "invalid port '${raw}': not a positive integer" >&2; return 1; }
+    v=$((10#${v}))                          # force base-10, strips leading zeros
+    (( v >= 1 && v <= 65535 )) || { echo "invalid port '${raw}': out of range 1-65535" >&2; return 1; }
+    echo "${v}"
+}
+
 : "${T3CODE_INSTANCE_PORT:?T3CODE_INSTANCE_PORT missing from instance.env}"
 : "${TS_SERVE_PORT:?TS_SERVE_PORT missing from instance.env}"
 
-if [[ "${TS_SERVE_PORT}" == "443" ]]; then
+local_port=$(normalize_port "${T3CODE_INSTANCE_PORT}") || exit 1
+ts_port=$(normalize_port "${TS_SERVE_PORT}") || exit 1
+
+if (( ts_port == 443 )); then
     echo "refusing to start: TS_SERVE_PORT 443 is reserved for the production instance" >&2
+    exit 1
+fi
+if (( local_port == 3773 )); then
+    echo "refusing to start: local port 3773 is reserved for the production instance" >&2
     exit 1
 fi
 
 exec /usr/bin/node "${server_bin}" serve \
     --base-dir "${base_dir}" \
-    --port "${T3CODE_INSTANCE_PORT}" \
+    --port "${local_port}" \
     --tailscale-serve \
-    --tailscale-serve-port "${TS_SERVE_PORT}"
+    --tailscale-serve-port "${ts_port}"

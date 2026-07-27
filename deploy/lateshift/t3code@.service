@@ -11,6 +11,9 @@ EnvironmentFile=/home/dev/services/lateshift/users/%i/instance.env
 ExecStart=/home/dev/services/lateshift/bin/run-instance.sh %i
 Restart=on-failure
 RestartSec=5
+# The server exits 130 on SIGTERM; treat a requested stop as success so a
+# plain `systemctl stop` does not leave the unit in a residual failed state.
+SuccessExitStatus=130
 
 # Resource caps: box has 7.6 GiB RAM / 4 cores; production t3code uses ~1 GiB.
 # Each instance idles around 1 GiB, so soft-cap at 1 GiB, hard-cap at 1.5 GiB,
