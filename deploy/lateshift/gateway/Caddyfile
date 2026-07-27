@@ -1,0 +1,74 @@
+# LateShift Cloud — public gateway (Caddy).
+#
+# Listens ONLY on 127.0.0.1:8880 (plain HTTP). TLS terminates at Cloudflare;
+# the `lateshift` cloudflared tunnel routes lateshiftcloud.com and
+# *.lateshiftcloud.com -> http://127.0.0.1:8880. Caddy never binds a public
+# interface and never touches ports 80/443 (auto_https off).
+#
+# Per-user site blocks are generated into /etc/caddy/lsc-users.caddy by
+# /home/dev/services/lateshift/bin/render-gateway (reads users.json). Do not
+# edit that file by hand.
+
+{
+	admin localhost:2019
+	auto_https off
+	default_bind 127.0.0.1
+	http_port 8880
+	log {
+		output file /var/log/caddy/gateway.log
+		level INFO
+	}
+}
+
+# --- reusable gated proxy ----------------------------------------------------
+# usage: import lsc_gated <upstream-port>
+# forward_auth -> portal /authz (Cookie forwarded automatically; we add the
+# public hostname). On allow (2xx) X-Lsc-User is copied onto the upstream
+# request and we reverse_proxy to the instance. reverse_proxy upgrades
+# WebSockets natively (T3 is websocket-heavy).
+(lsc_gated) {
+	forward_auth 127.0.0.1:3790 {
+		uri /authz
+		method GET
+		header_up X-Authz-Host {host}
+		copy_headers X-Lsc-User
+
+		# 401: not signed in -> bounce browser to the login URL the portal returns.
+		@needauth status 401
+		handle_response @needauth {
+			redir {rp.header.X-Authz-Redirect} 302
+		}
+		# 403: signed in but not permitted -> small forbidden page.
+		@forbidden status 403
+		handle_response @forbidden {
+			header Content-Type "text/html; charset=utf-8"
+			respond "<!doctype html><html><head><title>Forbidden - LateShift Cloud</title><meta name=viewport content='width=device-width,initial-scale=1'><style>body{background:#0b0e14;color:#e8ebf1;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}div{text-align:center}h1{letter-spacing:-.01em}p{color:#8a92a6}a{color:#7aa2f7}</style></head><body><div><h1>403 - Forbidden</h1><p>You are signed in, but you don't have access to this instance.</p><p><a href='https://lateshiftcloud.com/'>Back to LateShift Cloud</a></p></div></body></html>" 403
+		}
+	}
+	reverse_proxy 127.0.0.1:{args[0]}
+}
+
+# --- apex + www: portal directly (no authz) ----------------------------------
+# Every site address carries the explicit http:// scheme so Caddy binds them on
+# http_port (8880) instead of the default HTTPS 443 — TLS is Cloudflare's job.
+http://lateshiftcloud.com, http://www.lateshiftcloud.com {
+	reverse_proxy 127.0.0.1:3790 {
+		# Caddy already sets X-Forwarded-Host/-For; override proto since we sit
+		# behind Cloudflare's TLS (Caddy itself only sees plain HTTP).
+		header_up X-Forwarded-Proto https
+	}
+}
+
+# --- production instance (admin-gated by the portal /authz logic) ------------
+http://prod.lateshiftcloud.com {
+	import lsc_gated 3773
+}
+
+# --- per-user instances (generated from users.json) --------------------------
+import /etc/caddy/lsc-users.caddy
+
+# --- unknown subdomain -> 404 ------------------------------------------------
+http://*.lateshiftcloud.com {
+	header Content-Type "text/html; charset=utf-8"
+	respond "<!doctype html><html><head><title>Not found - LateShift Cloud</title><meta name=viewport content='width=device-width,initial-scale=1'><style>body{background:#0b0e14;color:#e8ebf1;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}div{text-align:center}h1{letter-spacing:-.01em}p{color:#8a92a6}a{color:#7aa2f7}</style></head><body><div><h1>404 - Not found</h1><p>No such LateShift Cloud workspace.</p><p><a href='https://lateshiftcloud.com/'>Back to LateShift Cloud</a></p></div></body></html>" 404
+}
