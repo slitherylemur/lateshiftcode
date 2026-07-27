@@ -7,7 +7,8 @@
 #   t3user remove <name> [--force]                    stop instance, archive its data
 #   t3user list                                       show all registered users
 #   t3user set <name> <key> <value>                   update a registry field
-#                                                     (keys: projectLimit, sharedAccess, tsLogin, admin, monthlyBudgetUsd)
+#                                                     (keys: projectLimit, sharedAccess, tsLogin, admin,
+#                                                      monthlyBudgetUsd, providerBudgets[.<provider>[.monthly|.fiveHour]])
 #   t3user pair <name> [--ttl 1h]                     mint a one-time pairing URL
 #   t3user share <name> <abs-path>                    grant a shared project dir (t3 project add on their instance)
 #   t3user unshare <name> <abs-path>                  revoke a shared project dir
@@ -135,6 +136,53 @@ def parse_busy(s):
             out.add(int(tok))
     return out
 
+# --- provider budgets ---------------------------------------------------------
+# Registry shape (backwards-compatible):
+#   providerBudgets: { "<provider>": <value>, ... }  where <provider> in
+#   {claude, codex} and <value> is EITHER a number (monthly USD cap, legacy
+#   form) OR an object {"monthly": X, "fiveHour": Y}. Absent/0 = unlimited.
+PROVIDERS = ("claude", "codex")
+
+
+def parse_amount(v, label):
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        print(f"{label} must be a number", file=sys.stderr)
+        sys.exit(2)
+    if not (0 <= n <= 100000):
+        print(f"{label} must be 0-100000 (0 = unlimited)", file=sys.stderr)
+        sys.exit(2)
+    return round(n, 2)
+
+
+def normalize_provider_value(v, label):
+    """Coerce a per-provider budget into either a rounded number (monthly-only)
+    or a {'monthly': X, 'fiveHour': Y} dict; validate ranges."""
+    if isinstance(v, dict):
+        out = {}
+        m = parse_amount(v.get("monthly", 0), f"{label}.monthly")
+        h = parse_amount(v.get("fiveHour", 0), f"{label}.fiveHour")
+        # Store the compact number form when there is no five-hour cap so the
+        # legacy single-number shape round-trips unchanged.
+        if h == 0:
+            return m
+        out["monthly"] = m
+        out["fiveHour"] = h
+        return out
+    return parse_amount(v, label)
+
+
+def provider_amounts(pb, provider):
+    """Return (monthlyUsd, fiveHourUsd) for a provider from either shape."""
+    v = (pb or {}).get(provider, 0)
+    if isinstance(v, dict):
+        return float(v.get("monthly") or 0), float(v.get("fiveHour") or 0)
+    try:
+        return float(v or 0), 0.0
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+
 if op == "exists":
     sys.exit(0 if args[0] in reg["users"] else 1)
 
@@ -182,6 +230,7 @@ elif op == "commit":
         "admin": admin,
         "tsLogin": ts_login,
         "monthlyBudgetUsd": 0,
+        "providerBudgets": {},
         "sharedProjects": [],
         "createdAt": datetime.datetime.now(datetime.timezone.utc)
             .strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -246,8 +295,60 @@ elif op == "set":
             print("monthlyBudgetUsd must be 0-100000 (0 = unlimited)", file=sys.stderr)
             sys.exit(2)
         user[key] = round(n, 2)
+    elif key == "providerBudgets" or key.startswith("providerBudgets."):
+        pb = user.setdefault("providerBudgets", {})
+        if not isinstance(pb, dict):
+            pb = {}
+            user["providerBudgets"] = pb
+        parts = key.split(".")
+        if len(parts) == 1:
+            # Whole object as JSON, e.g. '{"claude":20,"codex":{"monthly":30,"fiveHour":8}}'
+            try:
+                obj = json.loads(value)
+            except json.JSONDecodeError:
+                print("providerBudgets must be a JSON object", file=sys.stderr)
+                sys.exit(2)
+            if not isinstance(obj, dict):
+                print("providerBudgets must be a JSON object", file=sys.stderr)
+                sys.exit(2)
+            new = {}
+            for prov, val in obj.items():
+                if prov not in PROVIDERS:
+                    print(f"unknown provider '{prov}' (allowed: {', '.join(PROVIDERS)})", file=sys.stderr)
+                    sys.exit(2)
+                new[prov] = normalize_provider_value(val, f"providerBudgets.{prov}")
+            user["providerBudgets"] = new
+        elif len(parts) == 2:
+            prov = parts[1]
+            if prov not in PROVIDERS:
+                print(f"unknown provider '{prov}' (allowed: {', '.join(PROVIDERS)})", file=sys.stderr)
+                sys.exit(2)
+            # value may be a bare number (monthly) or a JSON object {monthly,fiveHour}
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                parsed = value
+            pb[prov] = normalize_provider_value(parsed, f"providerBudgets.{prov}")
+        elif len(parts) == 3:
+            prov, sub = parts[1], parts[2]
+            if prov not in PROVIDERS:
+                print(f"unknown provider '{prov}' (allowed: {', '.join(PROVIDERS)})", file=sys.stderr)
+                sys.exit(2)
+            if sub not in ("monthly", "fiveHour"):
+                print(f"unknown budget field '{sub}' (allowed: monthly, fiveHour)", file=sys.stderr)
+                sys.exit(2)
+            m, h = provider_amounts(pb, prov)
+            amt = parse_amount(value, f"providerBudgets.{prov}.{sub}")
+            if sub == "monthly":
+                m = amt
+            else:
+                h = amt
+            pb[prov] = m if h == 0 else {"monthly": m, "fiveHour": h}
+        else:
+            print(f"invalid providerBudgets key '{key}'", file=sys.stderr)
+            sys.exit(2)
     else:
-        print(f"key '{key}' is not settable (allowed: projectLimit, sharedAccess, tsLogin, admin, monthlyBudgetUsd)", file=sys.stderr)
+        print(f"key '{key}' is not settable (allowed: projectLimit, sharedAccess, tsLogin, admin, monthlyBudgetUsd, providerBudgets[.<provider>[.<monthly|fiveHour>]])", file=sys.stderr)
         sys.exit(2)
     save()
 
@@ -282,6 +383,31 @@ elif op == "shares":
         sys.exit(1)
     for p in user.get("sharedProjects", []):
         print(p)
+
+elif op == "envlimits":
+    # envlimits <name> — emit the LSC_* budget env lines for instance.env.
+    # All values are USD; 0 = unlimited. The fork enforces per-provider caps;
+    # LSC_LIMIT_TOTAL_USD mirrors monthlyBudgetUsd (budget-check reads the
+    # registry directly, but the total is exported for the fork's convenience).
+    name = args[0]
+    user = reg["users"].get(name)
+    if user is None:
+        sys.exit(1)
+    pb = user.get("providerBudgets") or {}
+    claude_m, claude_h = provider_amounts(pb, "claude")
+    codex_m, codex_h = provider_amounts(pb, "codex")
+    total = float(user.get("monthlyBudgetUsd") or 0)
+
+    def fmt(x):
+        # Integer-valued amounts print without a trailing ".0"; keep cents otherwise.
+        return str(int(x)) if float(x).is_integer() else f"{x:.2f}"
+
+    print(f"LSC_USER_NAME={name}")
+    print(f"LSC_LIMIT_TOTAL_USD={fmt(total)}")
+    print(f"LSC_LIMIT_CLAUDE_USD={fmt(claude_m)}")
+    print(f"LSC_LIMIT_CODEX_USD={fmt(codex_m)}")
+    print(f"LSC_LIMIT_CLAUDE_5H_USD={fmt(claude_h)}")
+    print(f"LSC_LIMIT_CODEX_5H_USD={fmt(codex_h)}")
 
 elif op == "list":
     fmt = "{:<20} {:>9} {:>7} {:>13} {:>6} {:>6}  {:<28} {}"
@@ -406,6 +532,15 @@ cmd_add() {
 T3CODE_INSTANCE_PORT=${local_port}
 TS_SERVE_PORT=${ts_port}
 T3CODE_MAX_PROJECTS=${project_limit}
+# Budget limits (USD; 0 = unlimited). Rewritten by 't3user set' on any budget
+# change; the patched fork reads these for per-provider enforcement. New users
+# start with no budgets, so every limit is 0 (unlimited) here.
+LSC_USER_NAME=${name}
+LSC_LIMIT_TOTAL_USD=0
+LSC_LIMIT_CLAUDE_USD=0
+LSC_LIMIT_CODEX_USD=0
+LSC_LIMIT_CLAUDE_5H_USD=0
+LSC_LIMIT_CODEX_5H_USD=0
 EOF
 
     echo "provisioning '${name}': local port ${local_port}, tailnet HTTPS port ${ts_port}"
@@ -510,9 +645,39 @@ cmd_list() {
     registry_py list
 }
 
+# Atomically rewrite the LSC_* budget block in a user's instance.env from the
+# registry. Preserves all non-LSC lines (ports, T3CODE_MAX_PROJECTS). Values
+# come from registry_py envlimits (single source of truth). Mirrors the
+# projectLimit rewrite: temp file in the same dir, atomic rename. The instance
+# must be restarted for the fork to pick up new limits (never auto-restarted).
+write_instance_limits() {
+    local name="$1" env_file lines tmp
+    env_file="$(registry_py get "${name}" baseDir)/instance.env"
+    if [[ ! -f "${env_file}" ]]; then
+        echo "warning: ${env_file} not found; registry updated but no instance.env to rewrite" >&2
+        return 0
+    fi
+    lines="$(registry_py envlimits "${name}")" || die "failed to render env limits for '${name}'"
+    tmp="$(mktemp "${env_file}.tmp.XXXXXX")"
+    # Drop any existing LSC_* lines, keep everything else, then append the
+    # freshly rendered block.
+    grep -vE '^(LSC_USER_NAME|LSC_LIMIT_TOTAL_USD|LSC_LIMIT_CLAUDE_USD|LSC_LIMIT_CODEX_USD|LSC_LIMIT_CLAUDE_5H_USD|LSC_LIMIT_CODEX_5H_USD)=' "${env_file}" > "${tmp}" || true
+    printf '%s\n' "${lines}" >> "${tmp}"
+    mv "${tmp}" "${env_file}"
+    echo "updated budget limits in ${env_file}; restart t3code@${name} to apply"
+}
+
 # set <name> <key> <value> — update one registry field. For projectLimit the
-# instance.env T3CODE_MAX_PROJECTS line is rewritten too; the caller must
-# restart t3code@<name> for the new limit to take effect.
+# instance.env T3CODE_MAX_PROJECTS line is rewritten too; for budget keys the
+# LSC_* block is rewritten. The caller must restart t3code@<name> for changes
+# to take effect.
+#
+# providerBudgets CLI shapes (all validated in registry_py):
+#   t3user set <n> providerBudgets.claude 20              # claude monthly = $20
+#   t3user set <n> providerBudgets.claude.monthly 20      # same, explicit
+#   t3user set <n> providerBudgets.claude.fiveHour 5      # claude 5h window = $5
+#   t3user set <n> providerBudgets.codex '{"monthly":30,"fiveHour":8}'
+#   t3user set <n> providerBudgets '{"claude":20,"codex":{"monthly":30,"fiveHour":8}}'
 cmd_set() {
     [[ $# -eq 3 ]] || die "usage: t3user set <name> <key> <value>"
     local name="$1" key="$2" value="$3"
@@ -532,10 +697,22 @@ cmd_set() {
         monthlyBudgetUsd)
             [[ "${value}" =~ ^[0-9]+(\.[0-9]{1,2})?$ ]] || die "monthlyBudgetUsd must be a number (0 = unlimited)"
             ;;
-        *) die "key '${key}' is not settable (allowed: projectLimit, sharedAccess, tsLogin, admin, monthlyBudgetUsd)" ;;
+        providerBudgets|providerBudgets.*)
+            # Shape/provider/amount validation happens in registry_py (JSON and
+            # numeric parsing live there); nothing to pre-check here.
+            ;;
+        *) die "key '${key}' is not settable (allowed: projectLimit, sharedAccess, tsLogin, admin, monthlyBudgetUsd, providerBudgets[.<provider>[.<monthly|fiveHour>]])" ;;
     esac
 
     registry_py set "${name}" "${key}" "${value}"
+
+    # Budget changes rewrite the LSC_* block (which always includes
+    # LSC_USER_NAME and LSC_LIMIT_TOTAL_USD) atomically.
+    case "${key}" in
+        monthlyBudgetUsd|providerBudgets|providerBudgets.*)
+            write_instance_limits "${name}"
+            ;;
+    esac
 
     if [[ "${key}" == "projectLimit" ]]; then
         local env_file
