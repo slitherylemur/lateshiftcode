@@ -108,8 +108,10 @@ the production server:
    decider on every `project.create` command; once the count of live
    (non-deleted) projects reaches the limit, the command is rejected with
    `Project limit reached (N). Ask your admin to raise it.` (surfaced as a
-   normal command error in the UI). Unset, empty, `0`, negative, or
-   non-numeric values mean unlimited. Restart the instance after changing it.
+   normal command error in the UI). The value must be a plain positive
+   decimal integer; anything else (unset, empty, `0`, negative, `1.5`,
+   `2junk`, `1e2`, ...) means unlimited. Restart the instance after changing
+   it.
 2. **Usage ledger** — every accepted provider `turn.completed` event appends a
    row to the `turn_usage` table (migration `035_TurnUsageLedger`).
 
@@ -131,6 +133,7 @@ Read directly from each instance's `userdata/state.sqlite` by the portal
 | Column                    | Type    | Notes                                                        |
 | ------------------------- | ------- | ------------------------------------------------------------ |
 | `row_id`                  | INTEGER | primary key, autoincrement                                   |
+| `event_id`                | TEXT    | runtime event id; not null, UNIQUE (dedupes replayed events) |
 | `thread_id`               | TEXT    | not null                                                     |
 | `project_id`              | TEXT    | resolved from the thread projection; nullable                |
 | `turn_id`                 | TEXT    | nullable (not every provider reports it)                     |
@@ -145,8 +148,10 @@ Read directly from each instance's `userdata/state.sqlite` by the portal
 | `usage_json`              | TEXT    | raw `{usage, modelUsage}` JSON from the provider; nullable   |
 | `completed_at`            | TEXT    | ISO timestamp, not null; indexed                             |
 
-Indexes: `idx_turn_usage_completed_at`, `idx_turn_usage_thread_id`,
-`idx_turn_usage_project_id`. Ledger writes are fail-open: an insert failure is
+Indexes: `idx_turn_usage_event_id` (UNIQUE), `idx_turn_usage_completed_at`,
+`idx_turn_usage_thread_id`, `idx_turn_usage_project_id`. Inserts are
+`INSERT OR IGNORE` keyed on `event_id`, so duplicate/stale completion events
+never double-count. Ledger writes are fail-open: an insert failure is
 logged and never breaks turn ingestion, so gaps are possible if the DB is
 unhealthy.
 

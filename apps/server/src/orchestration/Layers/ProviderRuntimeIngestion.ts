@@ -1507,6 +1507,7 @@ const make = Effect.gen(function* () {
             : null;
         yield* turnUsageRepository
           .insert({
+            eventId: event.eventId,
             threadId: thread.id,
             projectId: thread.projectId,
             turnId: eventTurnId ?? null,

@@ -17,7 +17,8 @@ const makeTurnUsageRepository = Effect.gen(function* () {
     Request: TurnUsageRecord,
     execute: (row) =>
       sql`
-        INSERT INTO turn_usage (
+        INSERT OR IGNORE INTO turn_usage (
+          event_id,
           thread_id,
           project_id,
           turn_id,
@@ -33,6 +34,7 @@ const makeTurnUsageRepository = Effect.gen(function* () {
           completed_at
         )
         VALUES (
+          ${row.eventId},
           ${row.threadId},
           ${row.projectId},
           ${row.turnId},

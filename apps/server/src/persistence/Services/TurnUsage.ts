@@ -15,6 +15,7 @@ import type * as Effect from "effect/Effect";
 import type { ProjectionRepositoryError } from "../Errors.ts";
 
 export const TurnUsageRecord = Schema.Struct({
+  eventId: Schema.String,
   threadId: Schema.String,
   projectId: Schema.NullOr(Schema.String),
   turnId: Schema.NullOr(Schema.String),
@@ -37,7 +38,8 @@ export type TurnUsageRecord = typeof TurnUsageRecord.Type;
 export interface TurnUsageRepositoryShape {
   /**
    * Append one usage record. Never updates or deletes; the ledger is
-   * append-only by design.
+   * append-only by design. Idempotent per `eventId`: replayed or duplicate
+   * runtime events are ignored (INSERT OR IGNORE on the unique event_id).
    */
   readonly insert: (row: TurnUsageRecord) => Effect.Effect<void, ProjectionRepositoryError>;
 }

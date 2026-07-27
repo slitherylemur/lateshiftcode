@@ -85,10 +85,24 @@ it.layer(NodeServices.layer)("project.create limit (T3CODE_MAX_PROJECTS)", (it) 
     }),
   );
 
+  it.effect("enforces a whitespace-padded numeric limit after trimming", () =>
+    Effect.gen(function* () {
+      process.env["T3CODE_MAX_PROJECTS"] = " 2 ";
+      const error = yield* decideOrchestrationCommand({
+        command: makeCreateCommand("project-c"),
+        readModel: makeReadModel([makeProject("project-a"), makeProject("project-b")]),
+      }).pipe(Effect.flip);
+      expect(error._tag).toBe("OrchestrationCommandInvariantError");
+    }),
+  );
+
   it.effect("treats unset, zero, negative, and invalid limits as unlimited", () =>
     Effect.gen(function* () {
       const projects = [makeProject("project-a"), makeProject("project-b")];
-      for (const limit of [undefined, "0", "-3", "banana", ""]) {
+      // "2junk", "1.5", and "1e2" would be accepted by a bare parseInt; the
+      // strict decimal-integer rule must treat them as unlimited instead of
+      // silently activating a partial parse as the limit.
+      for (const limit of [undefined, "0", "-3", "banana", "", "2junk", "1.5", "1e2"]) {
         if (limit === undefined) {
           delete process.env["T3CODE_MAX_PROJECTS"];
         } else {

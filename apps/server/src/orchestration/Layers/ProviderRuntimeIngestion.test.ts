@@ -326,6 +326,7 @@ describe("ProviderRuntimeIngestion", () => {
           Effect.gen(function* () {
             const sql = yield* SqlClient.SqlClient;
             return yield* sql<{
+              readonly event_id: string;
               readonly thread_id: string;
               readonly project_id: string | null;
               readonly turn_id: string | null;
@@ -432,6 +433,7 @@ describe("ProviderRuntimeIngestion", () => {
     const rows = await harness.queryTurnUsage();
     expect(rows).toHaveLength(1);
     const row = rows[0];
+    expect(row?.event_id).toBe("evt-ledger-turn-completed");
     expect(row?.thread_id).toBe("thread-1");
     expect(row?.project_id).toBe("project-1");
     expect(row?.turn_id).toBe("turn-ledger-1");
@@ -453,6 +455,32 @@ describe("ProviderRuntimeIngestion", () => {
       },
       modelUsage: { "claude-opus-5": { inputTokens: 120 } },
     });
+
+    // Replay of the same runtime event (same eventId) must not double-count:
+    // once the first completion clears activeTurnId the lifecycle guard
+    // accepts stale completions again, so idempotency comes from the unique
+    // event_id + INSERT OR IGNORE.
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-ledger-turn-completed"),
+      provider: ProviderDriverKind.make("claude"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:30.000Z",
+      turnId: asTurnId("turn-ledger-1"),
+      payload: {
+        state: "completed",
+        usage: {
+          input_tokens: 120,
+          output_tokens: 45,
+          cache_read_input_tokens: 1000,
+          duration_ms: 5400,
+        },
+        modelUsage: { "claude-opus-5": { inputTokens: 120 } },
+        totalCostUsd: 0.1234,
+      },
+    });
+    await harness.drain();
+    expect(await harness.queryTurnUsage()).toHaveLength(1);
   });
 
   it("applies provider session.state.changed transitions directly", async () => {

@@ -25,13 +25,14 @@ import { projectEvent } from "./projector.ts";
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
 // LateShift Cloud: optional per-instance cap on live (non-deleted) projects.
-// T3CODE_MAX_PROJECTS unset, empty, zero, negative, or non-numeric means
-// unlimited. Read per dispatch so tests (and instance restarts) pick up
-// changes without a module reload.
+// T3CODE_MAX_PROJECTS must be a plain positive decimal integer; anything else
+// (unset, empty, zero, negative, "1.5", "2junk", "1e2", ...) means unlimited.
+// Read per dispatch so tests (and instance restarts) pick up changes without
+// a module reload.
 const resolveMaxProjects = (): number | null => {
-  const raw = process.env["T3CODE_MAX_PROJECTS"];
-  if (raw === undefined || raw.trim() === "") return null;
-  const parsed = Number.parseInt(raw.trim(), 10);
+  const raw = process.env["T3CODE_MAX_PROJECTS"]?.trim();
+  if (raw === undefined || !/^[0-9]+$/.test(raw)) return null;
+  const parsed = Number.parseInt(raw, 10);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) return null;
   return parsed;
 };
