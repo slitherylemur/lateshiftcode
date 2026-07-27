@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# lsc-github-login - connect THIS LateShift Cloud workspace to your own GitHub.
+#
+# Run it once in a T3 terminal. It performs GitHub's device/web sign-in (a code
+# you paste at https://github.com/login/device), wires git to push through gh,
+# and stamps your GitHub name + no-reply email into this workspace's git author
+# identity. Everything is written under this workspace's private identity home
+# (GH_CONFIG_DIR / GIT_CONFIG_GLOBAL) - no other workspace is affected.
+set -euo pipefail
+
+: "${GH_CONFIG_DIR:?not inside a LateShift Cloud workspace (GH_CONFIG_DIR unset)}"
+: "${GIT_CONFIG_GLOBAL:?not inside a LateShift Cloud workspace (GIT_CONFIG_GLOBAL unset)}"
+
+host=github.com
+
+if gh auth status --hostname "${host}" >/dev/null 2>&1; then
+    echo "This workspace is already signed in to GitHub as:"
+    gh api user --jq '  " -> " + .login' 2>/dev/null || true
+    echo "Re-running will let you switch accounts; press Ctrl-C to keep the current one."
+    echo
+fi
+
+echo "Connecting this workspace to your GitHub account."
+echo "A one-time code will appear below - open the shown URL in your browser,"
+echo "paste the code, and approve. Nothing is stored outside this workspace."
+echo
+
+# Device/web flow: prints a user code + verification URL in the terminal.
+gh auth login --hostname "${host}" --git-protocol https --web
+
+# Make git use gh as the HTTPS credential helper (writes into GIT_CONFIG_GLOBAL).
+gh auth setup-git --hostname "${host}"
+
+# Attribute commits to the authenticated account. Use GitHub's per-user no-reply
+# email (ID+login@users.noreply.github.com) so the address stays private but
+# commits still link to the account.
+login=$(gh api user --jq .login)
+uid=$(gh api user --jq .id)
+name=$(gh api user --jq '.name // .login')
+git config --global user.name "${name}"
+git config --global user.email "${uid}+${login}@users.noreply.github.com"
+
+echo
+echo "Done. This workspace now authenticates to GitHub as: ${login}"
+echo "Commits will be authored as: ${name} <${uid}+${login}@users.noreply.github.com>"
+echo "Your own repos are now reachable with git clone/push and the gh CLI."

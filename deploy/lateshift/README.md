@@ -267,6 +267,7 @@ production `t3code.service` is a separate unit and is **not** affected.
 | write to `/etc`                                     | EROFS    | `ProtectSystem=strict`            |
 | write to `/home/dev/projects`, other users' data    | EROFS    | `ProtectSystem=strict` + `ProtectHome=read-only` |
 | write to `/home/dev/services/t3code-production`     | EROFS    | `ProtectSystem=strict`            |
+| read host `dev` GitHub token / gitconfig             | EACCES   | `InaccessiblePaths=/home/dev/.config/gh`, `InaccessiblePaths=/home/dev/.gitconfig` |
 | mount / new user namespace / kernel module load     | EPERM    | `RestrictNamespaces`, `SystemCallFilter=@system-service`, `ProtectKernelModules` |
 | clock / hostname / cgroup / kernel-tunable writes   | blocked  | `ProtectClock`, `ProtectHostname`, `ProtectControlGroups`, `ProtectKernelTunables` |
 
@@ -302,13 +303,45 @@ that is already using them:
   because per-instance copies of a single upstream account would fight over
   refresh-token rotation. Recommended future hardening: per-user provider
   tokens, each bind-mounted read-only into a per-instance config dir.
-- **GitHub auth** flows through the shared `gh` token via the git credential
-  helper (`gh auth git-credential`). `~/.config/gh` and `~/.gitconfig` are
-  exposed **read-only** (readable, not writable), so git pushes succeed as
-  `slitherylemur` but the token can't be rewritten. An agent can still read the
-  token and push as that identity to any repo the account can reach — the
-  chosen tradeoff over provisioning per-user tokens (deferred). Instances push
-  "as themselves" only in the sense that they all share this one identity.
+- **GitHub auth is now per-instance** (no longer shared). The host `dev`
+  user's `~/.config/gh` and `~/.gitconfig` are made **inaccessible** inside the
+  sandbox (`InaccessiblePaths` in the unit), and `run-instance.sh` points
+  `GH_CONFIG_DIR` and `GIT_CONFIG_GLOBAL` at `<base>/identity/{gh,gitconfig}`
+  (mode 700/600, under the instance's own writable base dir). Each workspace
+  therefore holds its **own** `gh` OAuth token and git author identity; one
+  instance can neither read nor push as another, and none can reach
+  `slitherylemur`'s credentials. Users onboard by running `lsc-github-login`
+  once (see **Per-workspace GitHub onboarding** below). Commits are authored as
+  the user's real GitHub account via its `ID+login@users.noreply.github.com`
+  no-reply email. The Claude/Codex tradeoff above still applies to those
+  services; only GitHub is per-user today.
+
+### Per-workspace GitHub onboarding
+
+Each workspace uses its **own** GitHub account. To connect one, open a terminal
+in the T3 workspace and run **once**:
+
+```sh
+lsc-github-login
+```
+
+It runs GitHub's device/web sign-in (`gh auth login -h github.com -p https -w`)
+— a one-time code you paste at <https://github.com/login/device> — then
+`gh auth setup-git`, then stamps your GitHub name + no-reply email into the
+workspace's git author identity. After that, `git clone`/`push` and the `gh`
+CLI work against your own repos, and commits are authored as you. The helper is
+exposed on every instance's `PATH` from
+`/home/dev/services/lateshift/instance-bin/` (a dedicated dir holding only
+user-facing tools; the admin `bin/` with `t3user`/`budget-check` is **not** on
+the instance PATH).
+
+> **Migration caveat (one-time).** The previous shared `slitherylemur` identity
+> is gone: after this change, **existing instances (`slither`, `testuser`) can
+> no longer push to GitHub until their user runs `lsc-github-login`.** This is
+> intentional — `dev`'s token is deliberately **not** copied into any instance.
+> Until a workspace authenticates, `gh auth status` inside it reports "not
+> logged in" and authenticated git operations fail; public `git clone` still
+> works unauthenticated.
 
 ### Verifying the sandbox
 
