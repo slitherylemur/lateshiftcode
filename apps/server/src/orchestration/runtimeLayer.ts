@@ -6,6 +6,7 @@ import { OrchestrationEngineLive } from "./Layers/OrchestrationEngine.ts";
 import { TurnBudgetGuardLive } from "./Layers/TurnBudgetGuard.ts";
 import { OrchestrationProjectionPipelineLive } from "./Layers/ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./Layers/ProjectionSnapshotQuery.ts";
+import { TurnUsageRepositoryLive } from "../persistence/Layers/TurnUsage.ts";
 
 export const OrchestrationEventInfrastructureLayerLive = Layer.mergeAll(
   OrchestrationEventStoreLive,
@@ -18,6 +19,7 @@ export const OrchestrationProjectionPipelineLayerLive = OrchestrationProjectionP
 
 export const OrchestrationInfrastructureLayerLive = Layer.mergeAll(
   OrchestrationProjectionSnapshotQueryLive,
+  TurnUsageRepositoryLive,
   OrchestrationEventInfrastructureLayerLive,
   OrchestrationProjectionPipelineLayerLive,
 );

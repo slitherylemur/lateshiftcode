@@ -1,4 +1,5 @@
 import * as Cause from "effect/Cause";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -27,9 +28,11 @@ const makeTurnBudgetGuard = Effect.gen(function* () {
       // Nothing is limited: never read the ledger, always allow.
       if (!hasAnyLimit(limits)) return Option.none<string>();
       const parsedNow = Date.parse(nowIso);
-      const nowMs = Number.isFinite(parsedNow) ? parsedNow : Date.now();
+      const nowMs = Number.isFinite(parsedNow)
+        ? parsedNow
+        : (yield* DateTime.now).epochMilliseconds;
       const sinceMs = Math.min(startOfUtcMonthMs(nowMs), nowMs - WINDOW_LOOKBACK_MS);
-      const sinceIso = new Date(sinceMs).toISOString();
+      const sinceIso = DateTime.formatIso(DateTime.makeUnsafe(sinceMs));
       const rows = yield* repository.listCompletedSince(sinceIso);
       const snapshot = computeUsageSnapshot(
         rows.flatMap((row) => {

@@ -70,7 +70,6 @@ import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import { normalizeDispatchCommand } from "./orchestration/Normalizer.ts";
 import { TurnUsageRepository } from "./persistence/Services/TurnUsage.ts";
-import { TurnUsageRepositoryLive } from "./persistence/Layers/TurnUsage.ts";
 import {
   buildUsageBudget,
   computeUsageSnapshot,
@@ -1481,12 +1480,12 @@ const makeWsRpcLayer = (
             Effect.gen(function* () {
               const limits = resolveLateShiftLimits();
               const userName = process.env["LSC_USER_NAME"]?.trim() || null;
-              const nowMs = Date.now();
+              const nowMs = (yield* DateTime.now).epochMilliseconds;
               // Fetch a little past the current month so the 5h session window
               // anchors correctly across a month boundary.
               const sinceMs = Math.min(startOfUtcMonthMs(nowMs), nowMs - 7 * 24 * 60 * 60 * 1_000);
               const rows = yield* turnUsageRepository
-                .listCompletedSince(new Date(sinceMs).toISOString())
+                .listCompletedSince(DateTime.formatIso(DateTime.makeUnsafe(sinceMs)))
                 .pipe(Effect.orElseSucceed(() => []));
               const snapshot = computeUsageSnapshot(
                 rows.flatMap((row) => {
@@ -2160,7 +2159,6 @@ export const websocketRpcRouteLayer = Layer.unwrap(
             makeWsRpcLayer(session, previewAutomationBroker).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(ProviderMaintenanceRunner.layer),
-              Layer.provide(TurnUsageRepositoryLive),
               Layer.provide(Layer.succeed(ServerSelfUpdate.ServerSelfUpdate, serverSelfUpdate)),
               Layer.provide(
                 SourceControlDiscovery.layer.pipe(

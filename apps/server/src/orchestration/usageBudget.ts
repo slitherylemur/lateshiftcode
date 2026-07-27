@@ -22,6 +22,7 @@
  * <= 0) means unlimited. All amounts are USD.
  */
 
+import * as DateTime from "effect/DateTime";
 import type { LateShiftUsageBudget } from "@t3tools/contracts";
 
 export const WINDOW_MS = 5 * 60 * 60 * 1_000;
@@ -111,8 +112,8 @@ export const hasAnyLimit = (limits: LateShiftLimits): boolean =>
 
 /** Start of the current UTC month, in epoch ms. */
 export const startOfUtcMonthMs = (nowMs: number): number => {
-  const now = new Date(nowMs);
-  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+  const iso = DateTime.formatIso(DateTime.makeUnsafe(nowMs));
+  return DateTime.toEpochMillis(DateTime.makeUnsafe(`${iso.slice(0, 7)}-01T00:00:00.000Z`));
 };
 
 /**
@@ -125,7 +126,9 @@ export const computeCurrentWindow = (
   nowMs: number,
 ): WindowUsage | null => {
   if (turns.length === 0) return null;
-  let anchorMs = turns[0].completedAtMs;
+  const firstTurn = turns[0];
+  if (firstTurn === undefined) return null;
+  let anchorMs = firstTurn.completedAtMs;
   for (const turn of turns) {
     // A turn at or after the current block has elapsed opens a fresh block.
     // This also covers a >= 5h inactivity gap (the gap pushes the turn past
@@ -247,7 +250,9 @@ export const buildUsageBudget = (input: {
       windowUsedUsd: aggregate.window?.usedUsd ?? 0,
       windowLimitUsd: providerLimits.windowUsd,
       windowResetsAt:
-        aggregate.window === null ? null : new Date(aggregate.window.resetsAtMs).toISOString(),
+        aggregate.window === null
+          ? null
+          : DateTime.formatIso(DateTime.makeUnsafe(aggregate.window.resetsAtMs)),
       windowLengthHours: WINDOW_MS / (60 * 60 * 1_000),
     };
   });
