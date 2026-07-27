@@ -33,6 +33,9 @@ LOCK_FILE="${LATESHIFT_ROOT}/.registry.lock"
 TAILNET_HOST="t3cloud.taild7c97b.ts.net"
 PUBLIC_DOMAIN="lateshiftcloud.com"   # public gateway domain (pair --public)
 RENDER_GATEWAY="${LATESHIFT_ROOT}/bin/render-gateway"  # regenerate Caddy user blocks
+# Applies the OWNER git identity + shared credential store to a shared repo
+# (see bin-shared/lsc-shared-git-setup). Called best-effort from the share path.
+SHARED_GIT_SETUP="${LATESHIFT_ROOT}/bin/lsc-shared-git-setup"
 T3_CLI="/usr/bin/t3"
 HEALTH_TIMEOUT_SECS=60
 RESERVED_LOCAL_PORT=3773   # production t3code local port
@@ -789,6 +792,18 @@ cmd_share() {
     "${T3_CLI}" project add "${real}" --base-dir "${base_dir}" \
         || die "t3 project add failed for '${real}' on ${name}'s instance"
     registry_py share "${name}" "${real}"
+    # Shared repos under /home/dev/shared push under the OWNER's git
+    # identity so every sharer's commits go out as the owner without
+    # needing push rights. Best-effort: a config failure (e.g. the path is
+    # not a git repo) must not fail the share itself.
+    case "${real}" in
+        /home/dev/shared/*)
+            if [[ -x "${SHARED_GIT_SETUP}" ]]; then
+                "${SHARED_GIT_SETUP}" "${real}" \
+                    || echo "t3user: warning: shared-git identity setup failed for '${real}'; commits there may use the per-user identity" >&2
+            fi
+            ;;
+    esac
     echo "shared '${real}' with '${name}'"
 }
 
