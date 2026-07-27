@@ -52,6 +52,47 @@ if (( local_port == 3773 )); then
     exit 1
 fi
 
+# --- Per-instance GitHub identity (LateShift Cloud) ---------------------------
+# Each workspace gets its OWN gh/git credential home under its (writable) base
+# dir, instead of inheriting the host dev user's shared identity. gh and git run
+# inside the sandbox read/write ONLY these per-instance files:
+#   GH_CONFIG_DIR      -> where `gh` stores hosts.yml/config.yml (its OAuth token)
+#   GIT_CONFIG_GLOBAL  -> the git "global" config (author identity + cred helper)
+# The unit makes /home/dev/.config/gh and /home/dev/.gitconfig inaccessible, so
+# nothing here can fall back to slitherylemur's shared credentials.
+identity_dir="${base_dir}/identity"
+export GH_CONFIG_DIR="${identity_dir}/gh"
+export GIT_CONFIG_GLOBAL="${identity_dir}/gitconfig"
+
+# First-run scaffolding (idempotent; dev-owned because this launcher runs as dev).
+mkdir -p "${GH_CONFIG_DIR}"
+chmod 700 "${identity_dir}" "${GH_CONFIG_DIR}"
+
+# Seed a placeholder global gitconfig if absent: a per-user author identity plus
+# the gh credential helper, so `git`/`gh` are wired up before the user logs in.
+# `lsc-github-login` overwrites user.name/user.email with the real GitHub
+# account after `gh auth login`; the credential helper matches what
+# `gh auth setup-git` writes (absolute path to the gh binary).
+if [[ ! -f "${GIT_CONFIG_GLOBAL}" ]]; then
+    cat > "${GIT_CONFIG_GLOBAL}" <<EOF
+[user]
+	name = ${name}
+	email = ${name}@users.noreply.lateshiftcloud.com
+[credential "https://github.com"]
+	helper =
+	helper = !/usr/bin/gh auth git-credential
+[credential "https://gist.github.com"]
+	helper =
+	helper = !/usr/bin/gh auth git-credential
+EOF
+    chmod 600 "${GIT_CONFIG_GLOBAL}"
+fi
+
+# Expose the per-workspace onboarding helper (lsc-github-login) on PATH for
+# terminals the instance spawns. This dedicated dir holds ONLY user-facing
+# tools; the admin bin/ (t3user, budget-check) is deliberately NOT on PATH.
+export PATH="/home/dev/services/lateshift/instance-bin:${PATH}"
+
 exec /usr/bin/node "${server_bin}" serve \
     --base-dir "${base_dir}" \
     --port "${local_port}" \

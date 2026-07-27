@@ -57,6 +57,17 @@ ReadWritePaths=/run/tailscale
 # Private /tmp and /var/tmp per instance (no cross-instance tmp leakage).
 PrivateTmp=yes
 
+# --- Per-instance GitHub identity (LateShift Cloud) --------------------------
+# Each workspace authenticates its OWN GitHub account. The launcher points
+# GH_CONFIG_DIR and GIT_CONFIG_GLOBAL at <base>/identity/ (writable, under the
+# ReadWritePaths carve-out above), so gh/git read and write ONLY that per-user
+# credential home. Block the host dev user's shared gh token and gitconfig so
+# an instance can neither read nor inherit slitherylemur's identity: with
+# ProtectHome=read-only the whole of /home/dev is otherwise readable, which is
+# exactly how the single shared identity used to leak into every instance.
+InaccessiblePaths=/home/dev/.config/gh
+InaccessiblePaths=/home/dev/.gitconfig
+
 # Kernel/host hardening: block module loading, kernel-tunable and clock writes,
 # cgroup tampering, raw kernel-log access, hostname changes, and new SUID/SGID
 # or realtime privileges. None of these are needed by the server or the agents.
