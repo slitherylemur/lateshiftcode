@@ -57,6 +57,8 @@ import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
 import * as T3ProjectFileLoader from "./project/T3ProjectFileLoader.ts";
 import * as RobloxGameIconResolver from "./project/RobloxGameIconResolver.ts";
 import * as RobloxProjectFileLoader from "./project/RobloxProjectFileLoader.ts";
+import * as RobloxProjectInputResolver from "./project/RobloxProjectInputResolver.ts";
+import * as RobloxProjectScaffolder from "./project/RobloxProjectScaffolder.ts";
 import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
 import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
 import * as WorkspaceFileSystem from "./workspace/WorkspaceFileSystem.ts";
@@ -276,6 +278,10 @@ const RobloxGameIconResolverLayerLive = RobloxGameIconResolver.layer.pipe(
   Layer.provide(FetchHttpClient.layer),
 );
 
+const RobloxProjectScaffolderLayerLive = RobloxProjectScaffolder.layer.pipe(
+  Layer.provide(RobloxProjectInputResolver.layer.pipe(Layer.provide(FetchHttpClient.layer))),
+);
+
 const AuthLayerLive = EnvironmentAuth.layer.pipe(
   Layer.provideMerge(PersistenceLayerLive),
   Layer.provide(ServerSecretStore.layer),
@@ -326,7 +332,11 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   Layer.provideMerge(ServerSettings.layer.pipe(Layer.provide(ServerSecretStore.layer))),
   Layer.provideMerge(WorkspaceLayerLive),
   Layer.provideMerge(
-    Layer.mergeAll(ProjectFaviconResolverLayerLive, RobloxGameIconResolverLayerLive),
+    Layer.mergeAll(
+      ProjectFaviconResolverLayerLive,
+      RobloxGameIconResolverLayerLive,
+      RobloxProjectScaffolderLayerLive,
+    ),
   ),
   Layer.provideMerge(RepositoryIdentityResolver.layer),
   Layer.provideMerge(ServerEnvironment.layer),

@@ -93,6 +93,8 @@ import * as PortScanner from "./preview/PortScanner.ts";
 import * as BrowserTraceCollector from "./observability/BrowserTraceCollector.ts";
 import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
 import * as RobloxGameIconResolver from "./project/RobloxGameIconResolver.ts";
+import * as RobloxProjectInputResolver from "./project/RobloxProjectInputResolver.ts";
+import * as RobloxProjectScaffolder from "./project/RobloxProjectScaffolder.ts";
 import * as RobloxProjectFileLoader from "./project/RobloxProjectFileLoader.ts";
 import * as T3ProjectFileLoader from "./project/T3ProjectFileLoader.ts";
 import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts";
@@ -511,6 +513,9 @@ const buildAppUnderTest = (options?: {
       RobloxGameIconResolver.layer.pipe(
         Layer.provide(RobloxProjectFileLoader.layer),
         Layer.provide(FetchHttpClient.layer),
+      ),
+      RobloxProjectScaffolder.layer.pipe(
+        Layer.provide(RobloxProjectInputResolver.layer.pipe(Layer.provide(FetchHttpClient.layer))),
       ),
     );
     const gitWorkflowLayer = GitWorkflowService.layer.pipe(
