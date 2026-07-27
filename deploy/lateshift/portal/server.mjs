@@ -455,6 +455,16 @@ async function handlePost(req, res, url) {
     const selfUser = Object.values(ctx.users).find(
       (u) => u.tsLogin && adminLower && u.tsLogin.toLowerCase() === adminLower,
     );
+    // Default: the admin's OWN instance when they have one; production only
+    // when explicitly requested (shared=1) or when no own workspace exists.
+    if (selfUser && form.shared !== "1") {
+      const own = await actions.mintUserPairing(selfUser.name);
+      if (own.ok) {
+        redirect(res, own.url);
+        return;
+      }
+      // fall through to the shared workspace on pairing failure
+    }
     const label = selfUser ? selfUser.name : "admin";
     const r = await actions.mintSharedPairing(label, ctx.config.sharedWorkspaceUrl);
     if (!r.ok) {
@@ -653,7 +663,10 @@ async function handlePost(req, res, url) {
           );
           return;
         }
-        return redirect(res, `/admin?flash=${encodeURIComponent(`User '${name}' removed (data archived).`)}`);
+        return redirect(
+          res,
+          `/admin?flash=${encodeURIComponent(`User '${name}' removed (data archived).`)}`,
+        );
       }
 
       default:

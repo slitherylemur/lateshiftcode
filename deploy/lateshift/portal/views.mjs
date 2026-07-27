@@ -812,11 +812,18 @@ function workspaceCard(self, csrf) {
   }
   return `<div class="card">
     <h2>Your workspace</h2>
-    <p class="muted" style="margin:0 0 14px">Open the shared production workspace. A one-time pairing link is minted and you are redirected into it.</p>
-    <form method="POST" action="/admin/open-workspace" class="inline">
-      ${hiddenInput("csrf", csrf)}
-      <button type="submit" class="btn btn-primary btn-big">Open production workspace</button>
-    </form>
+    <p class="muted" style="margin:0 0 14px">Open your own LateShift workspace, or the shared production workspace. A one-time pairing link is minted and you are redirected into it.</p>
+    <div class="actions-row">
+      <form method="POST" action="/admin/open-workspace" class="inline">
+        ${hiddenInput("csrf", csrf)}
+        <button type="submit" class="btn btn-primary btn-big">Open my workspace</button>
+      </form>
+      <form method="POST" action="/admin/open-workspace" class="inline">
+        ${hiddenInput("csrf", csrf)}
+        ${hiddenInput("shared", "1")}
+        <button type="submit" class="btn btn-big">Open production workspace</button>
+      </form>
+    </div>
   </div>`;
 }
 
