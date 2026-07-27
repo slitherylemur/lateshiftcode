@@ -1,0 +1,22 @@
+[Unit]
+Description=LateShift Cloud portal (landing page, work history, admin panel)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+User=dev
+WorkingDirectory=/home/dev/services/lateshift/portal
+Environment=PATH=/home/dev/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PORT=3790
+ExecStart=/usr/bin/node /home/dev/services/lateshift/portal/server.mjs
+Restart=on-failure
+RestartSec=5
+
+# The portal is a thin server-rendered front end: no build step, no bundler,
+# a handful of short-lived SQLite reads per request.
+MemoryMax=256M
+CPUQuota=50%
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target
