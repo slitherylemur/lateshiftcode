@@ -38,6 +38,11 @@ import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import { resolveAttachmentPathById } from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
+import * as RobloxGameIconResolver from "../project/RobloxGameIconResolver.ts";
+import {
+  ROBLOX_GAME_ICONS_CACHE_DIRNAME,
+  robloxGameIconCacheFileName,
+} from "../project/RobloxGameIconResolver.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 
 export const ASSET_ROUTE_PREFIX = "/api/assets";
@@ -82,6 +87,12 @@ const AssetClaimsSchema = Schema.Union([
     kind: Schema.Literal("project-favicon"),
     workspaceRoot: Schema.String,
     relativePath: Schema.NullOr(Schema.String),
+    expiresAt: Schema.Number,
+  }),
+  Schema.Struct({
+    version: Schema.Literal(1),
+    kind: Schema.Literal("roblox-icon"),
+    placeId: Schema.Number,
     expiresAt: Schema.Number,
   }),
 ]);
@@ -282,6 +293,30 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
             }),
         ),
       );
+      // A published Roblox game icon (from roblox.json) is the most
+      // representative icon for a Roblox project, so it takes precedence over
+      // the generic favicon locations. Any failure falls back gracefully.
+      const robloxGameIconResolver = yield* RobloxGameIconResolver.RobloxGameIconResolver;
+      const robloxIcon = yield* robloxGameIconResolver
+        .resolveIcon(workspaceRoot)
+        .pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning(
+              "Failed to resolve Roblox game icon; falling back to project favicon.",
+              { workspaceRoot, cause },
+            ).pipe(Effect.as(null)),
+          ),
+        );
+      if (robloxIcon) {
+        claims = {
+          version: 1,
+          kind: "roblox-icon",
+          placeId: robloxIcon.placeId,
+          expiresAt,
+        };
+        fileName = robloxGameIconCacheFileName(robloxIcon.placeId);
+        break;
+      }
       const faviconResolver = yield* ProjectFaviconResolver.ProjectFaviconResolver;
       const faviconPath = yield* faviconResolver.resolvePath(workspaceRoot).pipe(
         Effect.mapError(
@@ -385,6 +420,31 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
     );
     return Option.isSome(info) && info.value.type === "File"
       ? ({ kind: "file", path: attachmentPath } satisfies ResolvedAsset)
+      : null;
+  }
+
+  if (claims.kind === "roblox-icon") {
+    if (!Number.isSafeInteger(claims.placeId) || claims.placeId <= 0) return null;
+    const config = yield* ServerConfig.ServerConfig;
+    const path = yield* Path.Path;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const iconPath = path.join(
+      config.providerStatusCacheDir,
+      ROBLOX_GAME_ICONS_CACHE_DIRNAME,
+      robloxGameIconCacheFileName(claims.placeId),
+    );
+    const info = yield* optionOnNotFound(fileSystem.stat(iconPath)).pipe(
+      Effect.tapError((cause) =>
+        Effect.logError("Failed to inspect Roblox game icon asset.", {
+          placeId: claims.placeId,
+          path: iconPath,
+          cause,
+        }),
+      ),
+      Effect.orElseSucceed(() => Option.none()),
+    );
+    return Option.isSome(info) && info.value.type === "File"
+      ? ({ kind: "file", path: iconPath } satisfies ResolvedAsset)
       : null;
   }
 

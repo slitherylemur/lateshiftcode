@@ -7,6 +7,10 @@
       "types": "./src/projectFavicon.ts",
       "import": "./src/projectFavicon.ts"
     },
+    "./robloxProjectFile": {
+      "types": "./src/robloxProjectFile.ts",
+      "import": "./src/robloxProjectFile.ts"
+    },
     "./model": {
       "types": "./src/model.ts",
       "import": "./src/model.ts"

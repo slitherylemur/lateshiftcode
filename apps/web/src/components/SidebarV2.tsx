@@ -127,6 +127,7 @@ import {
   snoozeWakeLabel,
   type SnoozePreset,
 } from "./Sidebar.snooze";
+import { NewProjectDialog } from "./NewProjectDialog";
 import { ProjectFavicon } from "./ProjectFavicon";
 import { ProviderInstanceIcon } from "./chat/ProviderInstanceIcon";
 import { getTriggerDisplayModelLabel } from "./chat/providerIconUtils";
@@ -1045,6 +1046,8 @@ export default function SidebarV2() {
     () => openCommandPalette({ open: "add-project" }),
     [],
   );
+  const [isNewProjectDialogOpen, setIsNewProjectDialogOpen] = useState(false);
+  const openNewProjectDialog = useCallback(() => setIsNewProjectDialogOpen(true), []);
   const { environments } = useEnvironments();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const clearSelection = useThreadSelectionStore((s) => s.clearSelection);
@@ -2341,7 +2344,7 @@ export default function SidebarV2() {
                     <SidebarMenuButton
                       size="sm"
                       className="relative size-8 shrink-0 justify-center rounded-md bg-transparent p-0 text-sidebar-muted-foreground hover:bg-sidebar-row-hover hover:text-sidebar-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-sidebar"
-                      onClick={openAddProjectCommandPalette}
+                      onClick={openNewProjectDialog}
                       type="button"
                       aria-label="New project"
                     />
@@ -2538,7 +2541,7 @@ export default function SidebarV2() {
                   <span>No projects yet</span>
                   <button
                     type="button"
-                    onClick={openAddProjectCommandPalette}
+                    onClick={openNewProjectDialog}
                     className="inline-flex items-center gap-1.5 rounded-md border border-sidebar-border px-2.5 py-1 text-[11px] font-medium text-sidebar-muted-foreground transition-colors hover:bg-sidebar-row-hover hover:text-sidebar-foreground"
                   >
                     <PlusIcon className="size-3" />
@@ -2554,6 +2557,11 @@ export default function SidebarV2() {
           ) : null}
         </SidebarGroup>
       </SidebarContent>
+      <NewProjectDialog
+        open={isNewProjectDialogOpen}
+        onOpenChange={setIsNewProjectDialogOpen}
+        onBrowseExisting={openAddProjectCommandPalette}
+      />
       <Dialog
         open={projectActionsTarget !== null}
         onOpenChange={(open) => {

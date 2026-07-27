@@ -15,6 +15,11 @@ import {
 } from "./filesystem.ts";
 import { AssetAccessError, AssetCreateUrlInput, AssetCreateUrlResult } from "./assets.ts";
 import {
+  ProjectCreateRobloxError,
+  ProjectCreateRobloxInput,
+  ProjectCreateRobloxResult,
+} from "./robloxScaffold.ts";
+import {
   GitActionProgressEvent,
   VcsSwitchRefInput,
   VcsSwitchRefResult,
@@ -157,6 +162,7 @@ export const WS_METHODS = {
   projectsReadFile: "projects.readFile",
   projectsSearchEntries: "projects.searchEntries",
   projectsWriteFile: "projects.writeFile",
+  projectsCreateRoblox: "projects.createRoblox",
 
   // Shell methods
   shellOpenInEditor: "shell.openInEditor",
@@ -401,6 +407,12 @@ export const WsProjectsWriteFileRpc = Rpc.make(WS_METHODS.projectsWriteFile, {
   payload: ProjectWriteFileInput,
   success: ProjectWriteFileResult,
   error: Schema.Union([ProjectWriteFileError, EnvironmentAuthorizationError]),
+});
+
+export const WsProjectsCreateRobloxRpc = Rpc.make(WS_METHODS.projectsCreateRoblox, {
+  payload: ProjectCreateRobloxInput,
+  success: ProjectCreateRobloxResult,
+  error: Schema.Union([ProjectCreateRobloxError, EnvironmentAuthorizationError]),
 });
 
 export const WsShellOpenInEditorRpc = Rpc.make(WS_METHODS.shellOpenInEditor, {
@@ -731,6 +743,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsProjectsReadFileRpc,
   WsProjectsSearchEntriesRpc,
   WsProjectsWriteFileRpc,
+  WsProjectsCreateRobloxRpc,
   WsShellOpenInEditorRpc,
   WsFilesystemBrowseRpc,
   WsAssetsCreateUrlRpc,
