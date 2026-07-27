@@ -44,9 +44,23 @@ All fields optional. Read-only to the portal; edit the file directly.
     "codex":    100,   // USD/month cap for Codex/OpenAI usage
     "claude5h":  20,   // USD cap per 5-hour session window (Claude)
     "codex5h":   10    // USD cap per 5-hour session window (Codex)
-  }
+  },
+
+  // --- Public sign-in via GitHub OAuth (all OPTIONAL; absence tolerated) ---
+  "githubClientId":     "…",                    // GitHub OAuth app client id
+  "githubClientSecret": "…",                    // GitHub OAuth app client secret
+  "sessionSecret":      "<32-byte hex>",        // HMAC key for the lsc_session cookie
+  "publicBaseUrl":      "https://lateshiftcloud.com",
+  "cookieDomain":       ".lateshiftcloud.com",  // session-cookie Domain on the public host
+  "adminGithubLogins":  ["you"],                // GitHub logins that are admins
+  "resendApiKey":       "…",                    // OPTIONAL — signup-notification email
+  "notifyEmail":        "you@example.com"        // where signup requests are emailed
 }
 ```
+
+Each key above is read on every request and tolerated absent (→ `null`/`[]`).
+`portal.config.json` holds the OAuth secret + `sessionSecret`, so it is
+`chmod 600`.
 
 The admin **Subscription usage** panel sums `turn_usage.total_cost_usd`
 (bucketed by `provider_name` into claude / codex / other) across every user
@@ -63,3 +77,60 @@ When a cap is absent the ring/bar renders without a percentage.
 
 A **Usage leaderboard** ranks users by month-to-date total cost with an inline
 per-provider (Claude / Codex / other) breakdown.
+
+## Public sign-in (GitHub OAuth)
+
+The portal is reached on the tailnet via Tailscale Serve (identity headers,
+unchanged) **and** publicly as `https://lateshiftcloud.com` via a Cloudflare
+Tunnel → local gateway that forwards to `127.0.0.1:3790` with
+`X-Forwarded-Host` / `X-Forwarded-Proto` set. Public requests carry no
+Tailscale headers and authenticate with a signed session cookie instead.
+
+- `lib/auth.mjs` — GitHub OAuth (standard web flow, no libraries), the
+  HMAC-SHA256-signed `lsc_session` cookie, the signed OAuth-`state` cookie,
+  and the JSON pending-approval store. All crypto via `node:crypto`, all
+  outbound HTTP via the Node global `fetch`.
+
+**OAuth flow.** `GET /auth/github/login` → 302 to `github.com/login/oauth/authorize`
+(`scope=read:user`, `state` = signed random nonce in a short-lived HttpOnly
+cookie). `GET /auth/github/callback` verifies `state` (constant-time + signature),
+exchanges the code for a token (`Accept: application/json`), fetches
+`api.github.com/user`, then mints the session and routes: known+approved user →
+dashboard, admin → `/admin`, unknown login → recorded in `pending.json` and an
+awaiting-approval page. `GET /auth/logout` clears the session.
+
+**Session cookie.** `lsc_session = base64url(payload).sig`, payload
+`{v:1, gh:<login>, iat, exp}` (7 days). `Secure; HttpOnly; SameSite=Lax`;
+`Domain=cookieDomain` only when the request arrived via the public host
+(`X-Forwarded-Host` under `lateshiftcloud.com`), host-only otherwise.
+Signature verification is constant-time.
+
+**Identity.** `resolveIdentity` accepts a tailnet login (preferred, unchanged)
+or a GitHub login from the session. A registry user matches when its optional
+`githubLogin` field equals the session login (case-insensitive); admins are the
+existing tailnet rules **or** a login in `adminGithubLogins`.
+
+**Approvals.** The admin panel gains a **Pending requests** card (avatar, login,
+requested time) with CSRF-protected **Approve** (workspace name `[a-z0-9-]{2,20}`
+prefilled from the login + project limit) and **Deny** actions. Approve runs
+`actions.addUser` then `t3user set <name> githubLogin <login>` and removes the
+entry from `pending.json`; Deny moves it to the store's `denied[]` (honoured on
+future signups). If `resendApiKey` is set, a notification email is sent via
+Resend (failures never break signup; skipped silently when unconfigured).
+
+**Gateway authz endpoint.** `GET /authz` is loopback-only (called by the
+gateway). It reads the forwarded `Cookie` and `X-Authz-Host: <public hostname>`:
+
+- apex host → `200` (portal self-authenticates)
+- subdomain label = a registry user name, session resolves to that user (or an
+  admin) → `200` + `X-Lsc-User: <name>`
+- label `prod` → admins only → `200`
+- no/invalid session → `401` + `X-Authz-Redirect: <publicBaseUrl>/auth/github/login`
+- valid session, wrong user → `403`; unknown label → `404`
+
+> **Note / known limitation.** Setting `githubLogin` requires the `t3user` CLI
+> to allow that key; the installed `t3user` currently rejects unknown keys, so
+> the Approve step provisions the user but reports that `githubLogin` could not
+> be set (owned by another agent — do not edit `t3user` here). Until `t3user`
+> accepts `githubLogin`, public GitHub sign-in cannot match an approved user by
+> login. The `/authz` matrix, sessions, and OAuth flow are otherwise complete.

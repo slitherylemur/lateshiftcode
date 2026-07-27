@@ -8,7 +8,7 @@
 // can never be named.
 
 import { execFile } from "node:child_process";
-import { NAME_RE, TS_LOGIN_RE } from "./registry.mjs";
+import { NAME_RE, TS_LOGIN_RE, GH_LOGIN_RE } from "./registry.mjs";
 
 const T3USER = "/home/dev/services/lateshift/bin/t3user";
 // Stock production binary — NEVER the patched checkout: running the checkout
@@ -170,4 +170,21 @@ export async function removeUser(name, { force = false } = {}) {
   const args = ["remove", assertName(name)];
   if (force) args.push("--force");
   return run(T3USER, args, { timeoutMs: 180_000 });
+}
+
+
+export function assertGithubLogin(login) {
+  if (typeof login === "string" && GH_LOGIN_RE.test(login)) return login;
+  throw new Error("invalid github login");
+}
+
+/**
+ * Persist a user's GitHub login via the t3user CLI:
+ *   t3user set <name> githubLogin <login>
+ * NOTE: t3user must allow the `githubLogin` key for this to succeed. If the
+ * installed t3user rejects unknown keys this resolves { ok:false } and the
+ * caller surfaces a warning (the registry is only ever written via t3user).
+ */
+export async function setGithubLogin(name, login) {
+  return run(T3USER, ["set", assertName(name), "githubLogin", assertGithubLogin(login)]);
 }

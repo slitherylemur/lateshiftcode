@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import { loadConfig, loadRegistry, resolveIdentity, NAME_RE } from "./lib/registry.mjs";
+import * as auth from "./lib/auth.mjs";
 import {
   readWorkHistory,
   readUsageSummary,
@@ -155,12 +156,27 @@ function listSharedDirs() {
 
 // ---------------------------------------------------------------- context
 
+function sessionFrom(req, config) {
+  const raw = parseCookies(req)[auth.SESSION_COOKIE];
+  if (!raw) return null;
+  return auth.verifySession(raw, config.sessionSecret);
+}
+
 function buildContext(req) {
   const config = loadConfig();
   const users = loadRegistry();
-  const rawIdentity = identityFrom(req);
-  const principal = resolveIdentity(rawIdentity.login, { users, config });
-  return { config, users, identity: rawIdentity, principal };
+  const tsIdentity = identityFrom(req);
+  // Tailnet identity wins when present (unchanged tailnet behaviour); the
+  // signed GitHub session cookie only applies on the public path.
+  const session = tsIdentity.login ? null : sessionFrom(req, config);
+  const principal = resolveIdentity(
+    { tsLogin: tsIdentity.login, ghLogin: session?.gh ?? null },
+    { users, config },
+  );
+  const identity = tsIdentity.login
+    ? tsIdentity
+    : { login: session?.gh ?? null, name: null, profilePic: null };
+  return { config, users, identity, principal, session };
 }
 
 async function dashboardProps(ctx, csrf) {
@@ -285,10 +301,138 @@ async function adminProps(ctx, csrf, flash, selectedParam) {
       activeCount,
     },
     flash: flash || null,
+    pending: auth.readPending().pending,
   };
 }
 
 // ---------------------------------------------------------------- routes
+
+// ---------------------------------------------------------------- auth routes
+
+// GET /authz — loopback-only authorization endpoint for the public gateway.
+// Contract: request carries the forwarded Cookie and X-Authz-Host: <public
+// hostname>. Apex host → 200 (portal self-auths). Subdomain label must match a
+// registry user AND the session must resolve to that user (or an admin) → 200
+// + X-Lsc-User. Label "prod" → admins only. No/invalid session → 401 +
+// X-Authz-Redirect. Valid session, wrong user → 403.
+async function handleAuthz(req, res) {
+  const config = loadConfig();
+  const users = loadRegistry();
+
+  const rawHost = req.headers["x-authz-host"];
+  const host =
+    typeof rawHost === "string"
+      ? rawHost.split(",")[0].trim().toLowerCase().replace(/:\d+$/, "")
+      : "";
+  const apex = config.publicBaseUrl
+    ? new URL(config.publicBaseUrl).host.toLowerCase()
+    : "lateshiftcloud.com";
+  const loginUrl = `${config.publicBaseUrl || "https://lateshiftcloud.com"}/auth/github/login`;
+
+  const done = (status, headers = {}) => {
+    res.writeHead(status, headers);
+    res.end();
+  };
+
+  if (!host) return done(400);
+  if (host === apex) return done(200); // portal handles its own auth
+  if (!host.endsWith(`.${apex}`)) return done(404);
+  const label = host.slice(0, host.length - apex.length - 1);
+  if (!label || label.includes(".")) return done(404); // single-label only
+
+  const session = auth.verifySession(parseCookies(req)[auth.SESSION_COOKIE], config.sessionSecret);
+  if (!session) return done(401, { "x-authz-redirect": loginUrl });
+  const principal = resolveIdentity({ ghLogin: session.gh }, { users, config });
+
+  if (label === "prod") {
+    if (principal.isAdmin) return done(200, { "x-lsc-user": principal.user?.name || principal.login });
+    return done(403);
+  }
+  const target = users[label];
+  if (!target) return done(404);
+  if (principal.isAdmin) return done(200, { "x-lsc-user": target.name });
+  if (principal.user && principal.user.name === target.name) {
+    return done(200, { "x-lsc-user": target.name });
+  }
+  return done(403);
+}
+
+// GET /auth/github/login — 302 to GitHub's authorize endpoint.
+async function handleGithubLogin(req, res) {
+  const config = loadConfig();
+  if (!config.githubClientId || !config.sessionSecret || !config.publicBaseUrl) {
+    html(res, 503, views.renderMessage({
+      title: "Unavailable",
+      heading: "GitHub sign-in not configured",
+      bodyHtml: "<p>OAuth is not configured on this server.</p>",
+      backHref: "/",
+      error: true,
+    }));
+    return;
+  }
+  const { state, cookie } = auth.makeOAuthState(config.sessionSecret);
+  redirect(res, auth.githubAuthorizeUrl(config, state), { "set-cookie": cookie });
+}
+
+// GET /auth/github/callback — verify state, exchange code, mint session.
+async function handleGithubCallback(req, res, url) {
+  const config = loadConfig();
+  const users = loadRegistry();
+  const cookies = parseCookies(req);
+  const fail = (heading, detail) =>
+    html(res, 400, views.renderMessage({
+      title: "Sign-in failed",
+      heading,
+      bodyHtml: `<p>${views.esc(detail)}</p>`,
+      backHref: "/",
+      error: true,
+    }), { "set-cookie": auth.clearStateCookie() });
+
+  if (!config.githubClientId || !config.sessionSecret) {
+    return fail("Not configured", "GitHub sign-in is not configured.");
+  }
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  if (!code) return fail("Missing code", "No authorization code was returned.");
+  if (!auth.verifyOAuthState(state, cookies[auth.STATE_COOKIE], config.sessionSecret)) {
+    return fail("Invalid state", "The OAuth state check failed. Please try signing in again.");
+  }
+
+  let profile;
+  try {
+    profile = await auth.githubExchange(config, code);
+  } catch (e) {
+    return fail("GitHub error", e?.message ?? String(e));
+  }
+
+  const principal = resolveIdentity({ ghLogin: profile.login }, { users, config });
+  const sessionValue = auth.signSession(auth.makeSessionPayload(profile.login), config.sessionSecret);
+  const setCookie = [
+    auth.clearStateCookie(),
+    auth.sessionCookie(sessionValue, req, config, { maxAgeS: 7 * 24 * 3600 }),
+  ];
+
+  if (principal.user) {
+    res.writeHead(302, { location: "/", "set-cookie": setCookie });
+    res.end();
+    return;
+  }
+  if (principal.isAdmin) {
+    res.writeHead(302, { location: "/admin", "set-cookie": setCookie });
+    res.end();
+    return;
+  }
+  // Unknown login → record a pending request (deduped, denied list honoured)
+  // and optionally notify by email; then render an awaiting-approval page.
+  const result = auth.addPending({ login: profile.login, name: profile.name, avatar: profile.avatar_url });
+  if (result.added) auth.notifySignup(config, { login: profile.login, name: profile.name });
+  html(res, 200, views.renderAwaitingApproval({
+    login: profile.login,
+    name: profile.name,
+    avatar: profile.avatar_url,
+    denied: result.reason === "denied",
+  }), { "set-cookie": setCookie });
+}
 
 async function handleGet(req, res, url) {
   const cookies = parseCookies(req);
@@ -314,12 +458,25 @@ async function handleGet(req, res, url) {
     return;
   }
 
+  if (url.pathname === "/authz") return handleAuthz(req, res);
+  if (url.pathname === "/auth/github/login") return handleGithubLogin(req, res);
+  if (url.pathname === "/auth/github/callback") return handleGithubCallback(req, res, url);
+  if (url.pathname === "/auth/logout") {
+    const config = loadConfig();
+    res.writeHead(302, { location: "/", "set-cookie": auth.clearSessionCookies(req, config) });
+    res.end();
+    return;
+  }
+
   const ctx = buildContext(req);
   const csrf = ensureCsrf(cookies, res);
 
   if (url.pathname === "/") {
     if (!ctx.principal.user && !ctx.principal.isAdmin) {
-      html(res, 200, views.renderHero({ identityLogin: ctx.principal.login }));
+      html(res, 200, views.renderHero({
+        identityLogin: ctx.principal.login,
+        githubEnabled: Boolean(ctx.config.githubClientId && ctx.config.publicBaseUrl),
+      }));
       return;
     }
     if (!ctx.principal.user && ctx.principal.isAdmin) {
@@ -667,6 +824,31 @@ async function handlePost(req, res, url) {
           res,
           `/admin?flash=${encodeURIComponent(`User '${name}' removed (data archived).`)}`,
         );
+      }
+
+      case "/admin/approve": {
+        const login = typeof form.login === "string" ? form.login.trim() : "";
+        if (!auth.GH_LOGIN_RE.test(login)) return errPage("Invalid GitHub login", login || "(empty)");
+        if (!validName) return errPage("Invalid user name", "Names must match [a-z0-9-]{2,20}.");
+        const limit = actions.assertLimit(form.projectLimit ?? 3);
+        const r = await actions.addUser({ name, projectLimit: limit });
+        if (!r.ok) return errPage(`Provisioning '${name}' failed`, r.stderr || r.stdout);
+        const g = await actions.setGithubLogin(name, login);
+        auth.removePending(login);
+        if (!g.ok) {
+          return flashTo(
+            `User '${name}' provisioned, but githubLogin could NOT be set (t3user rejected it): ` +
+              (g.stderr || g.stdout).slice(0, 160),
+          );
+        }
+        return flashTo(`Approved ${login} as '${name}' (githubLogin set).`);
+      }
+
+      case "/admin/deny": {
+        const login = typeof form.login === "string" ? form.login.trim() : "";
+        if (!auth.GH_LOGIN_RE.test(login)) return errPage("Invalid GitHub login", login || "(empty)");
+        auth.denyPending(login);
+        return flashTo(`Denied access request from ${login}.`);
       }
 
       default:

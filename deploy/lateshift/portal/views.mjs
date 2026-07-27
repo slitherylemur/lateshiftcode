@@ -17,6 +17,18 @@ export function esc(v) {
     .replaceAll("'", "&#39;");
 }
 
+// GitHub mark, inline so the hero button needs no extra asset.
+const GITHUB_ICON =
+  '<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" ' +
+  'style="vertical-align:-2px;margin-right:7px" fill="currentColor">' +
+  '<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 ' +
+  '0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 ' +
+  '1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 ' +
+  '0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 ' +
+  '1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 ' +
+  '3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 ' +
+  '8.01 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>';
+
 function relTime(iso) {
   const t = Date.parse(iso);
   if (Number.isNaN(t)) return String(iso ?? "");
@@ -445,6 +457,16 @@ const CSS = `
   .lb .amt { flex: none; width: 92px; text-align: right; font-weight: 650; font-variant-numeric: tabular-nums; }
   .lb .brk { flex: none; font-size: 11.5px; color: var(--muted); width: 168px; text-align: right; }
   @media (max-width: 640px) { .lb .brk { display: none; } .lb .who { width: 90px; } }
+
+  /* Pending access requests (admin) */
+  .pend-list { display: flex; flex-direction: column; gap: 4px; }
+  .pend-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .pend-row:last-child { border-bottom: none; }
+  .pend-who { display: flex; align-items: center; gap: 10px; min-width: 200px; flex: 1; }
+  .pend-av { width: 36px; height: 36px; border-radius: 50%; flex: none; object-fit: cover; }
+  .pend-av-fb { display: inline-flex; align-items: center; justify-content: center; background: var(--surface-2); color: var(--muted); font-weight: 600; }
+  .pend-login { font-weight: 600; }
+  .pend-actions { display: flex; align-items: center; gap: 6px; }
 `;
 
 function statusChip(status) {
@@ -547,17 +569,21 @@ ${footer()}${extraScript}
 }
 
 // 1) Marketing hero for unknown visitors.
-export function renderHero({ identityLogin } = {}) {
+export function renderHero({ identityLogin, githubEnabled } = {}) {
   const footnote =
     typeof identityLogin === "string"
-      ? `Signed in to the tailnet as ${esc(identityLogin)} — this account has no workspace yet.`
-      : "Sign in via your tailnet to continue.";
+      ? `Signed in as ${esc(identityLogin)} — this account has no workspace yet.`
+      : "Access is invite-only.";
+  const githubBtn = githubEnabled
+    ? `<p style="margin:0 0 22px"><a class="btn btn-primary btn-big" href="/auth/github/login">${GITHUB_ICON}Sign in with GitHub</a></p>`
+    : "";
   const body = `<main class="hero">
     <div>
       <img src="/static/logo.png" alt="LateShift Cloud logo">
       <h1>LateShift Cloud</h1>
       <p class="subhead">Your AI dev workspace</p>
-      <p class="body">Access is invite-only. Contact your administrator to get a workspace.</p>
+      <p class="body">Access is invite-only. Sign in with GitHub to request a workspace, or contact your administrator.</p>
+      ${githubBtn}
       <p class="footnote">${footnote}</p>
     </div>
   </main>`;
@@ -1035,6 +1061,68 @@ function addUserCard(csrf) {
 }
 
 // 3) Admin page — master/detail with subscription totals and leaderboard.
+// Awaiting-approval page shown to an unknown GitHub user after OAuth.
+export function renderAwaitingApproval({ login, name, avatar, denied } = {}) {
+  const who = name ? `${esc(name)} (@${esc(login)})` : `@${esc(login)}`;
+  const avatarHtml = avatar
+    ? `<img src="${esc(avatar)}" alt="" style="width:72px;height:72px;border-radius:50%;margin-bottom:16px">`
+    : "";
+  const inner = denied
+    ? `<h1>Access unavailable</h1>
+       <p class="muted">Sorry ${who}, access for this account is not available.</p>`
+    : `<h1>Request received</h1>
+       <p class="muted">Thanks ${who} — your request for a LateShift Cloud workspace is
+       awaiting admin approval. You can sign in here once it has been approved.</p>`;
+  const body = `<main class="container">
+    <div class="card center-page">
+      ${avatarHtml}
+      ${inner}
+      <p style="margin-top:20px"><a href="/auth/logout">Sign out</a></p>
+    </div>
+  </main>`;
+  return layout({ title: "Awaiting approval — LateShift Cloud", body, navHtml: nav() });
+}
+
+// Admin card: pending GitHub access requests with Approve / Deny actions.
+function renderPending(pending, csrf) {
+  const list = Array.isArray(pending) ? pending : [];
+  if (!list.length) return "";
+  const rows = list
+    .map((pReq) => {
+      const login = esc(pReq.login);
+      const suggested =
+        String(pReq.login || "")
+          .toLowerCase()
+          .replace(/[^a-z0-9-]/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 20) || "user";
+      const avatar = pReq.avatar
+        ? `<img src="${esc(pReq.avatar)}" alt="" class="pend-av">`
+        : `<span class="pend-av pend-av-fb">${esc(String(pReq.login || "?").slice(0, 1).toUpperCase())}</span>`;
+      return `<div class="pend-row">
+      <div class="pend-who">${avatar}<div>
+        <div class="pend-login">@${login}</div>
+        <div class="muted" style="font-size:12.5px">${pReq.name ? esc(pReq.name) + " · " : ""}${esc(relTime(pReq.requestedAt))}</div>
+      </div></div>
+      <form method="POST" action="/admin/approve" class="pend-actions">
+        ${hiddenInput("csrf", csrf)}${hiddenInput("login", pReq.login)}
+        <input type="text" name="name" value="${esc(suggested)}" pattern="[a-z0-9-]{2,20}" required class="narrow" aria-label="workspace name">
+        <input type="number" name="projectLimit" value="3" min="0" max="999" class="narrow" aria-label="project limit">
+        <button type="submit" class="btn btn-sm btn-primary">Approve</button>
+      </form>
+      <form method="POST" action="/admin/deny" class="pend-actions">
+        ${hiddenInput("csrf", csrf)}${hiddenInput("login", pReq.login)}
+        <button type="submit" class="btn btn-sm btn-danger">Deny</button>
+      </form>
+    </div>`;
+    })
+    .join("");
+  return `<div class="card">
+    <h2>Pending requests <span class="muted" style="font-weight:400;font-size:15px">(${list.length})</span></h2>
+    <div class="pend-list">${rows}</div>
+  </div>`;
+}
+
 export function renderAdmin(props) {
   const {
     csrf,
@@ -1047,6 +1135,7 @@ export function renderAdmin(props) {
     leaderboard,
     aggregate,
     flash,
+    pending,
   } = props;
 
   const navHtml = nav({ identity, links: [{ href: "/", label: "Dashboard" }] });
@@ -1062,6 +1151,8 @@ export function renderAdmin(props) {
     </div>
 
     ${renderSubscription(subscription)}
+
+    ${renderPending(pending, csrf)}
 
     <div class="admin-grid">
       ${renderUserList(users, self, selectedKey, csrf)}
