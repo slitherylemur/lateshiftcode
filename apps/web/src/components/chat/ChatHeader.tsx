@@ -15,6 +15,7 @@ import ProjectScriptsControl, {
   type ProjectScriptActionResult,
 } from "../ProjectScriptsControl";
 import { OpenInPicker } from "./OpenInPicker";
+import { RobloxOpenControls } from "./RobloxOpenControls";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useT3ProjectFileScripts } from "~/hooks/useT3ProjectFileScripts";
 import { ProjectFavicon } from "../ProjectFavicon";
@@ -147,6 +148,9 @@ export const ChatHeader = memo(function ChatHeader({
             availableEditors={availableEditors}
             openInCwd={openInCwd}
           />
+        )}
+        {activeProjectName && (
+          <RobloxOpenControls environmentId={activeThreadEnvironmentId} cwd={activeProjectCwd} />
         )}
         {activeProjectName && (
           <GitActionsControl
