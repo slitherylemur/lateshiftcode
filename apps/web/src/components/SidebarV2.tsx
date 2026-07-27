@@ -12,7 +12,11 @@ import {
   scopeThreadRef,
   scopedThreadKey,
 } from "@t3tools/client-runtime/environment";
-import type { ScopedThreadRef, SidebarProjectGroupingMode } from "@t3tools/contracts";
+import type {
+  EnvironmentId,
+  ScopedThreadRef,
+  SidebarProjectGroupingMode,
+} from "@t3tools/contracts";
 import {
   AlarmClockIcon,
   AlarmClockOffIcon,
@@ -84,6 +88,7 @@ import { useThreadSelectionStore } from "../threadSelectionStore";
 import { useThreadActions } from "../hooks/useThreadActions";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import { openCommandPalette } from "../commandPaletteBus";
+import { onOpenNewProjectDialog } from "../newProjectDialogBus";
 import { startNewThreadFromContext } from "../lib/chatThreadActions";
 import { useClientSettings, useUpdateClientSettings } from "../hooks/useSettings";
 import { useCopyToClipboard } from "../hooks/useCopyToClipboard";
@@ -1047,7 +1052,26 @@ export default function SidebarV2() {
     [],
   );
   const [isNewProjectDialogOpen, setIsNewProjectDialogOpen] = useState(false);
-  const openNewProjectDialog = useCallback(() => setIsNewProjectDialogOpen(true), []);
+  const [newProjectInitialMode, setNewProjectInitialMode] = useState<"default" | "roblox">(
+    "default",
+  );
+  const [newProjectEnvironmentId, setNewProjectEnvironmentId] = useState<EnvironmentId | null>(
+    null,
+  );
+  const openNewProjectDialog = useCallback(() => {
+    setNewProjectInitialMode("default");
+    setNewProjectEnvironmentId(null);
+    setIsNewProjectDialogOpen(true);
+  }, []);
+  useEffect(
+    () =>
+      onOpenNewProjectDialog((detail) => {
+        setNewProjectInitialMode(detail.mode ?? "default");
+        setNewProjectEnvironmentId(detail.environmentId ?? null);
+        setIsNewProjectDialogOpen(true);
+      }),
+    [],
+  );
   const { environments } = useEnvironments();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const clearSelection = useThreadSelectionStore((s) => s.clearSelection);
@@ -2561,6 +2585,8 @@ export default function SidebarV2() {
         open={isNewProjectDialogOpen}
         onOpenChange={setIsNewProjectDialogOpen}
         onBrowseExisting={openAddProjectCommandPalette}
+        initialMode={newProjectInitialMode}
+        environmentIdOverride={newProjectEnvironmentId}
       />
       <Dialog
         open={projectActionsTarget !== null}

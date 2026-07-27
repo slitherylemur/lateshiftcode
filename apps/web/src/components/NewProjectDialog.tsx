@@ -7,7 +7,7 @@ import {
 } from "@t3tools/client-runtime/state/runtime";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import type { EnvironmentId } from "@t3tools/contracts";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import { inferProjectTitleFromPath, resolveProjectPathForDispatch } from "../lib/projectPaths";
@@ -32,6 +32,7 @@ import { Input } from "./ui/input";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 
 const SHARED_PROJECT_BASE_DIRECTORY = "/home/dev/shared";
+const ROBLOX_CREDENTIALS_URL = "https://create.roblox.com/dashboard/credentials";
 
 function ensureTrailingSlash(value: string): string {
   return value.endsWith("/") ? value : `${value}/`;
@@ -41,8 +42,12 @@ export function NewProjectDialog(props: {
   readonly open: boolean;
   readonly onOpenChange: (open: boolean) => void;
   readonly onBrowseExisting: () => void;
+  /** When the dialog is opened via the palette, which section to focus. */
+  readonly initialMode?: "default" | "roblox";
+  /** Environment the project should be created in, when the caller knows it. */
+  readonly environmentIdOverride?: EnvironmentId | null;
 }) {
-  const { onBrowseExisting, onOpenChange, open } = props;
+  const { environmentIdOverride, initialMode, onBrowseExisting, onOpenChange, open } = props;
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const { environments } = useEnvironments();
   const { handleNewThread } = useHandleNewThread();
@@ -56,7 +61,17 @@ export function NewProjectDialog(props: {
   const [isRobloxProject, setIsRobloxProject] = useState(false);
   const [workplaceLink, setWorkplaceLink] = useState("");
   const [productionLink, setProductionLink] = useState("");
+  const [testApiKey, setTestApiKey] = useState("");
+  const [prodApiKey, setProdApiKey] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // When the dialog is (re)opened, adopt the requested mode. Opening via the
+  // palette's "Roblox game" source focuses the Roblox flow directly.
+  useEffect(() => {
+    if (open) {
+      setIsRobloxProject(initialMode === "roblox");
+    }
+  }, [open, initialMode]);
 
   const resetForm = useCallback(() => {
     setName("");
@@ -64,6 +79,8 @@ export function NewProjectDialog(props: {
     setIsRobloxProject(false);
     setWorkplaceLink("");
     setProductionLink("");
+    setTestApiKey("");
+    setProdApiKey("");
   }, []);
 
   const handleOpenChange = useCallback(
@@ -77,15 +94,21 @@ export function NewProjectDialog(props: {
   const trimmedName = name.trim();
   const trimmedWorkplaceLink = workplaceLink.trim();
   const trimmedProductionLink = productionLink.trim();
+  const trimmedTestApiKey = testApiKey.trim();
+  const trimmedProdApiKey = prodApiKey.trim();
+  const resolvedEnvironmentId: EnvironmentId | null =
+    environmentIdOverride ?? primaryEnvironmentId ?? environments[0]?.environmentId ?? null;
   const canSubmit =
     trimmedName.length > 0 &&
     !isSubmitting &&
-    (primaryEnvironmentId !== null || environments.length > 0) &&
-    (!isRobloxProject || (trimmedWorkplaceLink.length > 0 && trimmedProductionLink.length > 0));
+    resolvedEnvironmentId !== null &&
+    (!isRobloxProject ||
+      (trimmedWorkplaceLink.length > 0 &&
+        trimmedProductionLink.length > 0 &&
+        trimmedTestApiKey.length > 0));
 
   const handleSubmit = useCallback(async () => {
-    const environmentId: EnvironmentId | null =
-      primaryEnvironmentId ?? environments[0]?.environmentId ?? null;
+    const environmentId = resolvedEnvironmentId;
     if (environmentId === null || trimmedName.length === 0) return;
 
     setIsSubmitting(true);
@@ -97,6 +120,8 @@ export function NewProjectDialog(props: {
             name: trimmedName,
             workplaceLink: trimmedWorkplaceLink,
             productionLink: trimmedProductionLink,
+            testApiKey: trimmedTestApiKey,
+            ...(trimmedProdApiKey.length > 0 ? { prodApiKey: trimmedProdApiKey } : {}),
             shareWithStaff,
           },
         });
@@ -191,10 +216,12 @@ export function NewProjectDialog(props: {
     handleNewThread,
     handleOpenChange,
     isRobloxProject,
-    primaryEnvironmentId,
+    resolvedEnvironmentId,
     shareWithStaff,
     trimmedName,
     trimmedProductionLink,
+    trimmedProdApiKey,
+    trimmedTestApiKey,
     trimmedWorkplaceLink,
   ]);
 
@@ -202,20 +229,28 @@ export function NewProjectDialog(props: {
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogPopup className="max-w-md">
         <DialogHeader className="gap-1.5">
-          <DialogTitle className="text-balance">New project</DialogTitle>
+          <DialogTitle className="text-balance">
+            {isRobloxProject ? "New Roblox game" : "New project"}
+          </DialogTitle>
           <DialogDescription>
-            Create a new project workspace, or{" "}
-            <button
-              type="button"
-              className="underline underline-offset-2 hover:text-foreground"
-              onClick={() => {
-                handleOpenChange(false);
-                onBrowseExisting();
-              }}
-            >
-              browse for an existing folder
-            </button>
-            .
+            {isRobloxProject ? (
+              "Scaffold a roblox-ts project with CI and auto-publish, wired to your Roblox experiences."
+            ) : (
+              <>
+                Create a new project workspace, or{" "}
+                <button
+                  type="button"
+                  className="underline underline-offset-2 hover:text-foreground"
+                  onClick={() => {
+                    handleOpenChange(false);
+                    onBrowseExisting();
+                  }}
+                >
+                  browse for an existing folder
+                </button>
+                .
+              </>
+            )}
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="flex flex-col gap-5">
@@ -233,6 +268,9 @@ export function NewProjectDialog(props: {
                 }
               }}
             />
+            <FieldDescription>
+              Lowercase letters, digits, and hyphens. Checked against your existing repositories.
+            </FieldDescription>
           </Field>
 
           <label className="flex items-start gap-2.5">
@@ -250,43 +288,93 @@ export function NewProjectDialog(props: {
             </span>
           </label>
 
-          <label className="flex items-start gap-2.5">
-            <Checkbox
-              checked={isRobloxProject}
-              onCheckedChange={(checked) => setIsRobloxProject(checked === true)}
-              className="mt-0.5"
-            />
-            <span className="flex flex-col gap-0.5">
-              <span className="font-medium text-foreground text-sm">Roblox project</span>
-              <span className="text-muted-foreground text-xs">
-                Scaffold a Roblox TypeScript project linked to a workplace and production
-                experience.
+          {!isRobloxProject ? (
+            <label className="flex items-start gap-2.5">
+              <Checkbox
+                checked={isRobloxProject}
+                onCheckedChange={(checked) => setIsRobloxProject(checked === true)}
+                className="mt-0.5"
+              />
+              <span className="flex flex-col gap-0.5">
+                <span className="font-medium text-foreground text-sm">Roblox game</span>
+                <span className="text-muted-foreground text-xs">
+                  Scaffold a roblox-ts project with CI and auto-publish, linked to a workplace and
+                  production experience.
+                </span>
               </span>
-            </span>
-          </label>
+            </label>
+          ) : null}
 
           {isRobloxProject ? (
             <div className="flex flex-col gap-4 border-border/60 border-l-2 pl-3.5">
               <Field>
-                <FieldLabel>Workplace game link</FieldLabel>
+                <FieldLabel>Workplace place</FieldLabel>
                 <Input
                   value={workplaceLink}
                   placeholder="https://create.roblox.com/dashboard/creations/experiences/..."
                   onChange={(event) => setWorkplaceLink(event.target.value)}
                 />
                 <FieldDescription>
-                  The dev experience whose start place holds the Studio-authored world and doubles
-                  as the Test place.
+                  Your dev experience&apos;s place: holds the Studio-built world and doubles as the
+                  joinable Test place. Paste a link or the place ID.
                 </FieldDescription>
               </Field>
               <Field>
-                <FieldLabel>Production place link</FieldLabel>
+                <FieldLabel>Production place</FieldLabel>
                 <Input
                   value={productionLink}
                   placeholder="https://www.roblox.com/games/..."
                   onChange={(event) => setProductionLink(event.target.value)}
                 />
-                <FieldDescription>The live game experience.</FieldDescription>
+                <FieldDescription>
+                  Your live game&apos;s place. Only the manual Promote workflow ever publishes here.
+                </FieldDescription>
+              </Field>
+              <Field>
+                <FieldLabel>Test API key</FieldLabel>
+                <Input
+                  type="password"
+                  autoComplete="off"
+                  value={testApiKey}
+                  placeholder="Roblox Open Cloud API key"
+                  onChange={(event) => setTestApiKey(event.target.value)}
+                />
+                <FieldDescription>
+                  Scopes: Universe Places → Write and Legacy Assets → Manage, restricted to the dev
+                  experience. Create one at{" "}
+                  <a
+                    href={ROBLOX_CREDENTIALS_URL}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="underline underline-offset-2 hover:text-foreground"
+                  >
+                    create.roblox.com/dashboard/credentials
+                  </a>
+                  .
+                </FieldDescription>
+              </Field>
+              <Field>
+                <FieldLabel>Production API key (optional)</FieldLabel>
+                <Input
+                  type="password"
+                  autoComplete="off"
+                  value={prodApiKey}
+                  placeholder="Add later if you prefer"
+                  onChange={(event) => setProdApiKey(event.target.value)}
+                />
+                <FieldDescription>
+                  Publish-only: Universe Places → Write, restricted to the production experience.
+                  Wires the manual Promote-to-production workflow; you can add it later. See{" "}
+                  <a
+                    href={ROBLOX_CREDENTIALS_URL}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="underline underline-offset-2 hover:text-foreground"
+                  >
+                    create.roblox.com/dashboard/credentials
+                  </a>
+                  .
+                </FieldDescription>
               </Field>
             </div>
           ) : null}
@@ -308,9 +396,11 @@ export function NewProjectDialog(props: {
           >
             {isSubmitting
               ? isRobloxProject
-                ? "Creating Roblox project…"
+                ? "Creating Roblox game…"
                 : "Creating…"
-              : "Create project"}
+              : isRobloxProject
+                ? "Create Roblox game"
+                : "Create project"}
           </Button>
         </DialogFooter>
       </DialogPopup>

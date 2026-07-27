@@ -25,6 +25,7 @@ import {
   CornerLeftUpIcon,
   FolderIcon,
   FolderPlusIcon,
+  Gamepad2Icon,
   LinkIcon,
   MessageSquareIcon,
   SettingsIcon,
@@ -107,6 +108,7 @@ import { orderItemsByPreferredIds, sortLogicalProjectsForSidebar } from "./Sideb
 import { resolveEnvironmentOptionLabel } from "./BranchToolbar.logic";
 import { CommandPaletteResults } from "./CommandPaletteResults";
 import { AzureDevOpsIcon, BitbucketIcon, GitHubIcon, GitLabIcon } from "./Icons";
+import { openNewProjectDialog } from "../newProjectDialogBus";
 import { ProjectFavicon } from "./ProjectFavicon";
 import { ThreadRowLeadingStatus, ThreadRowTrailingStatus } from "./ThreadStatusIndicators";
 import { primaryServerKeybindingsAtom, primaryServerProvidersAtom } from "../state/server";
@@ -951,6 +953,17 @@ function OpenCommandPaletteDialog(props: {
           keepOpen: true,
           run: async () => {
             startAddProjectBrowse(environmentId);
+          },
+        },
+        {
+          kind: "action",
+          value: `action:add-project:${environmentId}:roblox`,
+          searchTerms: ["roblox", "game", "roblox-ts", "luau", "ci", "publish", "deploy"],
+          title: "Roblox game",
+          description: "Scaffold a roblox-ts project with CI and auto-publish",
+          icon: <Gamepad2Icon className={ITEM_ICON_CLASS} />,
+          run: async () => {
+            openNewProjectDialog({ mode: "roblox", environmentId });
           },
         },
       ];
