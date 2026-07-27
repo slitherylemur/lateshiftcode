@@ -1,0 +1,14 @@
+{
+  "name": "lateshift-portal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "LateShift Cloud portal: landing page, per-user work history, workspace access, admin panel.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=22.5"
+  }
+}

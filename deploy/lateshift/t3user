@@ -2,9 +2,12 @@
 # t3user - LateShift Cloud per-user T3 Code instance provisioning CLI.
 #
 # Usage:
-#   t3user add <name> [--project-limit N] [--admin]   provision + start an instance
+#   t3user add <name> [--project-limit N] [--admin] [--ts-login LOGIN]
+#                                                     provision + start an instance
 #   t3user remove <name> [--force]                    stop instance, archive its data
 #   t3user list                                       show all registered users
+#   t3user set <name> <key> <value>                   update a registry field
+#                                                     (keys: projectLimit, sharedAccess, tsLogin, admin)
 #   t3user pair <name> [--ttl 1h]                     mint a one-time pairing URL
 #
 # State lives under /home/dev/services/lateshift:
@@ -31,7 +34,7 @@ RESERVED_TS_PORT=443       # production tailscale serve HTTPS port
 die() { echo "t3user: $*" >&2; exit 1; }
 
 usage() {
-    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -69,6 +72,14 @@ validate_name() {
     case "${name}" in
         t3code|production|prod|lateshift) die "name '${name}' is reserved" ;;
     esac
+}
+
+# Tailnet login identity, e.g. "alice@github" or "alice@example.com".
+validate_ts_login() {
+    local login="$1"
+    [[ "${login}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]] \
+        || die "invalid tsLogin '${login}' (expected user@domain, e.g. alice@github)"
+    (( ${#login} <= 128 )) || die "tsLogin too long"
 }
 
 # registry_py <op> [args...]  -- all registry access goes through python3 (no jq
@@ -145,16 +156,21 @@ elif op == "alloc":
     print(f"{local_port} {ts_port}")
 
 elif op == "commit":
-    # commit <name> <localPort> <tsPort> <projectLimit> <admin>
-    # Persist a user AFTER its instance passed health checks.
+    # commit <name> <localPort> <tsPort> <projectLimit> <admin> <tsLogin>
+    # Persist a user AFTER its instance passed health checks. tsLogin may be
+    # the empty string (stored as null).
     name, local_port, ts_port = args[0], int(args[1]), int(args[2])
     project_limit, admin = int(args[3]), args[4] == "true"
+    ts_login = args[5] if len(args) > 5 and args[5] else None
     if name in reg["users"]:
         print(f"user '{name}' already present at commit time", file=sys.stderr)
         sys.exit(1)
     if local_port in RESERVED_LOCAL or ts_port in RESERVED_TS:
         print("refusing to commit reserved production port", file=sys.stderr)
         sys.exit(2)
+    if ts_login and any(u.get("tsLogin") == ts_login for u in reg["users"].values()):
+        print(f"tsLogin '{ts_login}' is already mapped to another user", file=sys.stderr)
+        sys.exit(3)
     reg["users"][name] = {
         "localPort": local_port,
         "tsPort": ts_port,
@@ -162,6 +178,7 @@ elif op == "commit":
         "projectLimit": project_limit,
         "sharedAccess": False,
         "admin": admin,
+        "tsLogin": ts_login,
         "createdAt": datetime.datetime.now(datetime.timezone.utc)
             .strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
@@ -183,13 +200,51 @@ elif op == "remove":
     del reg["users"][name]
     save()
 
+elif op == "set":
+    # set <name> <key> <value>
+    # Allowed keys only; each value is validated here (defense in depth: the
+    # bash wrapper validates too).
+    name, key, value = args[0], args[1], args[2]
+    user = reg["users"].get(name)
+    if user is None:
+        print(f"user '{name}' not found", file=sys.stderr)
+        sys.exit(1)
+    if key == "projectLimit":
+        if not (value.isdigit() and 0 <= int(value) <= 999):
+            print("projectLimit must be an integer 0-999", file=sys.stderr)
+            sys.exit(2)
+        user[key] = int(value)
+    elif key in ("sharedAccess", "admin"):
+        if value not in ("true", "false"):
+            print(f"{key} must be 'true' or 'false'", file=sys.stderr)
+            sys.exit(2)
+        user[key] = value == "true"
+    elif key == "tsLogin":
+        import re
+        if value == "":
+            user[key] = None
+        else:
+            if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", value) or len(value) > 128:
+                print(f"invalid tsLogin '{value}'", file=sys.stderr)
+                sys.exit(2)
+            for other, u in reg["users"].items():
+                if other != name and u.get("tsLogin") == value:
+                    print(f"tsLogin '{value}' is already mapped to user '{other}'", file=sys.stderr)
+                    sys.exit(3)
+            user[key] = value
+    else:
+        print(f"key '{key}' is not settable (allowed: projectLimit, sharedAccess, tsLogin, admin)", file=sys.stderr)
+        sys.exit(2)
+    save()
+
 elif op == "list":
-    fmt = "{:<20} {:>9} {:>7} {:>13} {:>6} {:>6}  {}"
-    print(fmt.format("NAME", "LOCALPORT", "TSPORT", "PROJECTLIMIT", "SHARED", "ADMIN", "CREATED"))
+    fmt = "{:<20} {:>9} {:>7} {:>13} {:>6} {:>6}  {:<28} {}"
+    print(fmt.format("NAME", "LOCALPORT", "TSPORT", "PROJECTLIMIT", "SHARED", "ADMIN", "TSLOGIN", "CREATED"))
     for name, u in sorted(reg["users"].items()):
         print(fmt.format(name, u["localPort"], u["tsPort"], u["projectLimit"],
                          "yes" if u["sharedAccess"] else "no",
-                         "yes" if u["admin"] else "no", u["createdAt"]))
+                         "yes" if u["admin"] else "no",
+                         u.get("tsLogin") or "-", u["createdAt"]))
 
 else:
     print(f"unknown registry op: {op}", file=sys.stderr)
@@ -265,18 +320,20 @@ rollback_add() {
 }
 
 cmd_add() {
-    local name="" project_limit=3 admin=false
+    local name="" project_limit=3 admin=false ts_login=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --project-limit) project_limit="${2:?--project-limit needs a value}"; shift 2 ;;
             --admin) admin=true; shift ;;
+            --ts-login) ts_login="${2:?--ts-login needs a value}"; shift 2 ;;
             -*) die "unknown flag for add: $1" ;;
             *) [[ -n "${name}" ]] && die "unexpected argument: $1"; name="$1"; shift ;;
         esac
     done
-    [[ -n "${name}" ]] || die "usage: t3user add <name> [--project-limit N] [--admin]"
+    [[ -n "${name}" ]] || die "usage: t3user add <name> [--project-limit N] [--admin] [--ts-login LOGIN]"
     validate_name "${name}"
     [[ "${project_limit}" =~ ^[0-9]+$ ]] || die "--project-limit must be a number"
+    [[ -n "${ts_login}" ]] && validate_ts_login "${ts_login}"
 
     if registry_py exists "${name}"; then
         die "user '${name}' already exists (refusing to re-add)"
@@ -325,7 +382,7 @@ EOF
     fi
 
     # Instance is healthy and verified: persist it to the registry (atomic write).
-    registry_py commit "${name}" "${local_port}" "${ts_port}" "${project_limit}" "${admin}" \
+    registry_py commit "${name}" "${local_port}" "${ts_port}" "${project_limit}" "${admin}" "${ts_login}" \
         || { rollback_add "${name}" "${ts_port}" "${base_dir}"; die "registry commit failed; rolled back"; }
 
     # Best-effort tailnet reachability check (warn only: tailscale serve can
@@ -407,6 +464,53 @@ cmd_list() {
     registry_py list
 }
 
+# set <name> <key> <value> — update one registry field. For projectLimit the
+# instance.env T3CODE_MAX_PROJECTS line is rewritten too; the caller must
+# restart t3code@<name> for the new limit to take effect.
+cmd_set() {
+    [[ $# -eq 3 ]] || die "usage: t3user set <name> <key> <value>"
+    local name="$1" key="$2" value="$3"
+    validate_name "${name}"
+    registry_py exists "${name}" || die "user '${name}' not found"
+
+    case "${key}" in
+        projectLimit)
+            [[ "${value}" =~ ^[0-9]{1,3}$ ]] || die "projectLimit must be an integer 0-999"
+            ;;
+        sharedAccess|admin)
+            [[ "${value}" == "true" || "${value}" == "false" ]] || die "${key} must be 'true' or 'false'"
+            ;;
+        tsLogin)
+            [[ -n "${value}" ]] && validate_ts_login "${value}"
+            ;;
+        *) die "key '${key}' is not settable (allowed: projectLimit, sharedAccess, tsLogin, admin)" ;;
+    esac
+
+    registry_py set "${name}" "${key}" "${value}"
+
+    if [[ "${key}" == "projectLimit" ]]; then
+        local env_file
+        env_file="$(registry_py get "${name}" baseDir)/instance.env"
+        if [[ -f "${env_file}" ]]; then
+            # Rewrite only the T3CODE_MAX_PROJECTS line; never touch the port
+            # lines. Atomic replace within the same directory.
+            local tmp
+            tmp="$(mktemp "${env_file}.tmp.XXXXXX")"
+            if grep -q '^T3CODE_MAX_PROJECTS=' "${env_file}"; then
+                sed "s/^T3CODE_MAX_PROJECTS=.*/T3CODE_MAX_PROJECTS=${value}/" "${env_file}" > "${tmp}"
+            else
+                cat "${env_file}" > "${tmp}"
+                echo "T3CODE_MAX_PROJECTS=${value}" >> "${tmp}"
+            fi
+            mv "${tmp}" "${env_file}"
+            echo "updated ${env_file}; restart t3code@${name} to apply the new limit"
+        else
+            echo "warning: ${env_file} not found; registry updated but no instance.env to rewrite" >&2
+        fi
+    fi
+    echo "set ${name}.${key} = ${value}"
+}
+
 cmd_pair() {
     local name="" ttl="1h"
     while [[ $# -gt 0 ]]; do
@@ -435,7 +539,7 @@ main() {
     [[ $# -ge 1 ]] || usage 1
     local cmd="$1"; shift
     case "${cmd}" in
-        add|remove|pair|list)
+        add|remove|pair|list|set)
             # Serialize ALL registry access (reads included) across concurrent
             # invocations; lock is taken before first-time registry creation.
             mkdir -p "${LATESHIFT_ROOT}"
@@ -445,7 +549,7 @@ main() {
             "cmd_${cmd}" "$@"
             ;;
         -h|--help|help) usage 0 ;;
-        *) die "unknown command '${cmd}' (try: add, remove, list, pair)" ;;
+        *) die "unknown command '${cmd}' (try: add, remove, list, set, pair)" ;;
     esac
 }
 
