@@ -9,7 +9,9 @@
 #   t3user set <name> <key> <value>                   update a registry field
 #                                                     (keys: projectLimit, sharedAccess, tsLogin, admin,
 #                                                      monthlyBudgetUsd, providerBudgets[.<provider>[.monthly|.fiveHour]])
-#   t3user pair <name> [--ttl 1h]                     mint a one-time pairing URL
+#   t3user pair <name> [--ttl 1h] [--public]          mint a one-time pairing URL
+#                                                     (--public: use https://<name>.lateshiftcloud.com
+#                                                      instead of the tailnet URL)
 #   t3user share <name> <abs-path>                    grant a shared project dir (t3 project add on their instance)
 #   t3user unshare <name> <abs-path>                  revoke a shared project dir
 #
@@ -29,6 +31,8 @@ USERS_DIR="${LATESHIFT_ROOT}/users"
 ARCHIVE_DIR="${LATESHIFT_ROOT}/archive"
 LOCK_FILE="${LATESHIFT_ROOT}/.registry.lock"
 TAILNET_HOST="t3cloud.taild7c97b.ts.net"
+PUBLIC_DOMAIN="lateshiftcloud.com"   # public gateway domain (pair --public)
+RENDER_GATEWAY="${LATESHIFT_ROOT}/bin/render-gateway"  # regenerate Caddy user blocks
 T3_CLI="/usr/bin/t3"
 HEALTH_TIMEOUT_SECS=60
 RESERVED_LOCAL_PORT=3773   # production t3code local port
@@ -37,7 +41,7 @@ RESERVED_TS_PORT=443       # production tailscale serve HTTPS port
 die() { echo "t3user: $*" >&2; exit 1; }
 
 usage() {
-    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -586,6 +590,10 @@ EOF
     echo "  local:   http://127.0.0.1:${local_port}/"
     echo "  tailnet: https://${TAILNET_HOST}:${ts_port}/"
     echo "  pair:    t3user pair ${name}"
+
+    # Sync the public gateway's per-user Caddy blocks (best-effort; the tailnet
+    # path above is already live regardless).
+    sudo "${RENDER_GATEWAY}" >/dev/null 2>&1 || echo "warning: render-gateway failed; run 'sudo ${RENDER_GATEWAY}' to sync the public gateway" >&2
 }
 
 cmd_remove() {
@@ -638,6 +646,9 @@ cmd_remove() {
 
     registry_py remove "${name}"
     echo "user '${name}' removed (data archived, never deleted)"
+
+    # Drop the removed user's block from the public gateway (best-effort).
+    sudo "${RENDER_GATEWAY}" >/dev/null 2>&1 || echo "warning: render-gateway failed; run 'sudo ${RENDER_GATEWAY}' to sync the public gateway" >&2
 }
 
 cmd_list() {
@@ -781,27 +792,35 @@ cmd_unshare() {
 }
 
 cmd_pair() {
-    local name="" ttl="1h"
+    local name="" ttl="1h" public=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --ttl) ttl="${2:?--ttl needs a value}"; shift 2 ;;
+            --public) public=true; shift ;;
             -*) die "unknown flag for pair: $1" ;;
             *) [[ -n "${name}" ]] && die "unexpected argument: $1"; name="$1"; shift ;;
         esac
     done
-    [[ -n "${name}" ]] || die "usage: t3user pair <name> [--ttl 1h]"
+    [[ -n "${name}" ]] || die "usage: t3user pair <name> [--ttl 1h] [--public]"
     validate_name "${name}"
     registry_py exists "${name}" || die "user '${name}' not found"
 
-    local base_dir ts_port
+    local base_dir ts_port base_url
     base_dir=$(registry_py get "${name}" baseDir)
     ts_port=$(normalize_port "$(registry_py get "${name}" tsPort)") || die "registry tsPort for '${name}' is invalid"
+
+    # Default: tailnet URL. --public: the public gateway hostname (Cloudflare).
+    if ${public}; then
+        base_url="https://${name}.${PUBLIC_DOMAIN}"
+    else
+        base_url="https://${TAILNET_HOST}:${ts_port}"
+    fi
 
     "${T3_CLI}" auth pairing create \
         --base-dir "${base_dir}" \
         --ttl "${ttl}" \
         --label "lateshift-${name}" \
-        --base-url "https://${TAILNET_HOST}:${ts_port}"
+        --base-url "${base_url}"
 }
 
 main() {
