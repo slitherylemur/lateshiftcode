@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# t3user - LateShift Cloud per-user T3 Code instance provisioning CLI.
+#
+# Usage:
+#   t3user add <name> [--project-limit N] [--admin]   provision + start an instance
+#   t3user remove <name>                              stop instance, archive its data
+#   t3user list                                       show all registered users
+#   t3user pair <name> [--ttl 1h]                     mint a one-time pairing URL
+#
+# State lives under /home/dev/services/lateshift:
+#   users.json           port/user registry (contract consumed by the portal)
+#   users/<name>/        per-user T3 base dir (all instance state under userdata/)
+#   users/<name>/instance.env   ports + limits consumed by t3code@<name>.service
+#   archive/             timestamped archives of removed users (never deleted)
+#
+# SAFETY: this tool only ever manages t3code@<name> template units. It must
+# never touch the plain `t3code.service` production unit or HTTPS port 443.
+set -euo pipefail
+
+LATESHIFT_ROOT="/home/dev/services/lateshift"
+REGISTRY="${LATESHIFT_ROOT}/users.json"
+USERS_DIR="${LATESHIFT_ROOT}/users"
+ARCHIVE_DIR="${LATESHIFT_ROOT}/archive"
+LOCK_FILE="${LATESHIFT_ROOT}/.registry.lock"
+TAILNET_HOST="t3cloud.taild7c97b.ts.net"
+T3_CLI="/usr/bin/t3"
+HEALTH_TIMEOUT_SECS=60
+
+die() { echo "t3user: $*" >&2; exit 1; }
+
+usage() {
+    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+ensure_registry() {
+    mkdir -p "${USERS_DIR}" "${ARCHIVE_DIR}"
+    if [[ ! -f "${REGISTRY}" ]]; then
+        cat > "${REGISTRY}" <<'EOF'
+{
+  "users": {},
+  "nextLocalPort": 3780,
+  "nextTsPort": 8460
+}
+EOF
+    fi
+}
+
+validate_name() {
+    local name="$1"
+    [[ "${name}" =~ ^[a-z0-9-]{2,20}$ ]] || die "invalid name '${name}' (allowed: [a-z0-9-]{2,20})"
+    # Reserved words that could collide with the production unit or tooling.
+    case "${name}" in
+        t3code|production|prod|lateshift) die "name '${name}' is reserved" ;;
+    esac
+}
+
+# registry_py <op> [args...]  -- all registry mutations go through python3 (no jq on box)
+registry_py() {
+    python3 - "$@" <<'PYEOF'
+import json, sys, datetime
+
+REGISTRY = "/home/dev/services/lateshift/users.json"
+op = sys.argv[1]
+args = sys.argv[2:]
+
+with open(REGISTRY) as f:
+    reg = json.load(f)
+
+def save():
+    with open(REGISTRY, "w") as f:
+        json.dump(reg, f, indent=2, sort_keys=False)
+        f.write("\n")
+
+if op == "exists":
+    sys.exit(0 if args[0] in reg["users"] else 1)
+
+elif op == "add":
+    name, project_limit, admin = args[0], int(args[1]), args[2] == "true"
+    if name in reg["users"]:
+        sys.exit(1)
+    local_port = reg["nextLocalPort"]
+    ts_port = reg["nextTsPort"]
+    if ts_port == 443 or local_port == 3773:
+        print("port allocation collided with production reservation", file=sys.stderr)
+        sys.exit(2)
+    reg["users"][name] = {
+        "localPort": local_port,
+        "tsPort": ts_port,
+        "baseDir": f"/home/dev/services/lateshift/users/{name}",
+        "projectLimit": project_limit,
+        "sharedAccess": False,
+        "admin": admin,
+        "createdAt": datetime.datetime.now(datetime.timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    reg["nextLocalPort"] = local_port + 1
+    reg["nextTsPort"] = ts_port + 1
+    save()
+    print(f"{local_port} {ts_port}")
+
+elif op == "get":
+    name, field = args[0], args[1]
+    user = reg["users"].get(name)
+    if user is None:
+        sys.exit(1)
+    print(user[field])
+
+elif op == "remove":
+    name = args[0]
+    if name not in reg["users"]:
+        sys.exit(1)
+    del reg["users"][name]
+    save()
+
+elif op == "list":
+    fmt = "{:<20} {:>9} {:>7} {:>13} {:>6} {:>6}  {}"
+    print(fmt.format("NAME", "LOCALPORT", "TSPORT", "PROJECTLIMIT", "SHARED", "ADMIN", "CREATED"))
+    for name, u in sorted(reg["users"].items()):
+        print(fmt.format(name, u["localPort"], u["tsPort"], u["projectLimit"],
+                         "yes" if u["sharedAccess"] else "no",
+                         "yes" if u["admin"] else "no", u["createdAt"]))
+
+else:
+    print(f"unknown registry op: {op}", file=sys.stderr)
+    sys.exit(2)
+PYEOF
+}
+
+wait_for_health() {
+    local port="$1" deadline=$((SECONDS + HEALTH_TIMEOUT_SECS)) code
+    while (( SECONDS < deadline )); do
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:${port}/" || true)
+        if [[ "${code}" == "200" ]]; then
+            echo "healthy (HTTP ${code} on 127.0.0.1:${port})"
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+cmd_add() {
+    local name="" project_limit=3 admin=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --project-limit) project_limit="${2:?--project-limit needs a value}"; shift 2 ;;
+            --admin) admin=true; shift ;;
+            -*) die "unknown flag for add: $1" ;;
+            *) [[ -n "${name}" ]] && die "unexpected argument: $1"; name="$1"; shift ;;
+        esac
+    done
+    [[ -n "${name}" ]] || die "usage: t3user add <name> [--project-limit N] [--admin]"
+    validate_name "${name}"
+    [[ "${project_limit}" =~ ^[0-9]+$ ]] || die "--project-limit must be a number"
+
+    if registry_py exists "${name}"; then
+        die "user '${name}' already exists (refusing to re-add)"
+    fi
+    [[ -e "${USERS_DIR}/${name}" ]] && die "base dir ${USERS_DIR}/${name} already exists; resolve manually"
+
+    local ports
+    ports=$(registry_py add "${name}" "${project_limit}" "${admin}") || die "registry allocation failed"
+    local local_port ts_port
+    read -r local_port ts_port <<< "${ports}"
+
+    mkdir -p "${USERS_DIR}/${name}"
+    cat > "${USERS_DIR}/${name}/instance.env" <<EOF
+# LateShift Cloud instance config for '${name}' (consumed by t3code@${name}.service)
+T3CODE_INSTANCE_PORT=${local_port}
+TS_SERVE_PORT=${ts_port}
+T3CODE_MAX_PROJECTS=${project_limit}
+EOF
+
+    echo "provisioning '${name}': local port ${local_port}, tailnet HTTPS port ${ts_port}"
+    sudo systemctl enable --now "t3code@${name}.service"
+
+    echo -n "waiting for health on 127.0.0.1:${local_port} ... "
+    if ! wait_for_health "${local_port}"; then
+        echo "FAILED"
+        echo "instance did not become healthy within ${HEALTH_TIMEOUT_SECS}s; recent logs:" >&2
+        sudo journalctl -u "t3code@${name}" -n 20 --no-pager >&2 || true
+        exit 1
+    fi
+
+    systemctl status "t3code@${name}" --no-pager -n 0 | head -6 || true
+    echo
+    echo "user '${name}' is up:"
+    echo "  local:   http://127.0.0.1:${local_port}/"
+    echo "  tailnet: https://${TAILNET_HOST}:${ts_port}/"
+    echo "  pair:    t3user pair ${name}"
+}
+
+cmd_remove() {
+    local name="${1:?usage: t3user remove <name>}"
+    validate_name "${name}"
+    registry_py exists "${name}" || die "user '${name}' not found"
+
+    local ts_port
+    ts_port=$(registry_py get "${name}" tsPort)
+
+    echo "stopping and disabling t3code@${name} ..."
+    sudo systemctl disable --now "t3code@${name}.service" || true
+
+    # Best-effort: clear the tailscale serve mapping this instance created.
+    if [[ -n "${ts_port}" && "${ts_port}" != "443" ]]; then
+        sudo tailscale serve --https="${ts_port}" off 2>/dev/null || true
+    fi
+
+    if [[ -d "${USERS_DIR}/${name}" ]]; then
+        local dest="${ARCHIVE_DIR}/${name}-$(date -u +%Y%m%d-%H%M%S)"
+        mv "${USERS_DIR}/${name}" "${dest}"
+        echo "archived base dir to ${dest}"
+    fi
+
+    registry_py remove "${name}"
+    echo "user '${name}' removed (data archived, never deleted)"
+}
+
+cmd_list() {
+    registry_py list
+}
+
+cmd_pair() {
+    local name="" ttl="1h"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ttl) ttl="${2:?--ttl needs a value}"; shift 2 ;;
+            -*) die "unknown flag for pair: $1" ;;
+            *) [[ -n "${name}" ]] && die "unexpected argument: $1"; name="$1"; shift ;;
+        esac
+    done
+    [[ -n "${name}" ]] || die "usage: t3user pair <name> [--ttl 1h]"
+    validate_name "${name}"
+    registry_py exists "${name}" || die "user '${name}' not found"
+
+    local base_dir ts_port
+    base_dir=$(registry_py get "${name}" baseDir)
+    ts_port=$(registry_py get "${name}" tsPort)
+
+    "${T3_CLI}" auth pairing create \
+        --base-dir "${base_dir}" \
+        --ttl "${ttl}" \
+        --label "lateshift-${name}" \
+        --base-url "https://${TAILNET_HOST}:${ts_port}"
+}
+
+main() {
+    [[ $# -ge 1 ]] || usage 1
+    local cmd="$1"; shift
+    ensure_registry
+    case "${cmd}" in
+        add|remove|pair)
+            # Serialize registry mutations/reads across concurrent invocations.
+            exec 9> "${LOCK_FILE}"
+            flock 9
+            "cmd_${cmd}" "$@"
+            ;;
+        list) cmd_list "$@" ;;
+        -h|--help|help) usage 0 ;;
+        *) die "unknown command '${cmd}' (try: add, remove, list, pair)" ;;
+    esac
+}
+
+main "$@"
