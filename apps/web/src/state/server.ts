@@ -6,7 +6,6 @@ import {
   type ServerLifecycleWelcomePayload,
   type ServerProvider,
   type ServerSettings,
-  type LateShiftUsageBudget,
 } from "@t3tools/contracts";
 import { createServerEnvironmentAtoms } from "@t3tools/client-runtime/state/server";
 import { createEnvironmentServerConfigsAtom } from "@t3tools/client-runtime/state/shell";
@@ -63,15 +62,6 @@ export const primaryServerStateAtom = Atom.make((get): PrimaryServerState => {
 export const primaryServerConfigAtom = Atom.make(
   (get): ServerConfig | null => get(primaryServerStateAtom).config,
 ).pipe(Atom.withLabel("web-primary-server-config"));
-
-export const primaryUsageBudgetAtom = Atom.make((get): LateShiftUsageBudget | null => {
-  const environmentId = get(primaryEnvironmentIdAtom);
-  if (environmentId === null) {
-    return null;
-  }
-  const target = { environmentId, input: {} };
-  return Option.getOrNull(AsyncResult.value(get(serverEnvironment.usageBudget(target))));
-}).pipe(Atom.withLabel("web-primary-usage-budget"));
 
 export const primaryServerConfigEventAtom = Atom.make(
   (get): ServerConfigStreamEvent | null => get(primaryServerStateAtom).latestEvent,

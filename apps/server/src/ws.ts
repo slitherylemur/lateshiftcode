@@ -69,13 +69,6 @@ import * as ServerConfig from "./config.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import { normalizeDispatchCommand } from "./orchestration/Normalizer.ts";
-import { TurnUsageRepository } from "./persistence/Services/TurnUsage.ts";
-import {
-  buildUsageBudget,
-  computeUsageSnapshot,
-  resolveLateShiftLimits,
-  startOfUtcMonthMs,
-} from "./orchestration/usageBudget.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import {
@@ -309,7 +302,6 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.serverUpsertKeybinding, AuthOrchestrationOperateScope],
   [WS_METHODS.serverRemoveKeybinding, AuthOrchestrationOperateScope],
   [WS_METHODS.serverGetSettings, AuthOrchestrationReadScope],
-  [WS_METHODS.serverGetUsageBudget, AuthOrchestrationReadScope],
   [WS_METHODS.serverUpdateSettings, AuthOrchestrationOperateScope],
   [WS_METHODS.serverDiscoverSourceControl, AuthOrchestrationReadScope],
   [WS_METHODS.serverGetTraceDiagnostics, AuthOrchestrationReadScope],
@@ -417,7 +409,6 @@ const makeWsRpcLayer = (
       const currentSessionId = currentSession.sessionId;
       const crypto = yield* Crypto.Crypto;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
-      const turnUsageRepository = yield* TurnUsageRepository;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
       const checkpointDiffQuery = yield* CheckpointDiffQuery.CheckpointDiffQuery;
       const keybindings = yield* Keybindings.Keybindings;
@@ -1474,38 +1465,6 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.serverGetConfig, loadServerConfig, {
             "rpc.aggregate": "server",
           }),
-        [WS_METHODS.serverGetUsageBudget]: (_input) =>
-          observeRpcEffect(
-            WS_METHODS.serverGetUsageBudget,
-            Effect.gen(function* () {
-              const limits = resolveLateShiftLimits();
-              const userName = process.env["LSC_USER_NAME"]?.trim() || null;
-              const nowMs = (yield* DateTime.now).epochMilliseconds;
-              // Fetch a little past the current month so the 5h session window
-              // anchors correctly across a month boundary.
-              const sinceMs = Math.min(startOfUtcMonthMs(nowMs), nowMs - 7 * 24 * 60 * 60 * 1_000);
-              const rows = yield* turnUsageRepository
-                .listCompletedSince(DateTime.formatIso(DateTime.makeUnsafe(sinceMs)))
-                .pipe(Effect.orElseSucceed(() => []));
-              const snapshot = computeUsageSnapshot(
-                rows.flatMap((row) => {
-                  const completedAtMs = Date.parse(row.completedAt);
-                  return Number.isFinite(completedAtMs)
-                    ? [
-                        {
-                          provider: row.providerName,
-                          costUsd: row.totalCostUsd,
-                          completedAtMs,
-                        },
-                      ]
-                    : [];
-                }),
-                nowMs,
-              );
-              return buildUsageBudget({ userName, snapshot, limits, nowMs });
-            }),
-            { "rpc.aggregate": "server" },
-          ),
         [WS_METHODS.serverRefreshProviders]: (input) =>
           observeRpcEffect(
             WS_METHODS.serverRefreshProviders,
