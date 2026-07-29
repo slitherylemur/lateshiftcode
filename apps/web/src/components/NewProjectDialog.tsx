@@ -32,7 +32,6 @@ import { Input } from "./ui/input";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 
 const SHARED_PROJECT_BASE_DIRECTORY = "/home/dev/shared";
-const ROBLOX_CREDENTIALS_URL = "https://create.roblox.com/dashboard/credentials";
 
 function ensureTrailingSlash(value: string): string {
   return value.endsWith("/") ? value : `${value}/`;
@@ -61,8 +60,6 @@ export function NewProjectDialog(props: {
   const [isRobloxProject, setIsRobloxProject] = useState(false);
   const [workplaceLink, setWorkplaceLink] = useState("");
   const [productionLink, setProductionLink] = useState("");
-  const [testApiKey, setTestApiKey] = useState("");
-  const [prodApiKey, setProdApiKey] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   // When the dialog is (re)opened, adopt the requested mode. Opening via the
@@ -79,8 +76,6 @@ export function NewProjectDialog(props: {
     setIsRobloxProject(false);
     setWorkplaceLink("");
     setProductionLink("");
-    setTestApiKey("");
-    setProdApiKey("");
   }, []);
 
   const handleOpenChange = useCallback(
@@ -94,18 +89,13 @@ export function NewProjectDialog(props: {
   const trimmedName = name.trim();
   const trimmedWorkplaceLink = workplaceLink.trim();
   const trimmedProductionLink = productionLink.trim();
-  const trimmedTestApiKey = testApiKey.trim();
-  const trimmedProdApiKey = prodApiKey.trim();
   const resolvedEnvironmentId: EnvironmentId | null =
     environmentIdOverride ?? primaryEnvironmentId ?? environments[0]?.environmentId ?? null;
   const canSubmit =
     trimmedName.length > 0 &&
     !isSubmitting &&
     resolvedEnvironmentId !== null &&
-    (!isRobloxProject ||
-      (trimmedWorkplaceLink.length > 0 &&
-        trimmedProductionLink.length > 0 &&
-        trimmedTestApiKey.length > 0));
+    (!isRobloxProject || (trimmedWorkplaceLink.length > 0 && trimmedProductionLink.length > 0));
 
   const handleSubmit = useCallback(async () => {
     const environmentId = resolvedEnvironmentId;
@@ -120,8 +110,6 @@ export function NewProjectDialog(props: {
             name: trimmedName,
             workplaceLink: trimmedWorkplaceLink,
             productionLink: trimmedProductionLink,
-            testApiKey: trimmedTestApiKey,
-            ...(trimmedProdApiKey.length > 0 ? { prodApiKey: trimmedProdApiKey } : {}),
             shareWithStaff,
           },
         });
@@ -220,8 +208,6 @@ export function NewProjectDialog(props: {
     shareWithStaff,
     trimmedName,
     trimmedProductionLink,
-    trimmedProdApiKey,
-    trimmedTestApiKey,
     trimmedWorkplaceLink,
   ]);
 
@@ -308,74 +294,34 @@ export function NewProjectDialog(props: {
           {isRobloxProject ? (
             <div className="flex flex-col gap-4 border-border/60 border-l-2 pl-3.5">
               <Field>
-                <FieldLabel>Workplace place</FieldLabel>
+                <FieldLabel>Workplace place ID</FieldLabel>
                 <Input
                   value={workplaceLink}
-                  placeholder="https://create.roblox.com/dashboard/creations/experiences/..."
+                  placeholder="e.g. 1234567890"
                   onChange={(event) => setWorkplaceLink(event.target.value)}
                 />
                 <FieldDescription>
-                  Your dev experience&apos;s place: holds the Studio-built world and doubles as the
-                  joinable Test place. Paste a link or the place ID.
+                  The place holding your Studio-built world; doubles as the joinable Test place.
                 </FieldDescription>
               </Field>
               <Field>
-                <FieldLabel>Production place</FieldLabel>
+                <FieldLabel>Production place ID</FieldLabel>
                 <Input
                   value={productionLink}
-                  placeholder="https://www.roblox.com/games/..."
+                  placeholder="e.g. 9876543210"
                   onChange={(event) => setProductionLink(event.target.value)}
                 />
                 <FieldDescription>
-                  Your live game&apos;s place. Only the manual Promote workflow ever publishes here.
+                  Your live game&apos;s place; only the manual Promote workflow publishes here.
                 </FieldDescription>
               </Field>
-              <Field>
-                <FieldLabel>Test API key</FieldLabel>
-                <Input
-                  type="password"
-                  autoComplete="off"
-                  value={testApiKey}
-                  placeholder="Roblox Open Cloud API key"
-                  onChange={(event) => setTestApiKey(event.target.value)}
-                />
-                <FieldDescription>
-                  Scopes: Universe Places → Write and Legacy Assets → Manage, restricted to the dev
-                  experience. Create one at{" "}
-                  <a
-                    href={ROBLOX_CREDENTIALS_URL}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="underline underline-offset-2 hover:text-foreground"
-                  >
-                    create.roblox.com/dashboard/credentials
-                  </a>
-                  .
-                </FieldDescription>
-              </Field>
-              <Field>
-                <FieldLabel>Production API key (optional)</FieldLabel>
-                <Input
-                  type="password"
-                  autoComplete="off"
-                  value={prodApiKey}
-                  placeholder="Add later if you prefer"
-                  onChange={(event) => setProdApiKey(event.target.value)}
-                />
-                <FieldDescription>
-                  Publish-only: Universe Places → Write, restricted to the production experience.
-                  Wires the manual Promote-to-production workflow; you can add it later. See{" "}
-                  <a
-                    href={ROBLOX_CREDENTIALS_URL}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="underline underline-offset-2 hover:text-foreground"
-                  >
-                    create.roblox.com/dashboard/credentials
-                  </a>
-                  .
-                </FieldDescription>
-              </Field>
+              <div className="flex flex-col gap-1.5 text-muted-foreground text-xs">
+                <p>The experience must be in the Late Shift Games group.</p>
+                <p>
+                  The repository is created under the group owner&apos;s GitHub account. Publishing
+                  uses the group master key automatically.
+                </p>
+              </div>
             </div>
           ) : null}
         </DialogPanel>

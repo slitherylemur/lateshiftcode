@@ -1,11 +1,8 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
-import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
-import * as Sink from "effect/Sink";
-import * as Stream from "effect/Stream";
-import { ChildProcessSpawner } from "effect/unstable/process";
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
 
 import * as RobloxProjectInputResolver from "./RobloxProjectInputResolver.ts";
 import * as RobloxProjectScaffolder from "./RobloxProjectScaffolder.ts";
@@ -13,11 +10,8 @@ import * as RobloxProjectScaffolder from "./RobloxProjectScaffolder.ts";
 const {
   buildJoinablePlaceLink,
   buildRobloxProjectFile,
-  parseRepositoryUrl,
-  redactSecrets,
   robloxProjectFileToScriptArg,
   validateProjectName,
-  wireReportedDownloadFailure,
 } = RobloxProjectScaffolder;
 
 describe("validateProjectName", () => {
@@ -77,92 +71,34 @@ describe("buildJoinablePlaceLink", () => {
   });
 });
 
-describe("parseRepositoryUrl", () => {
-  it("pulls the repo url out of new-project.sh output", () => {
-    expect(parseRepositoryUrl("Project sky ready\nRepo: https://github.com/acme/sky\nDone")).toBe(
-      "https://github.com/acme/sky",
-    );
-  });
-  it("returns null when absent", () => {
-    expect(parseRepositoryUrl("no url here")).toBeNull();
-  });
-});
-
-describe("wireReportedDownloadFailure", () => {
-  it("detects the wire-roblox marker", () => {
-    expect(wireReportedDownloadFailure("...\nWIRE_ASSET_DOWNLOAD_FAILED\n...")).toBe(true);
-    expect(wireReportedDownloadFailure("asset-delivery download WORKS")).toBe(false);
-  });
-});
-
-describe("redactSecrets", () => {
-  it("scrubs every occurrence of each secret", () => {
-    expect(redactSecrets("a KEY1 b KEY2 c KEY1", ["KEY1", "KEY2"])).toBe(
-      "a <redacted> b <redacted> c <redacted>",
-    );
-  });
-  it("ignores empty secrets", () => {
-    expect(redactSecrets("unchanged", [""])).toBe("unchanged");
-  });
-});
-
 // ---------------------------------------------------------------------------
-// Flow tests: stub the shell + filesystem so no real project/repo is created.
+// Flow tests: stub the broker HTTP client + resolver so no real project/repo
+// is created. The scaffolder never sees or forwards any API key.
 // ---------------------------------------------------------------------------
 
-const encode = (value: string): Uint8Array => new TextEncoder().encode(value);
-
-interface RecordedSpawn {
-  readonly command: string;
-  readonly args: ReadonlyArray<string>;
-  readonly env: Record<string, string | undefined> | undefined;
+interface RecordedRequest {
+  readonly url: string;
+  readonly method: string;
+  readonly body: string;
 }
 
-function stubHandle(stdout: string, stderr: string, code: number) {
-  return ChildProcessSpawner.makeHandle({
-    pid: ChildProcessSpawner.ProcessId(1),
-    exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(code)),
-    isRunning: Effect.succeed(false),
-    kill: () => Effect.void,
-    stdin: Sink.drain,
-    stdout: stdout.length > 0 ? Stream.make(encode(stdout)) : Stream.empty,
-    stderr: stderr.length > 0 ? Stream.make(encode(stderr)) : Stream.empty,
-    all: Stream.empty,
-    getInputFd: () => Sink.drain,
-    getOutputFd: () => Stream.empty,
-    unref: Effect.succeed(Effect.void),
-  });
+function decodeBody(request: HttpClientRequest.HttpClientRequest): string {
+  const body = request.body as { readonly _tag?: string; readonly body?: unknown };
+  if (body && body._tag === "Uint8Array" && body.body instanceof Uint8Array) {
+    return new TextDecoder().decode(body.body);
+  }
+  if (body && typeof body.body === "string") return body.body;
+  return "";
 }
 
-function makeSpawnerLayer(options: {
-  readonly recorded: Array<RecordedSpawn>;
-  readonly wireStderr?: string;
-  readonly wireCode?: number;
-  readonly scaffoldCode?: number;
-}) {
-  return Layer.succeed(
-    ChildProcessSpawner.ChildProcessSpawner,
-    ChildProcessSpawner.make((command) => {
-      const cmd = command as unknown as {
-        readonly command: string;
-        readonly args: ReadonlyArray<string>;
-        readonly options?: { readonly env?: Record<string, string | undefined> };
-      };
-      options.recorded.push({ command: cmd.command, args: cmd.args, env: cmd.options?.env });
-      if (cmd.command.includes("wire-roblox")) {
-        return Effect.succeed(
-          stubHandle("==> Done\n", options.wireStderr ?? "", options.wireCode ?? 0),
-        );
-      }
-      return Effect.succeed(
-        stubHandle(
-          "Project sky-journey ready\nRepo: https://github.com/acme/sky-journey\n",
-          "",
-          options.scaffoldCode ?? 0,
-        ),
-      );
-    }),
-  );
+function brokerLayer(response: unknown, status: number, recorded: Array<RecordedRequest>) {
+  const execute = (request: HttpClientRequest.HttpClientRequest) => {
+    recorded.push({ url: request.url, method: request.method, body: decodeBody(request) });
+    return Effect.succeed(
+      HttpClientResponse.fromWeb(request, Response.json(response as object, { status })),
+    );
+  };
+  return Layer.succeed(HttpClient.HttpClient, HttpClient.make(execute));
 }
 
 const resolverLayer = Layer.succeed(
@@ -177,34 +113,23 @@ const resolverLayer = Layer.succeed(
   }),
 );
 
-function scaffolderLayer(spawner: Layer.Layer<ChildProcessSpawner.ChildProcessSpawner>) {
-  return RobloxProjectScaffolder.layer.pipe(
-    Layer.provide([
-      resolverLayer,
-      spawner,
-      FileSystem.layerNoop({ exists: () => Effect.succeed(false) }),
-      Path.layer,
-    ]),
-  );
+function scaffolderLayer(broker: Layer.Layer<HttpClient.HttpClient>) {
+  return RobloxProjectScaffolder.layer.pipe(Layer.provide([resolverLayer, broker, Path.layer]));
 }
 
 const baseInput = {
   name: "sky-journey",
-  workplaceLink: "https://www.roblox.com/games/222/x",
-  productionLink: "https://www.roblox.com/games/444/y",
+  workplaceLink: "222",
+  productionLink: "444",
   shareWithStaff: false,
 } as const;
 
 describe("RobloxProjectScaffolder.scaffold", () => {
-  it.effect("runs new-project.sh then wire-roblox.sh, passing keys via env not argv", () => {
-    const recorded: Array<RecordedSpawn> = [];
+  it.effect("resolves ids and POSTs the broker with no secrets, relaying the result", () => {
+    const recorded: Array<RecordedRequest> = [];
     return Effect.gen(function* () {
       const scaffolder = yield* RobloxProjectScaffolder.RobloxProjectScaffolder;
-      const result = yield* scaffolder.scaffold({
-        ...baseInput,
-        testApiKey: "TEST_SECRET_KEY",
-        prodApiKey: "PROD_SECRET_KEY",
-      });
+      const result = yield* scaffolder.scaffold(baseInput);
 
       expect(result.stages).toEqual(["resolve", "scaffold", "repo", "wire", "deploy-triggered"]);
       expect(result.repositoryUrl).toBe("https://github.com/acme/sky-journey");
@@ -212,38 +137,44 @@ describe("RobloxProjectScaffolder.scaffold", () => {
       expect(result.roblox.workplacePlaceId).toBe(222);
       expect(result.roblox.prodPlaceId).toBe(444);
 
-      expect(recorded.map((entry) => entry.command)).toEqual([
-        "./new-project.sh",
-        "./wire-roblox.sh",
-      ]);
-      const wire = recorded[1];
-      expect(wire?.env?.ROBLOX_TEST_API_KEY).toBe("TEST_SECRET_KEY");
-      expect(wire?.env?.ROBLOX_PROD_API_KEY).toBe("PROD_SECRET_KEY");
-      // The keys must never appear in the argument vector (visible via `ps`).
-      expect(wire?.args.join(" ")).not.toContain("TEST_SECRET_KEY");
-      expect(wire?.args.join(" ")).not.toContain("PROD_SECRET_KEY");
-      // Or in the scaffold spawn at all.
-      expect(recorded[0]?.args.join(" ")).not.toContain("SECRET");
-    }).pipe(Effect.provide(scaffolderLayer(makeSpawnerLayer({ recorded }))));
+      // Exactly one broker call, carrying the resolved ids + targetDir and NO
+      // API keys of any kind.
+      expect(recorded).toHaveLength(1);
+      const req = recorded[0];
+      expect(req?.method).toBe("POST");
+      expect(req?.url).toContain("/internal/roblox-create");
+      // robloxJson is a nested JSON string, so its quotes are escaped in the
+      // request body; assert the resolved ids + targetDir are carried, and that
+      // no API key / secret of any kind is.
+      expect(req?.body).toContain("workplacePlaceId");
+      expect(req?.body).toContain("222");
+      expect(req?.body).toContain("prodPlaceId");
+      expect(req?.body).toContain("444");
+      expect(req?.body).toContain('"targetDir"');
+      expect(req?.body.toLowerCase()).not.toContain("apikey");
+      expect(req?.body.toLowerCase()).not.toContain("secret");
+    }).pipe(
+      Effect.provide(
+        scaffolderLayer(
+          brokerLayer(
+            {
+              ok: true,
+              stages: ["scaffold", "repo", "wire", "deploy-triggered"],
+              repositoryUrl: "https://github.com/acme/sky-journey",
+              output: "==> Done",
+            },
+            200,
+            recorded,
+          ),
+        ),
+      ),
+    );
   });
 
-  it.effect("omits the prod key env var when no prod key is supplied", () => {
-    const recorded: Array<RecordedSpawn> = [];
-    return Effect.gen(function* () {
-      const scaffolder = yield* RobloxProjectScaffolder.RobloxProjectScaffolder;
-      yield* scaffolder.scaffold({ ...baseInput, testApiKey: "ONLY_TEST_KEY" });
-      const wire = recorded[1];
-      expect(wire?.env?.ROBLOX_TEST_API_KEY).toBe("ONLY_TEST_KEY");
-      expect(wire?.env?.ROBLOX_PROD_API_KEY).toBeUndefined();
-    }).pipe(Effect.provide(scaffolderLayer(makeSpawnerLayer({ recorded }))));
-  });
-
-  it.effect("surfaces the legacy-asset:manage hint when the download check fails", () =>
+  it.effect("surfaces the legacy-asset:manage hint when the broker reports verify-download", () =>
     Effect.gen(function* () {
       const scaffolder = yield* RobloxProjectScaffolder.RobloxProjectScaffolder;
-      const error = yield* scaffolder
-        .scaffold({ ...baseInput, testApiKey: "BAD_SCOPE_KEY" })
-        .pipe(Effect.flip);
+      const error = yield* scaffolder.scaffold(baseInput).pipe(Effect.flip);
       expect(error._tag).toBe("RobloxProjectWireError");
       if (error._tag === "RobloxProjectWireError") {
         expect(error.operation).toBe("verify-download");
@@ -252,22 +183,68 @@ describe("RobloxProjectScaffolder.scaffold", () => {
     }).pipe(
       Effect.provide(
         scaffolderLayer(
-          makeSpawnerLayer({ recorded: [], wireStderr: "WIRE_ASSET_DOWNLOAD_FAILED\n" }),
+          brokerLayer(
+            { ok: false, stage: "verify-download", repositoryUrl: "https://github.com/acme/x" },
+            200,
+            [],
+          ),
         ),
       ),
     ),
   );
 
-  it.effect("returns a wire error when wire-roblox.sh exits non-zero", () =>
+  it.effect("maps a broker wire-stage failure to a RobloxProjectWireError", () =>
     Effect.gen(function* () {
       const scaffolder = yield* RobloxProjectScaffolder.RobloxProjectScaffolder;
-      const error = yield* scaffolder
-        .scaffold({ ...baseInput, testApiKey: "KEY" })
-        .pipe(Effect.flip);
+      const error = yield* scaffolder.scaffold(baseInput).pipe(Effect.flip);
       expect(error._tag).toBe("RobloxProjectWireError");
       if (error._tag === "RobloxProjectWireError") {
         expect(error.operation).toBe("run-script");
+        expect(error.message).toContain("push rejected");
       }
-    }).pipe(Effect.provide(scaffolderLayer(makeSpawnerLayer({ recorded: [], wireCode: 1 })))),
+    }).pipe(
+      Effect.provide(
+        scaffolderLayer(
+          brokerLayer({ ok: false, stage: "wire", detail: "push rejected", code: 1 }, 200, []),
+        ),
+      ),
+    ),
   );
+
+  it.effect("maps a broker validate/scaffold failure to a RobloxProjectScaffoldError", () =>
+    Effect.gen(function* () {
+      const scaffolder = yield* RobloxProjectScaffolder.RobloxProjectScaffolder;
+      const error = yield* scaffolder.scaffold(baseInput).pipe(Effect.flip);
+      expect(error._tag).toBe("RobloxProjectScaffoldError");
+      if (error._tag === "RobloxProjectScaffoldError") {
+        expect(error.operation).toBe("run-script");
+        expect(error.message).toContain("npm install failed");
+      }
+    }).pipe(
+      Effect.provide(
+        scaffolderLayer(
+          brokerLayer(
+            { ok: false, stage: "scaffold", detail: "npm install failed", code: 1 },
+            200,
+            [],
+          ),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("rejects an invalid project name before hitting the broker", () => {
+    const recorded: Array<RecordedRequest> = [];
+    return Effect.gen(function* () {
+      const scaffolder = yield* RobloxProjectScaffolder.RobloxProjectScaffolder;
+      const error = yield* scaffolder
+        .scaffold({ ...baseInput, name: "bad/name" })
+        .pipe(Effect.flip);
+      expect(error._tag).toBe("RobloxProjectScaffoldError");
+      if (error._tag === "RobloxProjectScaffoldError") {
+        expect(error.operation).toBe("validate-name");
+      }
+      expect(recorded).toHaveLength(0);
+    }).pipe(Effect.provide(scaffolderLayer(brokerLayer({ ok: true }, 200, recorded))));
+  });
 });

@@ -65,6 +65,7 @@ PrivateTmp=yes
 # an instance can neither read nor inherit slitherylemur's identity: with
 # ProtectHome=read-only the whole of /home/dev is otherwise readable, which is
 # exactly how the single shared identity used to leak into every instance.
+InaccessiblePaths=/home/dev/services/lateshift/secrets
 InaccessiblePaths=/home/dev/.config/gh
 InaccessiblePaths=/home/dev/.gitconfig
 

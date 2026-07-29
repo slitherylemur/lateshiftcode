@@ -280,7 +280,10 @@ const RobloxGameIconResolverLayerLive = RobloxGameIconResolver.layer.pipe(
 );
 
 const RobloxProjectScaffolderLayerLive = RobloxProjectScaffolder.layer.pipe(
-  Layer.provide(RobloxProjectInputResolver.layer.pipe(Layer.provide(FetchHttpClient.layer))),
+  // The scaffolder itself needs an HttpClient (to POST the portal broker), as
+  // does the input resolver it depends on; one FetchHttpClient serves both.
+  Layer.provide(RobloxProjectInputResolver.layer),
+  Layer.provide(FetchHttpClient.layer),
 );
 
 const AuthLayerLive = EnvironmentAuth.layer.pipe(
