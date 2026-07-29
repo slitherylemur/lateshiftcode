@@ -30,12 +30,19 @@ REGISTRY="${LATESHIFT_ROOT}/users.json"
 USERS_DIR="${LATESHIFT_ROOT}/users"
 ARCHIVE_DIR="${LATESHIFT_ROOT}/archive"
 LOCK_FILE="${LATESHIFT_ROOT}/.registry.lock"
+
+# Provisioning-rollback state (see cmd_add / rollback_add). ADD_COMMITTED flips
+# to 1 only once the registry commit has succeeded; the EXIT trap installed by
+# cmd_add rolls back whenever it is still 0. ADD_ROLLED_BACK makes rollback_add
+# idempotent so an explicit call followed by the trap cannot run it twice.
+ADD_COMMITTED=0
+ADD_ROLLED_BACK=0
+ADD_NAME=""
+ADD_TS_PORT=""
+ADD_BASE_DIR=""
 TAILNET_HOST="t3cloud.taild7c97b.ts.net"
 PUBLIC_DOMAIN="lateshiftcloud.com"   # public gateway domain (pair --public)
 RENDER_GATEWAY="${LATESHIFT_ROOT}/bin/render-gateway"  # regenerate Caddy user blocks
-# Applies the OWNER git identity + shared credential store to a shared repo
-# (see bin-shared/lsc-shared-git-setup). Called best-effort from the share path.
-SHARED_GIT_SETUP="${LATESHIFT_ROOT}/bin/lsc-shared-git-setup"
 T3_CLI="/usr/bin/t3"
 HEALTH_TIMEOUT_SECS=60
 RESERVED_LOCAL_PORT=3773   # production t3code local port
@@ -499,6 +506,10 @@ verify_unit_owns_port() {
 # touched (commit happens only after health), so nothing to undo there.
 rollback_add() {
     local name="$1" ts_port="$2" created_dir="$3"
+    if [[ "${ADD_ROLLED_BACK}" == 1 ]]; then
+        return 0
+    fi
+    ADD_ROLLED_BACK=1
     echo "rolling back failed provision of '${name}' ..." >&2
     sudo systemctl disable --now "t3code@${name}.service" >/dev/null 2>&1 || true
     if [[ -n "${ts_port}" ]] && (( ts_port != RESERVED_TS_PORT )); then
@@ -546,6 +557,26 @@ cmd_add() {
     (( ts_port != RESERVED_TS_PORT )) || die "allocator returned reserved HTTPS port ${RESERVED_TS_PORT}"
 
     local base_dir="${USERS_DIR}/${name}"
+
+    # DEFECT FIX (missing trap): everything from here to the registry commit is
+    # a partial provision. Previously only the *anticipated* failures called
+    # rollback_add; an unexpected non-zero command under `set -e`, or a signal
+    # (Ctrl-C, SIGTERM/SIGHUP from a supervisor or a dropped SSH session), exited
+    # leaving ${base_dir} on disk with NO registry entry - and possibly an
+    # enabled/running unit. That bricked the name permanently: `t3user add
+    # <name>` then died at "base dir ... already exists; resolve manually" while
+    # `t3user remove <name>` died at "user not found". The trap below makes
+    # rollback unconditional on every exit path taken before the commit.
+    ADD_COMMITTED=0
+    ADD_ROLLED_BACK=0
+    ADD_NAME="${name}"
+    ADD_TS_PORT="${ts_port}"
+    ADD_BASE_DIR="${base_dir}"
+    trap 'if [[ "${ADD_COMMITTED}" != 1 ]]; then rollback_add "${ADD_NAME}" "${ADD_TS_PORT}" "${ADD_BASE_DIR}"; fi' EXIT
+    # Signals must unwind through the EXIT trap instead of killing the shell.
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+
     mkdir -p "${base_dir}"
     cat > "${base_dir}/instance.env" <<EOF
 # LateShift Cloud instance config for '${name}' (consumed by t3code@${name}.service)
@@ -585,6 +616,10 @@ EOF
     # Instance is healthy and verified: persist it to the registry (atomic write).
     registry_py commit "${name}" "${local_port}" "${ts_port}" "${project_limit}" "${admin}" "${ts_login}" \
         || { rollback_add "${name}" "${ts_port}" "${base_dir}"; die "registry commit failed; rolled back"; }
+    # Committed: the instance is real from here on and must NEVER be rolled back
+    # by the trap. Everything below is best-effort reporting.
+    ADD_COMMITTED=1
+    trap - EXIT INT TERM HUP
 
     # Best-effort tailnet reachability check (warn only: tailscale serve can
     # lag a moment, and local health is the provisioning gate).
@@ -678,7 +713,7 @@ cmd_list() {
 # projectLimit rewrite: temp file in the same dir, atomic rename. The instance
 # must be restarted for the fork to pick up new limits (never auto-restarted).
 write_instance_limits() {
-    local name="$1" env_file lines tmp
+    local name="$1" env_file lines tmp rc
     env_file="$(registry_py get "${name}" baseDir)/instance.env"
     if [[ ! -f "${env_file}" ]]; then
         echo "warning: ${env_file} not found; registry updated but no instance.env to rewrite" >&2
@@ -688,7 +723,19 @@ write_instance_limits() {
     tmp="$(mktemp "${env_file}.tmp.XXXXXX")"
     # Drop any existing LSC_* lines, keep everything else, then append the
     # freshly rendered block.
-    grep -vE '^(LSC_USER_NAME|LSC_LIMIT_TOTAL_USD|LSC_LIMIT_CLAUDE_USD|LSC_LIMIT_CODEX_USD|LSC_LIMIT_CLAUDE_5H_USD|LSC_LIMIT_CODEX_5H_USD)=' "${env_file}" > "${tmp}" || true
+    # DEFECT FIX (swallowed failure): this line used to end in `|| true`.
+    # grep exit 1 means "no lines matched" - legitimate here (the file was
+    # entirely LSC_* lines) and ${tmp} is correctly empty. Exit >=2 is a real
+    # read/write error, and `|| true` swallowed it: the `mv` below then replaced
+    # instance.env with a truncated file, destroying T3CODE_INSTANCE_PORT /
+    # TS_SERVE_PORT / T3CODE_MAX_PROJECTS and leaving the instance unable to
+    # start. Distinguish the two; on a real error leave instance.env untouched.
+    rc=0
+    grep -vE '^(LSC_USER_NAME|LSC_LIMIT_TOTAL_USD|LSC_LIMIT_CLAUDE_USD|LSC_LIMIT_CODEX_USD|LSC_LIMIT_CLAUDE_5H_USD|LSC_LIMIT_CODEX_5H_USD)=' "${env_file}" > "${tmp}" || rc=$?
+    if (( rc > 1 )); then
+        rm -f "${tmp}"
+        die "failed to read ${env_file} (grep exit ${rc}); instance.env left untouched"
+    fi
     printf '%s\n' "${lines}" >> "${tmp}"
     mv "${tmp}" "${env_file}"
     echo "updated budget limits in ${env_file}; restart t3code@${name} to apply"

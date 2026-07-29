@@ -20,6 +20,22 @@
 	}
 }
 
+# --- inbound identity-header strip (SECURITY) --------------------------------
+# Anything reaching Caddy arrives from the internet via Cloudflare ->
+# cloudflared; none of it is trusted. These headers are *produced* internally
+# (portal identity, ops-broker bearer token, forward_auth outputs) and must
+# never be attacker-supplied. Without this, a plain curl with
+# `Tailscale-User-Login: <admin tsLogin>` reached the portal identity path and
+# was served /admin. Import this FIRST in every site block that can be reached
+# from outside.
+(lsc_strip_identity) {
+	request_header -X-Ops-Token
+	request_header -Tailscale-User-*
+	request_header -X-Lsc-User
+	request_header -X-Lsc-Upstream
+	request_header -X-Authz-Host
+}
+
 # --- reusable gated proxy ----------------------------------------------------
 # usage: import lsc_gated <upstream-port>
 # forward_auth -> portal /authz (Cookie forwarded automatically; we add the
@@ -52,6 +68,7 @@
 # Every site address carries the explicit http:// scheme so Caddy binds them on
 # http_port (8880) instead of the default HTTPS 443 — TLS is Cloudflare's job.
 http://lateshiftcloud.com, http://www.lateshiftcloud.com {
+	import lsc_strip_identity
 	reverse_proxy 127.0.0.1:3790 {
 		# Caddy already sets X-Forwarded-Host/-For; override proto since we sit
 		# behind Cloudflare's TLS (Caddy itself only sees plain HTTP).
