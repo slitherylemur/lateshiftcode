@@ -211,7 +211,16 @@ async function dashboardProps(ctx, csrf) {
     projects: readWorkHistory(dbPath),
     usage: readUsageSummary(dbPath),
     isAdmin: ctx.principal.isAdmin,
+    github: githubStatusFor(user),
   };
+}
+
+// Workspace GitHub-connection status for a registry user (dashboard + admin).
+// { connected: bool, login: string|null } — login is the registry githubLogin.
+function githubStatusFor(user) {
+  if (!user || !user.baseDir) return { connected: false, login: user?.githubLogin ?? null };
+  const st = auth.githubIdentityStatus(user.baseDir);
+  return { connected: st.authenticated, login: user.githubLogin ?? st.login ?? null };
 }
 
 async function adminProps(ctx, csrf, flash, selectedParam) {
@@ -257,6 +266,7 @@ async function adminProps(ctx, csrf, flash, selectedParam) {
       budgetPaused: readBudgetPaused(u.baseDir),
       sharedProjects: u.sharedProjects,
       monthProviderCost: monthProv,
+      github: githubStatusFor(u),
       isSelf,
     });
     leaderboard.push({
@@ -434,6 +444,22 @@ async function handleGithubCallback(req, res, url) {
   ];
 
   if (principal.user) {
+    // Known user: install the OAuth token into their workspace gh store the
+    // first time (or if their store isn't authenticated yet — the re-auth
+    // path). Never overwrite an already-connected store; never log the token.
+    try {
+      const status = auth.githubIdentityStatus(principal.user.baseDir);
+      if (!status.authenticated) {
+        auth.installGithubIdentity(principal.user.baseDir, {
+          login: profile.login,
+          id: profile.id,
+          token: profile.token,
+        });
+      }
+    } catch (e) {
+      // Sign-in must never break on identity-install failure.
+      console.error(`identity install failed for ${principal.user.name}: ${e?.message ?? e}`);
+    }
     res.writeHead(302, { location: "/", "set-cookie": setCookie });
     res.end();
     return;
@@ -450,6 +476,12 @@ async function handleGithubCallback(req, res, url) {
     name: profile.name,
     avatar: profile.avatar_url,
   });
+  // Stash the captured token (unless the login was denied) so provisioning can
+  // install it into the workspace immediately after admin approval. Refreshed
+  // on every repeat sign-in while still pending. Never logged.
+  if (result.reason !== "denied") {
+    auth.setPendingToken(profile.login, { id: profile.id, token: profile.token });
+  }
   if (result.added) auth.notifySignup(config, { login: profile.login, name: profile.name });
   html(
     res,
@@ -918,13 +950,30 @@ async function handlePost(req, res, url) {
         if (!r.ok) return errPage(`Provisioning '${name}' failed`, r.stderr || r.stdout);
         const g = await actions.setGithubLogin(name, login);
         auth.removePending(login);
+        // Install the token captured at sign-in into the freshly-created
+        // workspace, then discard it from the pending-tokens store.
+        let ghNote = "";
+        const captured = auth.getPendingToken(login);
+        if (captured && captured.token) {
+          try {
+            const fresh = loadRegistry()[name];
+            const baseDir = fresh?.baseDir || `/home/dev/services/lateshift/users/${name}`;
+            auth.installGithubIdentity(baseDir, { login, id: captured.id, token: captured.token });
+            ghNote = " GitHub token installed.";
+          } catch (e) {
+            ghNote = ` (GitHub token install failed: ${String(e?.message ?? e).slice(0, 120)})`;
+          }
+        } else {
+          ghNote = " (no captured token — user must sign in again to connect GitHub).";
+        }
+        auth.removePendingToken(login);
         if (!g.ok) {
           return flashTo(
             `User '${name}' provisioned, but githubLogin could NOT be set (t3user rejected it): ` +
               (g.stderr || g.stdout).slice(0, 160),
           );
         }
-        return flashTo(`Approved ${login} as '${name}' (githubLogin set).`);
+        return flashTo(`Approved ${login} as '${name}' (githubLogin set).${ghNote}`);
       }
 
       case "/admin/deny": {
@@ -932,6 +981,7 @@ async function handlePost(req, res, url) {
         if (!auth.GH_LOGIN_RE.test(login))
           return errPage("Invalid GitHub login", login || "(empty)");
         auth.denyPending(login);
+        auth.removePendingToken(login);
         return flashTo(`Denied access request from ${login}.`);
       }
 
