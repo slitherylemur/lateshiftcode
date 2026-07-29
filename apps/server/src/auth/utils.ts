@@ -13,7 +13,21 @@ const SESSION_COOKIE_NAME = "t3_session";
 export function resolveSessionCookieName(input: {
   readonly mode: "web" | "desktop";
   readonly port: number;
+  readonly socketPath?: string | undefined;
 }): string {
+  // LateShift Cloud: under the single-origin design every workspace shares one
+  // browser cookie jar, so the session cookie must be keyed on the workspace.
+  // The unix socket path is the per-workspace identifier that is already in
+  // config; there is no port to key on any more.
+  if (input.socketPath !== undefined && input.socketPath.trim().length > 0) {
+    const slug = (input.socketPath.split(/[\/]/).pop() ?? "")
+      .replace(/\.sock$/, "")
+      .replace(/[^A-Za-z0-9_-]/g, "-");
+    if (slug.length > 0) {
+      return `${SESSION_COOKIE_NAME}_${slug}`;
+    }
+  }
+
   if (input.mode !== "desktop") {
     return SESSION_COOKIE_NAME;
   }
