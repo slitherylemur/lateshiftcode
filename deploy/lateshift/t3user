@@ -792,15 +792,19 @@ cmd_share() {
     "${T3_CLI}" project add "${real}" --base-dir "${base_dir}" \
         || die "t3 project add failed for '${real}' on ${name}'s instance"
     registry_py share "${name}" "${real}"
-    # Shared repos under /home/dev/shared push under the OWNER's git
-    # identity so every sharer's commits go out as the owner without
-    # needing push rights. Best-effort: a config failure (e.g. the path is
-    # not a git repo) must not fail the share itself.
+    # Shared repos: everyone uses their own GitHub identity; the owner
+    # auto-invites the sharee as a push collaborator on the repo (they must
+    # accept the GitHub invite). Best-effort: an invite failure must not
+    # fail the share itself.
     case "${real}" in
         /home/dev/shared/*)
-            if [[ -x "${SHARED_GIT_SETUP}" ]]; then
-                "${SHARED_GIT_SETUP}" "${real}" \
-                    || echo "t3user: warning: shared-git identity setup failed for '${real}'; commits there may use the per-user identity" >&2
+            local gh_login
+            gh_login=$(registry_py get "${name}" githubLogin 2>/dev/null || true)
+            if [[ -n "${gh_login}" && "${gh_login}" != "None" && -x "${LATESHIFT_ROOT}/bin/lsc-shared-collab" ]]; then
+                "${LATESHIFT_ROOT}/bin/lsc-shared-collab" "${real}" "${gh_login}" \
+                    || echo "t3user: warning: collaborator invite failed for '${name}' on '${real}'; add them manually on GitHub" >&2
+            else
+                echo "t3user: note: '${name}' has no githubLogin set; add them as a GitHub collaborator manually once they connect GitHub" >&2
             fi
             ;;
     esac

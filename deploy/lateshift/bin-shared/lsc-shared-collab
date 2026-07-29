@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# lsc-shared-collab <repo-dir> <github-login> — invite a user as a push
+# collaborator on the shared repo's GitHub remote, using the host dev gh
+# (authenticated as the owner). Best-effort caller; loud errors, exit != 0.
+set -euo pipefail
+DIR="${1:?usage: lsc-shared-collab <repo-dir> <github-login>}"
+LOGIN="${2:?usage: lsc-shared-collab <repo-dir> <github-login>}"
+[[ "${LOGIN}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]] || { echo "invalid github login" >&2; exit 1; }
+URL=$(git -C "${DIR}" remote get-url origin)
+# https://github.com/owner/repo(.git) or git@github.com:owner/repo(.git)
+SLUG=$(printf "%s" "${URL}" | sed -E "s#^(https://github.com/|git@github.com:)##; s#\.git\$##")
+[[ "${SLUG}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "cannot parse repo slug from ${URL}" >&2; exit 1; }
+gh api -X PUT "repos/${SLUG}/collaborators/${LOGIN}" -f permission=push >/dev/null
+echo "invited ${LOGIN} as collaborator on ${SLUG} (they must accept the invite)"
