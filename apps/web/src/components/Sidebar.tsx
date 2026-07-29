@@ -199,6 +199,8 @@ import {
   selectProjectGroupingSettings,
 } from "../logicalProject";
 import type { SidebarThreadSummary } from "../types";
+// LateShift W6-C: cross-workspace project groups (renders null off-gateway).
+import { LscCurrentWorkspaceBadge, LscWorkspaceGroups } from "../lateshift/LscWorkspaceGroups";
 import {
   buildPhysicalToLogicalProjectKeyMap,
   buildSidebarProjectSnapshots,
@@ -2873,7 +2875,10 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
       <LocalSecondaryStatus />
       <SidebarGroup className="px-2 py-2">
         <div className="mb-1 flex items-center justify-between pl-2 pr-1.5">
-          <span className="text-xs font-medium text-sidebar-muted-foreground/80">Projects</span>
+          <span className="text-xs font-medium text-sidebar-muted-foreground/80">
+            Projects
+            <LscCurrentWorkspaceBadge />
+          </span>
           <div className="flex items-center gap-1">
             <ProjectSortMenu
               projectSortOrder={projectSortOrder}
@@ -2981,6 +2986,8 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
           </div>
         )}
       </SidebarGroup>
+      {/* LateShift W6-C: projects in the user's OTHER workspaces (D13). */}
+      <LscWorkspaceGroups />
     </SidebarContent>
   );
 });

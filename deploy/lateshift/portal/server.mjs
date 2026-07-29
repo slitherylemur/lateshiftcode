@@ -654,8 +654,27 @@ async function handleGet(req, res, url) {
       return;
     }
     const aggregated = teams.aggregateProjects(ctx.principal.login);
+    // Which workspace this browser is currently routed to: the lsc_ws cookie
+    // if it names a workspace the user is a member of, else their personal
+    // one. Same fail-closed rule /authz applies — the cookie is a selector.
+    let current = null;
+    if (aggregated) {
+      const wanted = String(cookies.lsc_ws ?? "");
+      const ids = aggregated.workspaces.map((w) => w.id);
+      current =
+        ids.find((id) => id === wanted) ??
+        aggregated.workspaces.find((w) => w.kind === "personal")?.id ??
+        ids[0] ??
+        null;
+    }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(aggregated ?? { generatedAt: new Date().toISOString(), workspaces: [] }));
+    res.end(
+      JSON.stringify(
+        aggregated
+          ? { ...aggregated, currentWorkspaceId: current }
+          : { generatedAt: new Date().toISOString(), workspaces: [], currentWorkspaceId: null },
+      ),
+    );
     return;
   }
 
