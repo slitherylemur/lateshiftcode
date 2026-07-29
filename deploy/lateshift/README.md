@@ -440,3 +440,29 @@ Facts that keep this safe:
   and the team instance's project list. `lsw member` changes the first two
   atomically (revert on failure) and never needs to touch the third, which is
   fixed at creation; `lsw team verify` re-checks all three on demand.
+
+### Admin panel and portal aggregation (W6-B/C)
+
+The portal renders a minimal team panel on `/admin` (create workspace, list
+members, add/remove) that shells every mutation to `sudo -n lsw ...` — the
+portal never writes `registry.json`. This requires a scoped sudoers grant for
+the portal account:
+
+```
+dev ALL=(root) NOPASSWD: /home/dev/services/lateshift/bin/lsw
+```
+
+The per-team PAT is deliberately NOT manageable from the browser; the token
+value must never transit a web form (`lsw team pat install|rotate` on the host
+only).
+
+Portal JSON endpoints for the unified project list (W6-C):
+
+- `GET /api/lsc/projects` — session-authenticated; projects aggregated across
+  every v2 workspace the user belongs to, grouped and labelled by workspace
+  (`Personal` vs the team name). Read strictly read-only from each
+  workspace state.sqlite (`mode=ro` via node:sqlite readOnly).
+- `GET /api/lsc/select-workspace?ws=<id>` — validates membership, sets the
+  `lsc_ws` selector cookie (revalidated by /authz on every request; never an
+  assertion) and redirects to `/`, which reconnects against the selected
+  workspace.

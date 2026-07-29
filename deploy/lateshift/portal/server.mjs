@@ -35,6 +35,7 @@ import * as actions from "./lib/actions.mjs";
 import * as ops from "./lib/ops.mjs";
 import * as profiles from "./lib/profiles.mjs";
 import * as usage from "./lib/usage.mjs";
+import * as teams from "./lib/teams.mjs";
 import { LSC_PREFIX, p, normalizePath } from "./lib/paths.mjs";
 import * as views from "./views.mjs";
 
@@ -363,6 +364,9 @@ async function adminProps(ctx, csrf, flash, selectedParam) {
     },
     flash: flash || null,
     pending: auth.readPending().pending,
+    // v2 team workspaces (W6-B). null until the v2 registry exists on disk;
+    // the panel section is hidden in that case.
+    teams: teams.adminTeamsProps(),
   };
 }
 
@@ -636,6 +640,50 @@ async function handleGet(req, res, url) {
 
   const ctx = buildContext(req);
   const csrf = ensureCsrf(cookies, res);
+
+  // W6-C: the unified project list. Session-authenticated JSON, assembled
+  // across every v2 workspace the signed-in user belongs to, each group
+  // labelled by workspace so the fork's sidebar can render personal vs shared
+  // unambiguously. Fails CLOSED: no session → 401; no v2 membership → an
+  // empty list, never someone else's.
+  if (pathname === "/api/lsc/projects") {
+    res.setHeader("cache-control", "no-store");
+    if (!ctx.principal.login) {
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "unauthenticated" }));
+      return;
+    }
+    const aggregated = teams.aggregateProjects(ctx.principal.login);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(aggregated ?? { generatedAt: new Date().toISOString(), workspaces: [] }));
+    return;
+  }
+
+  // W6-C: workspace selection. Sets the lsc_ws cookie (validated against v2
+  // membership HERE and revalidated by /authz on every request — the cookie is
+  // a selector, never an assertion) and sends the browser back to the app,
+  // which reconnects against the newly selected workspace.
+  if (pathname === "/api/lsc/select-workspace") {
+    if (!ctx.principal.login) {
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "unauthenticated" }));
+      return;
+    }
+    const wanted = String(url.searchParams.get("ws") ?? "").slice(0, 40);
+    const memberships = teams.workspacesForLogin(ctx.principal.login) ?? [];
+    const target = memberships.find((w) => w.id === wanted);
+    if (!target) {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "not a member of that workspace" }));
+      return;
+    }
+    res.writeHead(302, {
+      location: "/",
+      "set-cookie": `lsc_ws=${encodeURIComponent(target.id)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000`,
+    });
+    res.end();
+    return;
+  }
 
   if (pathname === "/account") {
     if (!ctx.principal.login) return redirect(res, p("/auth/github/login"));
@@ -987,6 +1035,92 @@ async function handlePost(req, res, url) {
           );
         }
         return flashTo(`Approved ${login} as '${name}' (githubLogin set).${ghNote}`);
+      }
+
+      // ---- team workspaces (W6-B) -------------------------------------
+      // Every mutation goes through `lsw`, which owns the flock, the
+      // three-way membership reconciliation and the provisioning rollback.
+      // The portal never writes registry.json.
+
+      case "/admin/team-create": {
+        const project = String(form.project ?? "").trim();
+        const members = String(form.members ?? "")
+          .split(/[\s,]+/)
+          .filter(Boolean);
+        const repos = String(form.repos ?? "")
+          .split(/[\s,]+/)
+          .filter(Boolean);
+        let r;
+        try {
+          r = await teams.teamAdd({ project, members, repos });
+        } catch (e) {
+          return errPage("Invalid team parameters", e?.message ?? String(e));
+        }
+        if (!r.ok) return errPage(`Creating team '${project}' failed (nothing kept)`, r.stderr || r.stdout);
+        return redirect(
+          res,
+          `${p("/admin")}?flash=${encodeURIComponent(
+            `Team '${project}' created. Private repos need the PAT installed on the host: lsw team pat install ${project}`,
+          )}`,
+        );
+      }
+
+      case "/admin/team-member-add": {
+        const project = String(form.project ?? "").trim();
+        const login = String(form.login ?? "").trim();
+        let r;
+        try {
+          r = await teams.memberAdd(project, login);
+        } catch (e) {
+          return errPage("Invalid membership parameters", e?.message ?? String(e));
+        }
+        if (!r.ok) return errPage(`Adding ${login} to '${project}' failed (nothing changed)`, r.stderr || r.stdout);
+        return redirect(
+          res,
+          `${p("/admin")}?flash=${encodeURIComponent(`Added ${login} to team '${project}'.`)}`,
+        );
+      }
+
+      case "/admin/team-member-remove": {
+        const project = String(form.project ?? "").trim();
+        const login = String(form.login ?? "").trim();
+        if (form.confirm !== "1") {
+          html(
+            res,
+            200,
+            views.renderConfirm({
+              csrf,
+              title: "Confirm member removal",
+              heading: `Remove ${views.esc(login)} from team '${views.esc(project)}'?`,
+              detailHtml:
+                `The team's PAT is retired locally as part of this (the removed ` +
+                `member may hold a cached copy). Afterwards you must <strong>revoke ` +
+                `the old token on GitHub</strong> and install a new one on the host: ` +
+                `<code>lsw team pat install ${views.esc(project)}</code>.`,
+              action: p("/admin/team-member-remove"),
+              fields: [
+                { name: "project", value: project },
+                { name: "login", value: login },
+              ],
+              confirmLabel: "Remove member",
+              danger: true,
+            }),
+          );
+          return;
+        }
+        let r;
+        try {
+          r = await teams.memberRemove(project, login);
+        } catch (e) {
+          return errPage("Invalid membership parameters", e?.message ?? String(e));
+        }
+        if (!r.ok) return errPage(`Removing ${login} from '${project}' failed (nothing changed)`, r.stderr || r.stdout);
+        return redirect(
+          res,
+          `${p("/admin")}?flash=${encodeURIComponent(
+            `Removed ${login} from '${project}'. REVOKE the old team PAT on GitHub, then: lsw team pat install ${project}`,
+          )}`,
+        );
       }
 
       case "/admin/deny": {

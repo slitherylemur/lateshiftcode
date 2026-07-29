@@ -1274,6 +1274,63 @@ function renderPending(pending, csrf) {
   </div>`;
 }
 
+// W6-B: minimal team-workspace panel — create, list members, add/remove.
+// Deliberately small: the PAT never appears here (CLI-only), and everything
+// else is a thin form over `lsw`.
+function renderTeams(teamsProps, csrf) {
+  if (!teamsProps) return ""; // no v2 registry on this host yet
+  const { teams, logins } = teamsProps;
+  const rows = teams
+    .map((t) => {
+      const members = t.members.length
+        ? t.members
+            .map(
+              (m) => `<span class="chip">${esc(m)}
+        <form method="POST" action="${esc(p("/admin/team-member-remove"))}" style="display:inline">
+          ${hiddenInput("csrf", csrf)}${hiddenInput("project", t.project)}${hiddenInput("login", m)}
+          <button type="submit" class="btn btn-sm btn-danger" title="Remove ${esc(m)}">×</button>
+        </form></span>`,
+            )
+            .join(" ")
+        : `<span class="muted">no members</span>`;
+      const repos = t.repos.length
+        ? `<div class="muted" style="font-size:12.5px">${t.repos.map((r) => esc(r)).join(" · ")}</div>`
+        : "";
+      return `<div class="pend-row">
+      <div>
+        <div class="pend-login">t-${esc(t.project)} <span class="muted" style="font-weight:400">(${esc(t.unit || `t3ws@t-${t.project}.service`)})</span></div>
+        ${repos}
+        <div style="margin-top:6px">${members}</div>
+      </div>
+      <form method="POST" action="${esc(p("/admin/team-member-add"))}" class="pend-actions">
+        ${hiddenInput("csrf", csrf)}${hiddenInput("project", t.project)}
+        <input type="text" name="login" list="lsc-v2-logins" placeholder="github login" required class="narrow" aria-label="github login">
+        <button type="submit" class="btn btn-sm btn-primary">Add member</button>
+      </form>
+    </div>`;
+    })
+    .join("");
+  return `<div class="card">
+    <h2>Team workspaces <span class="muted" style="font-weight:400;font-size:15px">(v2)</span></h2>
+    <datalist id="lsc-v2-logins">${logins.map((l) => `<option value="${esc(l)}">`).join("")}</datalist>
+    ${rows || `<p class="muted">No team workspaces yet.</p>`}
+    <form method="POST" action="${esc(p("/admin/team-create"))}" style="margin-top:14px">
+      ${hiddenInput("csrf", csrf)}
+      <div class="pend-actions" style="flex-wrap:wrap;gap:8px">
+        <input type="text" name="project" placeholder="project name" pattern="[a-z0-9-]{2,24}" required class="narrow" aria-label="project name">
+        <input type="text" name="members" placeholder="members (logins, space-separated)" aria-label="members">
+        <input type="text" name="repos" placeholder="repos (owner/repo, space-separated)" aria-label="repos">
+        <button type="submit" class="btn btn-sm btn-primary">Create team workspace</button>
+      </div>
+      <p class="muted" style="font-size:12.5px;margin-top:6px">
+        Repos are cloned <strong>fresh from GitHub</strong> into the new workspace — there is no
+        way to move an existing project in. Private repos need the per-team PAT first, which is
+        installed on the host only: <code>lsw team pat install &lt;project&gt;</code>.
+      </p>
+    </form>
+  </div>`;
+}
+
 export function renderAdmin(props) {
   const { csrf, identity, users, self, selectedKey, aggregate, flash, pending, pool, consumption } =
     props;
@@ -1293,6 +1350,8 @@ export function renderAdmin(props) {
     ${renderPoolMini(pool)}
 
     ${renderPending(pending, csrf)}
+
+    ${renderTeams(props.teams, csrf)}
 
     <div class="admin-grid">
       ${renderUserList(users, self, selectedKey, csrf)}
