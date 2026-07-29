@@ -103,20 +103,20 @@ export function isPublicHost(req) {
   return host === APEX_SUFFIX || host.endsWith(`.${APEX_SUFFIX}`);
 }
 
-/** Assemble a Set-Cookie for the session, choosing Domain by request path. */
+/** Assemble a Set-Cookie for the session. Host-only under the v2 single
+ * origin: no Domain attribute, ever (cookieDomain deleted in W7-C). */
 export function sessionCookie(value, req, config, { maxAgeS } = {}) {
   const parts = [`${SESSION_COOKIE}=${value}`, "Path=/", "HttpOnly", "Secure", "SameSite=Lax"];
-  if (isPublicHost(req) && config.cookieDomain) parts.push(`Domain=${config.cookieDomain}`);
   if (typeof maxAgeS === "number") parts.push(`Max-Age=${maxAgeS}`);
   return parts.join("; ");
 }
 
-/** Set-Cookie that clears the session on both the host and the cookie domain. */
+/** Set-Cookie list that clears the session. The Domain=.lateshiftcloud.com
+ * variant is kept ONLY to clear cookies minted by the retired v1 subdomain
+ * stack during the cutover window; delete it after W8. */
 export function clearSessionCookies(req, config) {
   const base = `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
-  const out = [base];
-  if (config.cookieDomain) out.push(`${base}; Domain=${config.cookieDomain}`);
-  return out;
+  return [base, `${base}; Domain=.lateshiftcloud.com`];
 }
 
 // ---------------------------------------------------------------- OAuth state

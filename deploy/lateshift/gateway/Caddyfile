@@ -1,33 +1,54 @@
-# LateShift Cloud — public gateway (Caddy).
+# LateShift Cloud — v2 SINGLE-ORIGIN gateway (architecture-v2 §3/§6, W7-B).
 #
-# Listens ONLY on 127.0.0.1:8880 (plain HTTP). TLS terminates at Cloudflare;
-# the `lateshift` cloudflared tunnel routes lateshiftcloud.com and
-# *.lateshiftcloud.com -> http://127.0.0.1:8880. Caddy never binds a public
-# interface and never touches ports 80/443 (auto_https off).
+# One origin: https://lateshiftcloud.com. The workspace IS the site; the portal
+# owns only the reserved root /~lsc. No per-user subdomains, no generated
+# lsc-users.caddy, no render-gateway.
 #
-# Per-user site blocks are generated into /etc/caddy/lsc-users.caddy by
-# /home/dev/services/lateshift/bin/render-gateway (reads users.json). Do not
-# edit that file by hand.
+# ── INSTALLATION ──────────────────────────────────────────────────────────────
+# NOT installed by tools/install.sh. Installing this file to /etc/caddy replaces
+# the live v1 subdomain gateway — that is the W8 CUTOVER step and must be done
+# deliberately (and is reverted by restoring the v1 Caddyfile).
+#
+# Shadow-stack run (parallel to live, nothing shared, live caddy untouched):
+#   sudo LSC_HTTP_PORT=8881 LSC_PORTAL_UPSTREAM=127.0.0.1:3791 \
+#     caddy run --config .../gateway/Caddyfile --adapter caddyfile
+# The process must be able to traverse /run/lsc/<ws>/ (0750 <ws>:caddy), i.e.
+# run as root or with the caddy group, exactly like the packaged caddy.service.
+#
+# ── LOAD-BEARING FACTS (do not "clean up") ───────────────────────────────────
+# 1. The route { } wrapper is MANDATORY, not stylistic. Caddy's default
+#    directive order runs request_header AFTER forward_auth's copy_headers, so
+#    without route{} the identity strip wipes X-Lsc-Upstream and EVERY request
+#    (WS included) 502s. Proved in spike W0-B on this box's caddy v2.11.4.
+# 2. The strip stays anyway: copy_headers already REPLACES inbound
+#    X-Lsc-Upstream/X-Lsc-User (spoof-proof, proved), but the strip also covers
+#    any future path that reaches a proxy without passing forward_auth.
+# 3. Dynamic upstream from a forward_auth response header works on the stock
+#    caddy v2.11.4, INCLUDING unix-socket dial addresses ("unix//run/lsc/…")
+#    and WebSocket upgrade, and fails closed: 2xx without X-Lsc-Upstream dials
+#    the empty address and 502s — no fallthrough to a client-chosen host.
+#    (TCP form proved in W0-B; unix form re-proved 2026-07-29 on scratch ports.)
+# 4. Caddy normalizes %7E: /~lsc/*, /%7Elsc/* and /%7elsc/* all hit the @lsc
+#    matcher (verified on this box), so the reserved root cannot be dodged by
+#    percent-encoding.
+# 5. Sustained SSE/large-frame WS throughput through the dynamic upstream was
+#    NOT load-tested (W0-B point 5). flush_interval -1 disables response
+#    buffering; if T3 streaming misbehaves, look here first.
 
 {
-	admin localhost:2019
+	admin off
 	auto_https off
 	default_bind 127.0.0.1
-	http_port 8880
+	http_port {$LSC_HTTP_PORT:8880}
 	log {
-		output file /var/log/caddy/gateway.log
+		output file {$LSC_LOG_FILE:/var/log/caddy/lsc-gateway-v2.log}
 		level INFO
 	}
 }
 
-# --- inbound identity-header strip (SECURITY) --------------------------------
-# Anything reaching Caddy arrives from the internet via Cloudflare ->
-# cloudflared; none of it is trusted. These headers are *produced* internally
-# (portal identity, ops-broker bearer token, forward_auth outputs) and must
-# never be attacker-supplied. Without this, a plain curl with
-# `Tailscale-User-Login: <admin tsLogin>` reached the portal identity path and
-# was served /admin. Import this FIRST in every site block that can be reached
-# from outside.
+# Inbound identity-header strip (SECURITY). Everything reaching Caddy came from
+# the internet via Cloudflare -> cloudflared; none of it is trusted. These
+# headers are produced internally and must never be attacker-supplied.
 (lsc_strip_identity) {
 	request_header -X-Ops-Token
 	request_header -Tailscale-User-*
@@ -36,56 +57,73 @@
 	request_header -X-Authz-Host
 }
 
-# --- reusable gated proxy ----------------------------------------------------
-# usage: import lsc_gated <upstream-port>
-# forward_auth -> portal /authz (Cookie forwarded automatically; we add the
-# public hostname). On allow (2xx) X-Lsc-User is copied onto the upstream
-# request and we reverse_proxy to the instance. reverse_proxy upgrades
-# WebSockets natively (T3 is websocket-heavy).
-(lsc_gated) {
-	forward_auth 127.0.0.1:3790 {
-		uri /authz
-		method GET
-		header_up X-Authz-Host {host}
-		copy_headers X-Lsc-User
+# The whole single-origin router. Portal upstream comes from
+# {$LSC_PORTAL_UPSTREAM} so the shadow stack can point at a shadow portal.
+(lsc_single_origin) {
+	route {
+		import lsc_strip_identity
 
-		# 401: not signed in -> bounce browser to the login URL the portal returns.
-		@needauth status 401
-		handle_response @needauth {
-			redir {rp.header.X-Authz-Redirect} 302
+		# /~lsc/authz is Caddy-internal (the forward_auth target below calls
+		# the portal directly with uri /authz). It must never be reachable
+		# from outside: a public 200 from it would leak routing headers.
+		@authz path /~lsc/authz /~lsc/authz/*
+		respond @authz 404
+
+		# Reserved root -> portal. Everything under /~lsc (and nothing else)
+		# is portal-owned; the portal 404s any /~lsc path it does not
+		# implement rather than falling through to the workspace (W0-C).
+		@portal path /~lsc /~lsc/*
+		handle @portal {
+			reverse_proxy {$LSC_PORTAL_UPSTREAM:127.0.0.1:3790} {
+				header_up X-Forwarded-Proto https
+			}
 		}
-		# 403: signed in but not permitted -> small forbidden page.
-		@forbidden status 403
-		handle_response @forbidden {
-			header Content-Type "text/html; charset=utf-8"
-			respond "<!doctype html><html><head><title>Forbidden - LateShift Cloud</title><meta name=viewport content='width=device-width,initial-scale=1'><style>body{background:#0b0e14;color:#e8ebf1;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}div{text-align:center}h1{letter-spacing:-.01em}p{color:#8a92a6}a{color:#7aa2f7}</style></head><body><div><h1>403 - Forbidden</h1><p>You are signed in, but you don't have access to this instance.</p><p><a href='https://lateshiftcloud.com/'>Back to LateShift Cloud</a></p></div></body></html>" 403
+
+		# Everything else IS the workspace: authorize, then proxy to the
+		# socket the portal returned. /authz fails closed; see
+		# portal/lib/workspaces.mjs for the decision table.
+		handle {
+			forward_auth {$LSC_PORTAL_UPSTREAM:127.0.0.1:3790} {
+				uri /authz
+				method GET
+				copy_headers X-Lsc-Upstream X-Lsc-User
+
+				# 401: not signed in -> bounce to the login URL the portal returns.
+				@needauth status 401
+				handle_response @needauth {
+					redir {rp.header.X-Authz-Redirect} 302
+				}
+				# 403: signed in but not a member of the selected workspace.
+				@forbidden status 403
+				handle_response @forbidden {
+					header Content-Type "text/html; charset=utf-8"
+					respond "<!doctype html><html><head><title>Forbidden - LateShift Cloud</title><meta name=viewport content='width=device-width,initial-scale=1'><style>body{background:#0b0e14;color:#e8ebf1;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}div{text-align:center}h1{letter-spacing:-.01em}p{color:#8a92a6}a{color:#7aa2f7}</style></head><body><div><h1>403 - Forbidden</h1><p>You are signed in, but you don't have access to this workspace.</p><p><a href='/~lsc/account'>Your account</a></p></div></body></html>" 403
+				}
+				# 503: authorized, but the workspace socket is not up yet.
+				@starting status 503
+				handle_response @starting {
+					header Content-Type "text/html; charset=utf-8"
+					header Retry-After 5
+					respond "<!doctype html><html><head><title>Starting - LateShift Cloud</title><meta http-equiv=refresh content=5><meta name=viewport content='width=device-width,initial-scale=1'><style>body{background:#0b0e14;color:#e8ebf1;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}div{text-align:center}h1{letter-spacing:-.01em}p{color:#8a92a6}</style></head><body><div><h1>Workspace starting…</h1><p>Your workspace isn't reachable yet. This page retries automatically.</p></div></body></html>" 503
+				}
+			}
+			reverse_proxy {http.request.header.X-Lsc-Upstream} {
+				header_up X-Forwarded-Proto https
+				# Do not buffer streaming responses (SSE / long turns).
+				flush_interval -1
+			}
 		}
 	}
-	reverse_proxy 127.0.0.1:{args[0]}
 }
 
-# --- apex + www: portal directly (no authz) ----------------------------------
-# Every site address carries the explicit http:// scheme so Caddy binds them on
-# http_port (8880) instead of the default HTTPS 443 — TLS is Cloudflare's job.
-http://lateshiftcloud.com, http://www.lateshiftcloud.com {
-	import lsc_strip_identity
-	reverse_proxy 127.0.0.1:3790 {
-		# Caddy already sets X-Forwarded-Host/-For; override proto since we sit
-		# behind Cloudflare's TLS (Caddy itself only sees plain HTTP).
-		header_up X-Forwarded-Proto https
-	}
+# Apex (and a loopback address for the shadow stack / smoke tests).
+http://lateshiftcloud.com, http://127.0.0.1:{$LSC_HTTP_PORT:8880} {
+	import lsc_single_origin
 }
 
-# --- production instance (admin-gated by the portal /authz logic) ------------
-http://prod.lateshiftcloud.com {
-	import lsc_gated 3773
-}
-
-# --- per-user instances (generated from users.json) --------------------------
-import /etc/caddy/lsc-users.caddy
-
-# --- unknown subdomain -> 404 ------------------------------------------------
-http://*.lateshiftcloud.com {
-	header Content-Type "text/html; charset=utf-8"
-	respond "<!doctype html><html><head><title>Not found - LateShift Cloud</title><meta name=viewport content='width=device-width,initial-scale=1'><style>body{background:#0b0e14;color:#e8ebf1;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}div{text-align:center}h1{letter-spacing:-.01em}p{color:#8a92a6}a{color:#7aa2f7}</style></head><body><div><h1>404 - Not found</h1><p>No such LateShift Cloud workspace.</p><p><a href='https://lateshiftcloud.com/'>Back to LateShift Cloud</a></p></div></body></html>" 404
+# Any other host — www and the retired per-user subdomains — goes home. The
+# session cookie is host-only on the apex, so serving the app on www would
+# just produce a sign-in loop.
+http://*.lateshiftcloud.com, http://www.lateshiftcloud.com {
+	redir https://lateshiftcloud.com{uri} 302
 }

@@ -32,7 +32,6 @@ const LSC_ROOT = "/home/dev/services/lateshift";
 const CHECKOUT = `${LSC_ROOT}/checkout`;
 const SECRETS_TOKEN = `${LSC_ROOT}/secrets/ops-token`;
 const AUDIT_LOG = `${LSC_ROOT}/ops-audit.log`;
-const RENDER_GATEWAY = `${LSC_ROOT}/bin/render-gateway`;
 const BRANDING = `${LSC_ROOT}/tools/apply-branding.sh`;
 
 const INFRA_REPO = "/home/dev/projects/t3code";
@@ -445,10 +444,19 @@ if [ "$ok" = 1 ]; then audit "rolled-back-healthy backup=${backup}"; else audit 
   };
 }
 
-/** 5. update-gateway — regenerate caddy site blocks + reload caddy. */
+/** 5. update-gateway — validate the installed Caddy config, then reload.
+ * There is nothing to render any more (W7-C deleted the per-user subdomain
+ * blocks and render-gateway): the v2 gateway is one static Caddyfile. Validate
+ * BEFORE reload so a broken config can never be loaded into the gateway. */
 async function updateGateway() {
-  const r = await run("sudo", ["-n", RENDER_GATEWAY], { timeoutMs: 60_000 });
-  return { ok: r.ok, code: r.code, output: tail(r, 3000) };
+  const v = await run(
+    "sudo",
+    ["-n", "caddy", "validate", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"],
+    { timeoutMs: 60_000 },
+  );
+  if (!v.ok) return { ok: false, stage: "validate", code: v.code, output: tail(v, 3000) };
+  const r = await run("sudo", ["-n", "systemctl", "reload", "caddy"], { timeoutMs: 60_000 });
+  return { ok: r.ok, stage: "reload", code: r.code, output: tail(r, 3000) };
 }
 
 /** 6. logs — journalctl for whitelisted units only (never production t3code). */

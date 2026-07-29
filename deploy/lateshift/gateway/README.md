@@ -1,77 +1,81 @@
-# LateShift Cloud — public gateway (Caddy)
+# LateShift Cloud — v2 single-origin gateway (Caddy)
 
-Public front door for `lateshiftcloud.com`. Cloudflare terminates TLS and the
-`lateshift` cloudflared tunnel forwards `lateshiftcloud.com` and
-`*.lateshiftcloud.com` to `http://127.0.0.1:8880`, where Caddy routes:
+One origin: `https://lateshiftcloud.com`. Cloudflare terminates TLS and the
+`lateshift` cloudflared tunnel forwards to Caddy on loopback. Caddy routes by
+PATH, not by host:
 
-| Host                          | Behaviour                                                        |
-| ----------------------------- | --------------------------------------------------------------- |
-| `lateshiftcloud.com`, `www.`  | reverse_proxy to the portal (`127.0.0.1:3790`), no authz        |
-| `<user>.lateshiftcloud.com`   | `forward_auth` /authz then reverse_proxy to that user's port    |
-| `prod.lateshiftcloud.com`     | `forward_auth` /authz (admin-only per portal) then proxy `3773` |
-| any other `*.lateshiftcloud.com` | 404 page                                                     |
+| Path                     | Behaviour                                                          |
+| ------------------------ | ------------------------------------------------------------------ |
+| `/~lsc/authz*`           | hard 404 (Caddy-internal endpoint, never public)                    |
+| `/~lsc`, `/~lsc/*`       | reverse_proxy to the portal                                         |
+| everything else          | `forward_auth` portal `/authz` → reverse_proxy to the workspace unix socket named by `X-Lsc-Upstream` |
+| any non-apex host        | 302 to `https://lateshiftcloud.com{uri}` (www + retired subdomains) |
 
-Caddy listens **only** on `127.0.0.1:8880`, plain HTTP (`auto_https off`,
-`default_bind 127.0.0.1`). It never binds a public interface and never touches
-ports 80/443 — TLS is Cloudflare's job. WebSockets pass through natively
-(`reverse_proxy` upgrades).
+There are no per-user subdomains, no `lsc-users.caddy`, and no
+`render-gateway` — all deleted in W7-C. The workspace IS the site; the portal
+owns only the reserved root `/~lsc` (spike W0-C).
 
-## Files
+## Authz contract (portal `GET /authz`, forward_auth target)
 
-- `Caddyfile` — main config. Installed to `/etc/caddy/Caddyfile`. Defines the
-  `lsc_gated` snippet (forward_auth + reverse_proxy), the apex/www/prod/404
-  blocks, and `import /etc/caddy/lsc-users.caddy`.
-- `render-gateway` — regenerates the per-user site blocks. Installed to
-  `/home/dev/services/lateshift/bin/render-gateway`.
+The gateway forwards the original `Cookie` header. The portal resolves
+session → user → selected workspace (`lsc_ws` cookie, validated against
+registry membership on EVERY request; absent → personal workspace) and
+answers:
 
-## Authz contract (portal `GET /authz` on 127.0.0.1:3790)
+- **200** + `X-Lsc-Upstream: unix//run/lsc/<ws>/http.sock` + `X-Lsc-User:
+  <github login>` — Caddy `copy_headers` both onto the request and proxies to
+  that socket. The portal never returns 200 without `X-Lsc-Upstream`.
+- **401** + `X-Authz-Redirect` — Caddy 302s the browser to sign-in.
+- **403** — forbidden page (non-member, unknown user, disabled user, corrupt
+  registry, any error at all: /authz fails CLOSED — architecture-v2 R2).
+- **503** — valid member but the workspace socket is not up; Caddy serves a
+  self-refreshing "starting" page instead of a bare 502.
 
-The gateway sends the original `Cookie` header (forwarded automatically) plus
-`X-Authz-Host: <public hostname>`. Expected responses:
+Resolution logic: `portal/lib/workspaces.mjs` (single decision table).
 
-- **200** — allow. Portal returns `X-Lsc-User`, which Caddy copies onto the
-  upstream request before proxying.
-- **401** — not signed in. Portal returns `X-Authz-Redirect: <login URL>`;
-  Caddy 302-redirects the browser there.
-- **403** — signed in but forbidden. Caddy serves a small forbidden page.
+## Load-bearing facts (also in the Caddyfile header — do not "clean up")
 
-The apex host is proxied straight to the portal with no authz call.
+1. The `route { }` wrapper is mandatory: Caddy's default directive order runs
+   `request_header` AFTER `forward_auth`'s `copy_headers`, which wipes
+   `X-Lsc-Upstream` and 502s every request (spike W0-B, caddy v2.11.4).
+2. The inbound strip of `X-Lsc-User` / `X-Lsc-Upstream` / `X-Ops-Token` /
+   `X-Authz-Host` / `Tailscale-User-*` stays even though `copy_headers`
+   already replaces: it covers any future path that bypasses forward_auth.
+3. Dynamic upstream from a forward_auth response header works on the stock
+   caddy v2.11.4 with unix-socket dial addresses and WebSocket upgrade, and
+   fails closed (2xx without the header dials the empty address → 502, never
+   a client-chosen host).
+4. Caddy normalizes `%7E`: the `/~lsc` matcher also catches `/%7Elsc/...`.
+5. NOT yet proven: sustained SSE / large-frame WS throughput through the
+   dynamic upstream (`flush_interval -1` is set; look there first).
 
-## Per-user mapping: `render-gateway`
+## Paths the portal must never claim (T3 owns them)
 
-Reads `/home/dev/services/lateshift/users.json` and writes
-`/etc/caddy/lsc-users.caddy` (atomic, idempotent), one block per active user:
+`/`, `/assets/*`, `/api/*`, `/oauth/*`, `/.well-known/*`, `/ws`, `/mcp`,
+`/favicon*.ico`, `/favicon-*.png`, `/apple-touch-icon.png`,
+`/mockServiceWorker.js`, `/settings*`, `/pair`, `/connect*`, `/draft/*`, and
+every two-segment path (`/$environmentId/$threadId` catches them all).
+Links from inside the T3 shell to `/~lsc/*` must be real document
+navigations, never SPA `<Link>`s.
 
-```
-<name>.lateshiftcloud.com {
-	import lsc_gated <localPort>
-}
-```
+## Installation / shadow run
 
-Then `systemctl reload caddy` (skip with `--no-reload`). Must run as root;
-safe on an empty or missing registry. It is invoked best-effort at the tail of
-`t3user add` / `t3user remove` so the gateway tracks the registry
-automatically. Run it manually after hand-editing users.json:
-
-```
-sudo /home/dev/services/lateshift/bin/render-gateway
-```
-
-## Install / cutover
+`tools/install.sh` deliberately does NOT install this Caddyfile: copying it to
+`/etc/caddy/Caddyfile` retires the live v1 subdomain gateway and IS the W8
+cutover. Shadow run alongside the live stack (nothing shared):
 
 ```sh
-# Caddy from the official apt repo (one-time)
-sudo apt-get install -y caddy
-
-sudo install -m 644 Caddyfile /etc/caddy/Caddyfile
-sudo install -m 755 render-gateway /home/dev/services/lateshift/bin/render-gateway
-sudo /home/dev/services/lateshift/bin/render-gateway --no-reload   # seed lsc-users.caddy
-caddy validate --config /etc/caddy/Caddyfile
-
-# cutover from the placeholder to Caddy on 8880
-sudo systemctl disable --now lsc-gateway-placeholder
-sudo systemctl enable --now caddy
+sudo LSC_HTTP_PORT=8881 LSC_PORTAL_UPSTREAM=127.0.0.1:3791 \
+  caddy run --config deploy/lateshift/gateway/Caddyfile --adapter caddyfile
 ```
 
-Nothing here affects the tailnet paths (portal `:8450`, instances `:8460+`,
-production `:443` via `tailscale serve`) — those are independent of Caddy.
+The process needs the `caddy` group (or root) to traverse
+`/run/lsc/<ws>/` (`0750 <ws>:caddy`).
+
+## Tests
+
+- `sudo node gateway/smoke-gateway.mjs` — boots the real portal + this real
+  Caddyfile on shadow ports (8881/3798) and asserts the whole table above,
+  including the WebSocket upgrade and the forged-header overwrite. 10 checks.
+- `node portal/test/authz-matrix.mjs` — the exhaustive 26-case /authz matrix
+  (W7-D), every deny row asserted.

@@ -37,6 +37,7 @@ import * as profiles from "./lib/profiles.mjs";
 import * as usage from "./lib/usage.mjs";
 import * as teams from "./lib/teams.mjs";
 import { LSC_PREFIX, p, normalizePath } from "./lib/paths.mjs";
+import * as workspaces from "./lib/workspaces.mjs";
 import * as views from "./views.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -374,53 +375,41 @@ async function adminProps(ctx, csrf, flash, selectedParam) {
 
 // ---------------------------------------------------------------- auth routes
 
-// GET /authz — loopback-only authorization endpoint for the public gateway.
-// Contract: request carries the forwarded Cookie and X-Authz-Host: <public
-// hostname>. Apex host → 200 (portal self-auths). Subdomain label must match a
-// registry user AND the session must resolve to that user (or an admin) → 200
-// + X-Lsc-User. Label "prod" → admins only. No/invalid session → 401 +
-// X-Authz-Redirect. Valid session, wrong user → 403.
+// GET /authz — loopback-only, Caddy-internal authorization + routing endpoint
+// (the forward_auth target) for the v2 single-origin gateway. It is the ONLY
+// thing standing between users (architecture-v2 R2), so it FAILS CLOSED: any
+// throw on any path → 403 with no routing headers. Contract (gateway/Caddyfile):
+//   200 + X-Lsc-Upstream + X-Lsc-User  → Caddy proxies to that workspace socket
+//   401 + X-Authz-Redirect             → browser is bounced to GitHub sign-in
+//   403                                → forbidden page (never routed)
+//   503                                → valid member, workspace socket not up yet
+// Workspace selection: the lsc_ws cookie, validated against registry membership
+// on EVERY request and never trusted as an assertion; no cookie → the personal
+// workspace. Resolution lives in lib/workspaces.mjs (single decision table).
+// No request header is trusted here: identity comes only from the signed
+// session cookie, routing only from registry.json.
 async function handleAuthz(req, res) {
-  const config = loadConfig();
-  const users = loadRegistry();
-
-  const rawHost = req.headers["x-authz-host"];
-  const host =
-    typeof rawHost === "string"
-      ? rawHost.split(",")[0].trim().toLowerCase().replace(/:\d+$/, "")
-      : "";
-  const apex = config.publicBaseUrl
-    ? new URL(config.publicBaseUrl).host.toLowerCase()
-    : "lateshiftcloud.com";
-  const loginUrl = `${config.publicBaseUrl || "https://lateshiftcloud.com"}${p("/auth/github/login")}`;
-
   const done = (status, headers = {}) => {
-    res.writeHead(status, headers);
+    res.writeHead(status, { "cache-control": "no-store", ...headers });
     res.end();
   };
-
-  if (!host) return done(400);
-  if (host === apex) return done(200); // portal handles its own auth
-  if (!host.endsWith(`.${apex}`)) return done(404);
-  const label = host.slice(0, host.length - apex.length - 1);
-  if (!label || label.includes(".")) return done(404); // single-label only
-
-  const session = auth.verifySession(parseCookies(req)[auth.SESSION_COOKIE], config.sessionSecret);
-  if (!session) return done(401, { "x-authz-redirect": loginUrl });
-  const principal = resolveIdentity({ ghLogin: session.gh }, { users, config });
-
-  if (label === "prod") {
-    if (principal.isAdmin)
-      return done(200, { "x-lsc-user": principal.user?.name || principal.login });
+  try {
+    const config = loadConfig();
+    const cookies = parseCookies(req);
+    const session = auth.verifySession(cookies[auth.SESSION_COOKIE], config.sessionSecret);
+    if (!session) {
+      const loginUrl = `${config.publicBaseUrl || "https://lateshiftcloud.com"}${p("/auth/github/login")}`;
+      return done(401, { "x-authz-redirect": loginUrl });
+    }
+    const reg = workspaces.loadRegistryV2();
+    const r = workspaces.resolveWorkspace(session.gh, cookies[workspaces.WS_COOKIE] ?? null, reg);
+    if (!r.ok) return done(r.status);
+    return done(200, { "x-lsc-upstream": r.upstream, "x-lsc-user": r.user });
+  } catch (err) {
+    // Fail closed, loudly. A deny with a logged reason beats a routed mistake.
+    console.error("authz error (denied):", err?.message ?? err);
     return done(403);
   }
-  const target = users[label];
-  if (!target) return done(404);
-  if (principal.isAdmin) return done(200, { "x-lsc-user": target.name });
-  if (principal.user && principal.user.name === target.name) {
-    return done(200, { "x-lsc-user": target.name });
-  }
-  return done(403);
 }
 
 // GET /auth/github/login — 302 to GitHub's authorize endpoint, identity scope
@@ -618,7 +607,14 @@ async function handleGet(req, res, url) {
     return;
   }
 
-  if (pathname === "/authz") return handleAuthz(req, res);
+  // /authz is Caddy-internal (forward_auth) and only ever BARE. The gateway
+  // 404s the public /~lsc/authz form; the portal refuses the prefixed form
+  // too so the invariant holds even if a future gateway config slips.
+  if (url.pathname === "/authz") return handleAuthz(req, res);
+  if (pathname === "/authz") {
+    res.writeHead(404).end();
+    return;
+  }
   if (pathname === "/auth/github/login") return handleGithubLogin(req, res);
   if (pathname === "/auth/github/connect") {
     // The consented push-access upgrade. Requires an existing session — this
