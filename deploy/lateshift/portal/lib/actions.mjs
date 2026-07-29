@@ -10,13 +10,9 @@
 import { execFile } from "node:child_process";
 import { readFileSync, existsSync, realpathSync } from "node:fs";
 import { dirname, basename } from "node:path";
-import { NAME_RE, TS_LOGIN_RE, GH_LOGIN_RE } from "./registry.mjs";
+import { NAME_RE, GH_LOGIN_RE } from "./registry.mjs";
 
 const T3USER = "/home/dev/services/lateshift/bin/t3user";
-// Stock production binary — NEVER the patched checkout: running the checkout
-// build against production's default base dir would apply fork migrations to
-// production's state database.
-const SHARED_SERVER_BIN = "/usr/bin/t3";
 
 const SAFE_UNIT_RE = /^t3code@[a-z0-9-]{2,20}(\.service)?$/;
 
@@ -28,11 +24,6 @@ export function assertSafeUnit(unit) {
 export function assertName(name) {
   if (typeof name === "string" && NAME_RE.test(name)) return name;
   throw new Error("invalid user name");
-}
-
-export function assertTsLogin(login) {
-  if (typeof login === "string" && TS_LOGIN_RE.test(login) && login.length <= 128) return login;
-  throw new Error("invalid tailnet login");
 }
 
 export function assertLimit(value) {
@@ -72,99 +63,22 @@ export async function restartInstance(name) {
   });
 }
 
-const PAIR_URL_RE = /https:\/\/[A-Za-z0-9.-]+(?::\d+)?\/pair#token=[A-Za-z0-9]+/;
-
-/** t3user pair <name> → one-time pairing URL for the user's own instance. */
-export async function mintUserPairing(name, ttl = "15m", { publicHost = false } = {}) {
-  if (!/^[0-9]+[smhd]$/.test(ttl)) throw new Error("invalid ttl");
-  const args = ["pair", assertName(name), "--ttl", ttl];
-  if (publicHost) args.push("--public");
-  const r = await run(T3USER, args);
-  const match = r.stdout.match(PAIR_URL_RE);
-  if (!r.ok || !match) {
-    return { ok: false, url: null, detail: (r.stderr || r.stdout).slice(0, 2000) };
-  }
-  return { ok: true, url: match[0], detail: null };
-}
-
-/**
- * Pairing against the SHARED instance (today: production, default base dir
- * ~/.t3 — deliberately NO --base-dir flag). Verifies the printed URL points
- * at the configured shared workspace origin before handing it out.
- */
-export async function mintSharedPairing(name, sharedWorkspaceUrl) {
-  assertName(name);
-  if (!sharedWorkspaceUrl) {
-    return { ok: false, url: null, detail: "shared workspace not configured" };
-  }
-  const baseUrl = sharedWorkspaceUrl.replace(/\/+$/, "");
-  const r = await run(SHARED_SERVER_BIN, [
-    "auth",
-    "pairing",
-    "create",
-    "--ttl",
-    "15m",
-    "--label",
-    `portal:${name}`,
-    "--base-url",
-    baseUrl,
-  ]);
-  const match = r.stdout.match(PAIR_URL_RE);
-  if (!r.ok || !match) {
-    return { ok: false, url: null, detail: (r.stderr || r.stdout).slice(0, 2000) };
-  }
-  const url = match[0];
-  const expectedOrigin = new URL(sharedWorkspaceUrl).origin;
-  if (new URL(url).origin !== expectedOrigin) {
-    return {
-      ok: false,
-      url: null,
-      detail: `pairing URL origin ${new URL(url).origin} does not match shared workspace ${expectedOrigin}`,
-    };
-  }
-  return { ok: true, url, detail: null };
-}
-
 /** t3user add — provisioning can take up to ~90s (health-gated). */
-export async function addUser({ name, tsLogin, projectLimit }) {
+export async function addUser({ name, projectLimit }) {
   const args = ["add", assertName(name), "--project-limit", String(assertLimit(projectLimit))];
-  if (tsLogin) args.push("--ts-login", assertTsLogin(tsLogin));
   return run(T3USER, args, { timeoutMs: 180_000 });
-}
-
-export function assertBudget(value) {
-  const n = Number(value);
-  if (Number.isFinite(n) && n >= 0 && n <= 100000) return Math.round(n * 100) / 100;
-  throw new Error("budget must be a number 0-100000 (0 = unlimited)");
-}
-
-const SHARED_PATH_RE = /^\/home\/dev\/(shared|projects)\/[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
-
-export function assertSharedPath(path) {
-  if (typeof path === "string" && path.length <= 300 && SHARED_PATH_RE.test(path)) return path;
-  throw new Error("shared path must be under /home/dev/shared/ or /home/dev/projects/");
 }
 
 /** t3user set <name> <key> <value> (allowed keys enforced by the CLI too). */
 export async function setUserField(name, key, value) {
-  if (!["projectLimit", "sharedAccess", "tsLogin", "admin", "monthlyBudgetUsd"].includes(key))
-    throw new Error(`key '${key}' is not settable`);
-  let v;
-  if (key === "projectLimit") v = String(assertLimit(value));
-  else if (key === "monthlyBudgetUsd") v = String(assertBudget(value));
-  else if (key === "sharedAccess" || key === "admin")
-    v = value === true || value === "true" ? "true" : "false";
-  else v = assertTsLogin(value);
+  if (!["projectLimit", "admin"].includes(key)) throw new Error(`key '${key}' is not settable`);
+  const v =
+    key === "projectLimit"
+      ? String(assertLimit(value))
+      : value === true || value === "true"
+        ? "true"
+        : "false";
   return run(T3USER, ["set", assertName(name), key, v]);
-}
-
-/** t3user share/unshare <name> <path> — grant or revoke a shared project dir. */
-export async function shareProject(name, path) {
-  return run(T3USER, ["share", assertName(name), assertSharedPath(path)], { timeoutMs: 60_000 });
-}
-
-export async function unshareProject(name, path) {
-  return run(T3USER, ["unshare", assertName(name), assertSharedPath(path)], { timeoutMs: 60_000 });
 }
 
 /** t3user remove <name> [--force] */

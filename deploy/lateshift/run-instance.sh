@@ -4,7 +4,6 @@
 # Port configuration comes from the unit's EnvironmentFile
 # (/home/dev/services/lateshift/users/<username>/instance.env), which must define:
 #   T3CODE_INSTANCE_PORT  local HTTP port the server binds on 127.0.0.1
-#   TS_SERVE_PORT         HTTPS port exposed on the tailnet via `tailscale serve`
 # Optional:
 #   T3CODE_MAX_PROJECTS   per-user project limit (enforced by the patched
 #                         server build; unset/0 = unlimited)
@@ -38,15 +37,9 @@ normalize_port() {
 }
 
 : "${T3CODE_INSTANCE_PORT:?T3CODE_INSTANCE_PORT missing from instance.env}"
-: "${TS_SERVE_PORT:?TS_SERVE_PORT missing from instance.env}"
 
 local_port=$(normalize_port "${T3CODE_INSTANCE_PORT}") || exit 1
-ts_port=$(normalize_port "${TS_SERVE_PORT}") || exit 1
 
-if (( ts_port == 443 )); then
-    echo "refusing to start: TS_SERVE_PORT 443 is reserved for the production instance" >&2
-    exit 1
-fi
 if (( local_port == 3773 )); then
     echo "refusing to start: local port 3773 is reserved for the production instance" >&2
     exit 1
@@ -96,6 +89,4 @@ export PATH="/home/dev/services/lateshift/instance-bin:${PATH}"
 
 exec /usr/bin/node "${server_bin}" serve \
     --base-dir "${base_dir}" \
-    --port "${local_port}" \
-    --tailscale-serve \
-    --tailscale-serve-port "${ts_port}"
+    --port "${local_port}"

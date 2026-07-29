@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 // LateShift Cloud portal server.
 //
-// Serves on 127.0.0.1:<PORT> (default 3790) behind Tailscale Serve, which
-// injects the caller's tailnet identity as Tailscale-User-Login /
-// Tailscale-User-Name / Tailscale-User-Profile-Pic headers. Identity mapping,
-// work history, workspace pairing and the admin panel all build on that.
+// Serves on 127.0.0.1:<PORT> (default 3790) behind the public Caddy gateway.
+// Identity comes exclusively from the signed lsc_session cookie minted by the
+// GitHub OAuth callback; work history and the admin panel build on that.
 //
 // SAFETY: never touches the production t3code unit; all systemctl calls go
 // through lib/actions.mjs assertSafeUnit(). Refuses to start on port 443 or
@@ -12,7 +11,7 @@
 
 import http from "node:http";
 import crypto from "node:crypto";
-import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -23,10 +22,7 @@ import {
   readUsageSummary,
   readCostSince,
   readCostThisMonth,
-  readBudgetPaused,
   readMonthProviderCost,
-  readProviderTurns,
-  computeProviderWindows,
   stateDbPath,
 } from "./lib/history.mjs";
 import * as actions from "./lib/actions.mjs";
@@ -48,11 +44,6 @@ const LOGO_PATHS = [
 ];
 const CSRF_COOKIE = "lsc_csrf";
 
-// The single share root. Directories directly under it are the universe of
-// shareable projects; grants (registry sharedProjects) are absolute paths here.
-const SHARED_ROOT = "/home/dev/shared";
-const SHARE_DIR_RE = /^[A-Za-z0-9._-]+$/;
-
 // ---------------------------------------------------------------- helpers
 
 function parseCookies(req) {
@@ -62,24 +53,6 @@ function parseCookies(req) {
     if (idx > 0) out[part.slice(0, idx).trim()] = part.slice(idx + 1).trim();
   }
   return out;
-}
-
-function identityFrom(req) {
-  // Only meaningful when the request came through Tailscale Serve. Direct
-  // 127.0.0.1 requests can forge these headers — accepted risk on this
-  // single-admin box (see README).
-  const login = req.headers["tailscale-user-login"];
-  return {
-    login: typeof login === "string" && login.length <= 256 ? login : null,
-    name:
-      typeof req.headers["tailscale-user-name"] === "string"
-        ? req.headers["tailscale-user-name"]
-        : null,
-    profilePic:
-      typeof req.headers["tailscale-user-profile-pic"] === "string"
-        ? req.headers["tailscale-user-profile-pic"]
-        : null,
-  };
 }
 
 function readBody(req, limit = 64 * 1024) {
@@ -148,18 +121,6 @@ function ensureCsrf(cookies, res) {
   return token;
 }
 
-/** Directories directly under the share root, as {name, path}. */
-function listSharedDirs() {
-  try {
-    return readdirSync(SHARED_ROOT, { withFileTypes: true })
-      .filter((d) => d.isDirectory() && !d.name.startsWith(".") && SHARE_DIR_RE.test(d.name))
-      .map((d) => ({ name: d.name, path: `${SHARED_ROOT}/${d.name}` }))
-      .sort((a, b) => a.name.localeCompare(b.name));
-  } catch {
-    return [];
-  }
-}
-
 // ---------------------------------------------------------------- context
 
 function sessionFrom(req, config) {
@@ -171,17 +132,9 @@ function sessionFrom(req, config) {
 function buildContext(req) {
   const config = loadConfig();
   const users = loadRegistry();
-  const tsIdentity = identityFrom(req);
-  // Tailnet identity wins when present (unchanged tailnet behaviour); the
-  // signed GitHub session cookie only applies on the public path.
-  const session = tsIdentity.login ? null : sessionFrom(req, config);
-  const principal = resolveIdentity(
-    { tsLogin: tsIdentity.login, ghLogin: session?.gh ?? null },
-    { users, config },
-  );
-  const identity = tsIdentity.login
-    ? tsIdentity
-    : { login: session?.gh ?? null, name: null, profilePic: null };
+  const session = sessionFrom(req, config);
+  const principal = resolveIdentity({ ghLogin: session?.gh ?? null }, { users, config });
+  const identity = { login: session?.gh ?? null, name: null, profilePic: null };
   const fwdHost =
     typeof req.headers["x-forwarded-host"] === "string" ? req.headers["x-forwarded-host"] : "";
   const isPublic = fwdHost === "lateshiftcloud.com" || fwdHost.endsWith(".lateshiftcloud.com");
@@ -201,13 +154,9 @@ async function dashboardProps(ctx, csrf) {
     user: {
       name: user.name,
       projectLimit: user.projectLimit,
-      sharedAccess: user.sharedAccess,
       admin: user.admin,
-      monthlyBudgetUsd: user.monthlyBudgetUsd,
-      sharedProjects: user.sharedProjects,
     },
     instanceStatus: await actions.instanceStatus(user.name),
-    budgetPaused: readBudgetPaused(user.baseDir),
     monthCostUsd: readCostThisMonth(dbPath),
     projects: readWorkHistory(dbPath),
     usage: readUsageSummary(dbPath),
@@ -231,12 +180,8 @@ async function adminProps(ctx, csrf, flash, selectedParam) {
 
   const rows = [];
   const leaderboard = [];
-  const subTotals = { claude: 0, codex: 0, other: 0, total: 0 };
   let totalCost30d = 0;
   let activeCount = 0;
-  let allTurns = [];
-  // 7d lookback is more than enough to locate the current 5h window anchor.
-  const windowSince = new Date(Date.now() - 7 * 86400_000).toISOString();
 
   for (const u of registryUsers) {
     const dbPath = stateDbPath(u.baseDir);
@@ -245,27 +190,18 @@ async function adminProps(ctx, csrf, flash, selectedParam) {
     const cost30d = readCostSince(dbPath, 30);
     if (cost30d != null) totalCost30d += cost30d;
     const monthProv = readMonthProviderCost(dbPath);
-    subTotals.claude += monthProv.claude;
-    subTotals.codex += monthProv.codex;
-    subTotals.other += monthProv.other;
-    subTotals.total += monthProv.total;
-    allTurns = allTurns.concat(readProviderTurns(dbPath, windowSince));
 
-    const isSelf = Boolean(u.tsLogin && adminLower && u.tsLogin.toLowerCase() === adminLower);
+    const isSelf = Boolean(
+      u.githubLogin && adminLower && u.githubLogin.toLowerCase() === adminLower,
+    );
     rows.push({
       name: u.name,
-      tsLogin: u.tsLogin,
       localPort: u.localPort,
-      tsPort: u.tsPort,
       projectLimit: u.projectLimit,
-      sharedAccess: u.sharedAccess,
       admin: u.admin,
       instanceStatus: status,
       cost30dUsd: cost30d,
-      monthlyBudgetUsd: u.monthlyBudgetUsd,
       monthCostUsd: readCostThisMonth(dbPath),
-      budgetPaused: readBudgetPaused(u.baseDir),
-      sharedProjects: u.sharedProjects,
       monthProviderCost: monthProv,
       github: githubStatusFor(u),
       isSelf,
@@ -280,14 +216,12 @@ async function adminProps(ctx, csrf, flash, selectedParam) {
   }
 
   leaderboard.sort((a, b) => b.total - a.total);
-  const windows = computeProviderWindows(allTurns);
 
   const selfRow = rows.find((r) => r.isSelf) || null;
   const self = {
     present: Boolean(selfRow),
     name: selfRow ? selfRow.name : null,
     login: adminLogin,
-    workspaceConfigured: Boolean(ctx.config.sharedWorkspaceUrl),
   };
 
   // Selection: a registry user name, or "@self" for the admin's own account.
@@ -307,12 +241,6 @@ async function adminProps(ctx, csrf, flash, selectedParam) {
     users: rows,
     self,
     selectedKey,
-    sharedDirs: listSharedDirs(),
-    subscription: {
-      totals: subTotals,
-      windows,
-      limits: ctx.config.subscriptionLimits,
-    },
     leaderboard,
     aggregate: {
       totalCost30dUsd: totalCost30d,
@@ -483,7 +411,6 @@ async function handleGithubCallback(req, res, url) {
   if (result.reason !== "denied") {
     auth.setPendingToken(profile.login, { id: profile.id, token: profile.token });
   }
-  if (result.added) auth.notifySignup(config, { login: profile.login, name: profile.name });
   html(
     res,
     200,
@@ -678,57 +605,6 @@ async function handlePost(req, res, url) {
   }
   const csrf = cookies[CSRF_COOKIE];
 
-  // ---- user-facing actions -------------------------------------------
-  if (url.pathname === "/open") {
-    const user = ctx.principal.user;
-    if (!user) {
-      html(res, 403, views.renderForbidden({ identity: { login: ctx.principal.login } }));
-      return;
-    }
-    const r = await actions.mintUserPairing(user.name, "15m", { publicHost: ctx.isPublic });
-    if (!r.ok) {
-      html(
-        res,
-        502,
-        views.renderMessage({
-          title: "Error",
-          heading: "Could not open workspace",
-          bodyHtml: `<p>Pairing failed:</p><pre>${views.esc(r.detail ?? "unknown error")}</pre>`,
-          backHref: "/",
-          error: true,
-        }),
-      );
-      return;
-    }
-    redirect(res, r.url);
-    return;
-  }
-
-  if (url.pathname === "/open-shared") {
-    const user = ctx.principal.user;
-    if (!user || !user.sharedAccess) {
-      html(res, 403, views.renderForbidden({ identity: { login: ctx.principal.login } }));
-      return;
-    }
-    const r = await actions.mintSharedPairing(user.name, ctx.config.sharedWorkspaceUrl);
-    if (!r.ok) {
-      html(
-        res,
-        502,
-        views.renderMessage({
-          title: "Error",
-          heading: "Could not open shared workspace",
-          bodyHtml: `<p>Pairing failed:</p><pre>${views.esc(r.detail ?? "unknown error")}</pre>`,
-          backHref: "/",
-          error: true,
-        }),
-      );
-      return;
-    }
-    redirect(res, r.url);
-    return;
-  }
-
   // ---- admin actions ---------------------------------------------------
   if (!url.pathname.startsWith("/admin/")) {
     html(
@@ -746,44 +622,6 @@ async function handlePost(req, res, url) {
   }
   if (!ctx.principal.isAdmin) {
     html(res, 403, views.renderForbidden({ identity: { login: ctx.principal.login } }));
-    return;
-  }
-
-  // Admin opens the shared production workspace (their own "workspace" card).
-  // Not keyed by a registry user — uses the admin's own registry name when
-  // present, else a static label. No `name` field required.
-  if (url.pathname === "/admin/open-workspace") {
-    const adminLower = ctx.principal.login ? ctx.principal.login.toLowerCase() : null;
-    const selfUser = Object.values(ctx.users).find(
-      (u) => u.tsLogin && adminLower && u.tsLogin.toLowerCase() === adminLower,
-    );
-    // Default: the admin's OWN instance when they have one; production only
-    // when explicitly requested (shared=1) or when no own workspace exists.
-    if (selfUser && form.shared !== "1") {
-      const own = await actions.mintUserPairing(selfUser.name, "15m", { publicHost: ctx.isPublic });
-      if (own.ok) {
-        redirect(res, own.url);
-        return;
-      }
-      // fall through to the shared workspace on pairing failure
-    }
-    const label = selfUser ? selfUser.name : "admin";
-    const r = await actions.mintSharedPairing(label, ctx.config.sharedWorkspaceUrl);
-    if (!r.ok) {
-      html(
-        res,
-        502,
-        views.renderMessage({
-          title: "Error",
-          heading: "Could not open workspace",
-          bodyHtml: `<p>Pairing failed:</p><pre>${views.esc(r.detail ?? "unknown error")}</pre>`,
-          backHref: "/admin",
-          error: true,
-        }),
-      );
-      return;
-    }
-    redirect(res, r.url);
     return;
   }
 
@@ -813,13 +651,8 @@ async function handlePost(req, res, url) {
       case "/admin/add-user": {
         if (!validName) return errPage("Invalid user name", "Names must match [a-z0-9-]{2,20}.");
         const limit = actions.assertLimit(form.projectLimit ?? 3);
-        const tsLogin = form.tsLogin ? actions.assertTsLogin(form.tsLogin.trim()) : null;
-        const r = await actions.addUser({ name, tsLogin, projectLimit: limit });
+        const r = await actions.addUser({ name, projectLimit: limit });
         if (!r.ok) return errPage(`Provisioning '${name}' failed`, r.stderr || r.stdout);
-        if (form.sharedAccess === "on" || form.sharedAccess === "true") {
-          const s = await actions.setUserField(name, "sharedAccess", "true");
-          if (!s.ok) return errPage(`User created but sharedAccess failed`, s.stderr || s.stdout);
-        }
         return flashTo(`User '${name}' provisioned.`);
       }
 
@@ -857,65 +690,12 @@ async function handlePost(req, res, url) {
         return flashTo(`Limit for '${name}' set to ${limit}; instance restarted.`);
       }
 
-      case "/admin/set-budget": {
-        if (!validName || !(name in ctx.users)) return errPage("Unknown user", name);
-        const budget = actions.assertBudget(form.budget);
-        const s = await actions.setUserField(name, "monthlyBudgetUsd", budget);
-        if (!s.ok) return errPage("Setting budget failed", s.stderr || s.stdout);
-        return flashTo(
-          budget === 0
-            ? `Budget for '${name}' removed (unlimited).`
-            : `Budget for '${name}' set to $${budget}/month (enforced within ~10 min).`,
-        );
-      }
-
-      case "/admin/set-tslogin": {
-        if (!validName || !(name in ctx.users)) return errPage("Unknown user", name);
-        const login = (form.tsLogin ?? "").trim();
-        if (!login) return errPage("Invalid tailnet login", "Tailnet login cannot be empty.");
-        const s = await actions.setUserField(name, "tsLogin", login);
-        if (!s.ok) return errPage("Setting tailnet login failed", s.stderr || s.stdout);
-        return flashTo(`Tailnet login for '${name}' set to ${login}.`);
-      }
-
       case "/admin/toggle-admin": {
         if (!validName || !(name in ctx.users)) return errPage("Unknown user", name);
         const next = ctx.users[name].admin ? "false" : "true";
         const s = await actions.setUserField(name, "admin", next);
         if (!s.ok) return errPage("Toggle failed", s.stderr || s.stdout);
         return flashTo(`admin flag for '${name}' is now ${next}.`);
-      }
-
-      case "/admin/share-project": {
-        if (!validName || !(name in ctx.users)) return errPage("Unknown user", name);
-        const path = actions.assertSharedPath((form.path ?? "").trim());
-        const r = await actions.shareProject(name, path);
-        if (!r.ok) return errPage("Sharing failed", r.stderr || r.stdout);
-        return flashTo(`Shared '${path}' with '${name}'.`);
-      }
-
-      case "/admin/unshare-project": {
-        if (!validName || !(name in ctx.users)) return errPage("Unknown user", name);
-        const path = actions.assertSharedPath((form.path ?? "").trim());
-        const r = await actions.unshareProject(name, path);
-        if (!r.ok) return errPage("Unsharing failed", r.stderr || r.stdout);
-        return flashTo(`Unshared '${path}' from '${name}'.`);
-      }
-
-      case "/admin/toggle-shared": {
-        if (!validName || !(name in ctx.users)) return errPage("Unknown user", name);
-        const next = ctx.users[name].sharedAccess ? "false" : "true";
-        const s = await actions.setUserField(name, "sharedAccess", next);
-        if (!s.ok) return errPage("Toggle failed", s.stderr || s.stdout);
-        return flashTo(`sharedAccess for '${name}' is now ${next}.`);
-      }
-
-      case "/admin/pair": {
-        if (!validName || !(name in ctx.users)) return errPage("Unknown user", name);
-        const r = await actions.mintUserPairing(name, "1h", { publicHost: ctx.isPublic });
-        if (!r.ok) return errPage("Pairing failed", r.detail);
-        html(res, 200, views.renderPairResult({ name, url: r.url, backHref: "/admin" }));
-        return;
       }
 
       case "/admin/remove-user": {
@@ -929,8 +709,8 @@ async function handlePost(req, res, url) {
               title: "Confirm removal",
               heading: `Remove user '${name}'?`,
               detailHtml:
-                `This stops <code>t3code@${views.esc(name)}</code>, clears its ` +
-                `tailnet mapping and archives its data (never deleted).`,
+                `This stops <code>t3code@${views.esc(name)}</code> and archives ` +
+                `its data (never deleted).`,
               action: "/admin/remove-user",
               fields: [{ name: "name", value: name }],
               confirmLabel: "Remove user",

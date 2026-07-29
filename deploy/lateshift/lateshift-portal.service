@@ -1,6 +1,6 @@
 [Unit]
 Description=LateShift Cloud portal (landing page, work history, admin panel)
-After=network-online.target tailscaled.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]

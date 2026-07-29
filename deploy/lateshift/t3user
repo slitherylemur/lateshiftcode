@@ -2,18 +2,12 @@
 # t3user - LateShift Cloud per-user T3 Code instance provisioning CLI.
 #
 # Usage:
-#   t3user add <name> [--project-limit N] [--admin] [--ts-login LOGIN]
-#                                                     provision + start an instance
+#   t3user add <name> [--project-limit N] [--admin]   provision + start an instance
 #   t3user remove <name> [--force]                    stop instance, archive its data
 #   t3user list                                       show all registered users
 #   t3user set <name> <key> <value>                   update a registry field
-#                                                     (keys: projectLimit, sharedAccess, tsLogin, admin,
-#                                                      monthlyBudgetUsd, providerBudgets[.<provider>[.monthly|.fiveHour]])
-#   t3user pair <name> [--ttl 1h] [--public]          mint a one-time pairing URL
-#                                                     (--public: use https://<name>.lateshiftcloud.com
-#                                                      instead of the tailnet URL)
-#   t3user share <name> <abs-path>                    grant a shared project dir (t3 project add on their instance)
-#   t3user unshare <name> <abs-path>                  revoke a shared project dir
+#                                                     (keys: projectLimit, admin, githubLogin)
+#   t3user pair <name> [--ttl 1h]                     mint a one-time pairing URL
 #
 # State lives under /home/dev/services/lateshift:
 #   users.json           port/user registry (contract consumed by the portal)
@@ -30,21 +24,16 @@ REGISTRY="${LATESHIFT_ROOT}/users.json"
 USERS_DIR="${LATESHIFT_ROOT}/users"
 ARCHIVE_DIR="${LATESHIFT_ROOT}/archive"
 LOCK_FILE="${LATESHIFT_ROOT}/.registry.lock"
-TAILNET_HOST="t3cloud.taild7c97b.ts.net"
-PUBLIC_DOMAIN="lateshiftcloud.com"   # public gateway domain (pair --public)
+PUBLIC_DOMAIN="lateshiftcloud.com"   # public gateway domain
 RENDER_GATEWAY="${LATESHIFT_ROOT}/bin/render-gateway"  # regenerate Caddy user blocks
-# Applies the OWNER git identity + shared credential store to a shared repo
-# (see bin-shared/lsc-shared-git-setup). Called best-effort from the share path.
-SHARED_GIT_SETUP="${LATESHIFT_ROOT}/bin/lsc-shared-git-setup"
 T3_CLI="/usr/bin/t3"
 HEALTH_TIMEOUT_SECS=60
 RESERVED_LOCAL_PORT=3773   # production t3code local port
-RESERVED_TS_PORT=443       # production tailscale serve HTTPS port
 
 die() { echo "t3user: $*" >&2; exit 1; }
 
 usage() {
-    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -68,8 +57,7 @@ ensure_registry() {
         cat > "${REGISTRY}" <<'EOF'
 {
   "users": {},
-  "nextLocalPort": 3780,
-  "nextTsPort": 8460
+  "nextLocalPort": 3780
 }
 EOF
     fi
@@ -84,14 +72,6 @@ validate_name() {
     esac
 }
 
-# Tailnet login identity, e.g. "alice@github" or "alice@example.com".
-validate_ts_login() {
-    local login="$1"
-    [[ "${login}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]] \
-        || die "invalid tsLogin '${login}' (expected user@domain, e.g. alice@github)"
-    (( ${#login} <= 128 )) || die "tsLogin too long"
-}
-
 # registry_py <op> [args...]  -- all registry access goes through python3 (no jq
 # on box). Writes are atomic: temp file in the same directory, fsync, rename.
 registry_py() {
@@ -100,7 +80,6 @@ import json, os, sys, datetime, tempfile
 
 REGISTRY = "/home/dev/services/lateshift/users.json"
 RESERVED_LOCAL = {3773}
-RESERVED_TS = {443}
 op = sys.argv[1]
 args = sys.argv[2:]
 
@@ -131,9 +110,8 @@ def save():
     finally:
         os.close(dfd)
 
-def taken(kind):
-    key = "localPort" if kind == "local" else "tsPort"
-    return {int(u[key]) for u in reg["users"].values()}
+def taken():
+    return {int(u["localPort"]) for u in reg["users"].values()}
 
 def parse_busy(s):
     out = set()
@@ -143,63 +121,15 @@ def parse_busy(s):
             out.add(int(tok))
     return out
 
-# --- provider budgets ---------------------------------------------------------
-# Registry shape (backwards-compatible):
-#   providerBudgets: { "<provider>": <value>, ... }  where <provider> in
-#   {claude, codex} and <value> is EITHER a number (monthly USD cap, legacy
-#   form) OR an object {"monthly": X, "fiveHour": Y}. Absent/0 = unlimited.
-PROVIDERS = ("claude", "codex")
-
-
-def parse_amount(v, label):
-    try:
-        n = float(v)
-    except (TypeError, ValueError):
-        print(f"{label} must be a number", file=sys.stderr)
-        sys.exit(2)
-    if not (0 <= n <= 100000):
-        print(f"{label} must be 0-100000 (0 = unlimited)", file=sys.stderr)
-        sys.exit(2)
-    return round(n, 2)
-
-
-def normalize_provider_value(v, label):
-    """Coerce a per-provider budget into either a rounded number (monthly-only)
-    or a {'monthly': X, 'fiveHour': Y} dict; validate ranges."""
-    if isinstance(v, dict):
-        out = {}
-        m = parse_amount(v.get("monthly", 0), f"{label}.monthly")
-        h = parse_amount(v.get("fiveHour", 0), f"{label}.fiveHour")
-        # Store the compact number form when there is no five-hour cap so the
-        # legacy single-number shape round-trips unchanged.
-        if h == 0:
-            return m
-        out["monthly"] = m
-        out["fiveHour"] = h
-        return out
-    return parse_amount(v, label)
-
-
-def provider_amounts(pb, provider):
-    """Return (monthlyUsd, fiveHourUsd) for a provider from either shape."""
-    v = (pb or {}).get(provider, 0)
-    if isinstance(v, dict):
-        return float(v.get("monthly") or 0), float(v.get("fiveHour") or 0)
-    try:
-        return float(v or 0), 0.0
-    except (TypeError, ValueError):
-        return 0.0, 0.0
-
 if op == "exists":
     sys.exit(0 if args[0] in reg["users"] else 1)
 
 elif op == "alloc":
-    # alloc <busy_local_csv> <busy_ts_csv>
-    # Pick the next free port pair WITHOUT persisting anything. The caller
-    # holds the registry flock for the whole `add`, so the pair stays reserved
+    # alloc <busy_local_csv>
+    # Pick the next free local port WITHOUT persisting anything. The caller
+    # holds the registry flock for the whole `add`, so the port stays reserved
     # until `commit` (or is simply dropped on failure, leaving no state).
-    busy_local = parse_busy(args[0]) | taken("local") | RESERVED_LOCAL
-    busy_ts = parse_busy(args[1]) | taken("ts") | RESERVED_TS
+    busy_local = parse_busy(args[0]) | taken() | RESERVED_LOCAL
     def pick(start, busy):
         p = int(start)
         for _ in range(2000):
@@ -208,42 +138,29 @@ elif op == "alloc":
             p += 1
         print("no free port found within search window", file=sys.stderr)
         sys.exit(2)
-    local_port = pick(reg["nextLocalPort"], busy_local)
-    ts_port = pick(reg["nextTsPort"], busy_ts)
-    print(f"{local_port} {ts_port}")
+    print(pick(reg["nextLocalPort"], busy_local))
 
 elif op == "commit":
-    # commit <name> <localPort> <tsPort> <projectLimit> <admin> <tsLogin>
-    # Persist a user AFTER its instance passed health checks. tsLogin may be
-    # the empty string (stored as null).
-    name, local_port, ts_port = args[0], int(args[1]), int(args[2])
-    project_limit, admin = int(args[3]), args[4] == "true"
-    ts_login = args[5] if len(args) > 5 and args[5] else None
+    # commit <name> <localPort> <projectLimit> <admin>
+    # Persist a user AFTER its instance passed health checks.
+    name, local_port = args[0], int(args[1])
+    project_limit, admin = int(args[2]), args[3] == "true"
     if name in reg["users"]:
         print(f"user '{name}' already present at commit time", file=sys.stderr)
         sys.exit(1)
-    if local_port in RESERVED_LOCAL or ts_port in RESERVED_TS:
+    if local_port in RESERVED_LOCAL:
         print("refusing to commit reserved production port", file=sys.stderr)
         sys.exit(2)
-    if ts_login and any(u.get("tsLogin") == ts_login for u in reg["users"].values()):
-        print(f"tsLogin '{ts_login}' is already mapped to another user", file=sys.stderr)
-        sys.exit(3)
     reg["users"][name] = {
         "localPort": local_port,
-        "tsPort": ts_port,
         "baseDir": f"/home/dev/services/lateshift/users/{name}",
         "projectLimit": project_limit,
-        "sharedAccess": False,
         "admin": admin,
-        "tsLogin": ts_login,
-        "monthlyBudgetUsd": 0,
-        "providerBudgets": {},
-        "sharedProjects": [],
+        "githubLogin": None,
         "createdAt": datetime.datetime.now(datetime.timezone.utc)
             .strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     reg["nextLocalPort"] = max(reg["nextLocalPort"], local_port + 1)
-    reg["nextTsPort"] = max(reg["nextTsPort"], ts_port + 1)
     save()
 
 elif op == "get":
@@ -274,24 +191,11 @@ elif op == "set":
             print("projectLimit must be an integer 0-999", file=sys.stderr)
             sys.exit(2)
         user[key] = int(value)
-    elif key in ("sharedAccess", "admin"):
+    elif key == "admin":
         if value not in ("true", "false"):
             print(f"{key} must be 'true' or 'false'", file=sys.stderr)
             sys.exit(2)
         user[key] = value == "true"
-    elif key == "tsLogin":
-        import re
-        if value == "":
-            user[key] = None
-        else:
-            if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", value) or len(value) > 128:
-                print(f"invalid tsLogin '{value}'", file=sys.stderr)
-                sys.exit(2)
-            for other, u in reg["users"].items():
-                if other != name and u.get("tsLogin") == value:
-                    print(f"tsLogin '{value}' is already mapped to user '{other}'", file=sys.stderr)
-                    sys.exit(3)
-            user[key] = value
     elif key == "githubLogin":
         import re
         if value == "":
@@ -305,138 +209,18 @@ elif op == "set":
                     print(f"githubLogin already mapped to user: {other}", file=sys.stderr)
                     sys.exit(3)
             user[key] = value
-    elif key == "monthlyBudgetUsd":
-        try:
-            n = float(value)
-        except ValueError:
-            print("monthlyBudgetUsd must be a number", file=sys.stderr)
-            sys.exit(2)
-        if not (0 <= n <= 100000):
-            print("monthlyBudgetUsd must be 0-100000 (0 = unlimited)", file=sys.stderr)
-            sys.exit(2)
-        user[key] = round(n, 2)
-    elif key == "providerBudgets" or key.startswith("providerBudgets."):
-        pb = user.setdefault("providerBudgets", {})
-        if not isinstance(pb, dict):
-            pb = {}
-            user["providerBudgets"] = pb
-        parts = key.split(".")
-        if len(parts) == 1:
-            # Whole object as JSON, e.g. '{"claude":20,"codex":{"monthly":30,"fiveHour":8}}'
-            try:
-                obj = json.loads(value)
-            except json.JSONDecodeError:
-                print("providerBudgets must be a JSON object", file=sys.stderr)
-                sys.exit(2)
-            if not isinstance(obj, dict):
-                print("providerBudgets must be a JSON object", file=sys.stderr)
-                sys.exit(2)
-            new = {}
-            for prov, val in obj.items():
-                if prov not in PROVIDERS:
-                    print(f"unknown provider '{prov}' (allowed: {', '.join(PROVIDERS)})", file=sys.stderr)
-                    sys.exit(2)
-                new[prov] = normalize_provider_value(val, f"providerBudgets.{prov}")
-            user["providerBudgets"] = new
-        elif len(parts) == 2:
-            prov = parts[1]
-            if prov not in PROVIDERS:
-                print(f"unknown provider '{prov}' (allowed: {', '.join(PROVIDERS)})", file=sys.stderr)
-                sys.exit(2)
-            # value may be a bare number (monthly) or a JSON object {monthly,fiveHour}
-            try:
-                parsed = json.loads(value)
-            except json.JSONDecodeError:
-                parsed = value
-            pb[prov] = normalize_provider_value(parsed, f"providerBudgets.{prov}")
-        elif len(parts) == 3:
-            prov, sub = parts[1], parts[2]
-            if prov not in PROVIDERS:
-                print(f"unknown provider '{prov}' (allowed: {', '.join(PROVIDERS)})", file=sys.stderr)
-                sys.exit(2)
-            if sub not in ("monthly", "fiveHour"):
-                print(f"unknown budget field '{sub}' (allowed: monthly, fiveHour)", file=sys.stderr)
-                sys.exit(2)
-            m, h = provider_amounts(pb, prov)
-            amt = parse_amount(value, f"providerBudgets.{prov}.{sub}")
-            if sub == "monthly":
-                m = amt
-            else:
-                h = amt
-            pb[prov] = m if h == 0 else {"monthly": m, "fiveHour": h}
-        else:
-            print(f"invalid providerBudgets key '{key}'", file=sys.stderr)
-            sys.exit(2)
     else:
-        print(f"key '{key}' is not settable (allowed: projectLimit, sharedAccess, tsLogin, githubLogin, admin, monthlyBudgetUsd, providerBudgets[.<provider>[.<monthly|fiveHour>]])", file=sys.stderr)
+        print(f"key '{key}' is not settable (allowed: projectLimit, admin, githubLogin)", file=sys.stderr)
         sys.exit(2)
     save()
 
-elif op == "share":
-    # share <name> <abs-path> — record a shared project grant (idempotent).
-    name, path = args[0], args[1]
-    user = reg["users"].get(name)
-    if user is None:
-        print(f"user '{name}' not found", file=sys.stderr)
-        sys.exit(1)
-    shared = user.setdefault("sharedProjects", [])
-    if path not in shared:
-        shared.append(path)
-        save()
-
-elif op == "unshare":
-    # unshare <name> <abs-path> — drop a shared project grant (idempotent).
-    name, path = args[0], args[1]
-    user = reg["users"].get(name)
-    if user is None:
-        print(f"user '{name}' not found", file=sys.stderr)
-        sys.exit(1)
-    shared = user.setdefault("sharedProjects", [])
-    if path in shared:
-        shared.remove(path)
-        save()
-
-elif op == "shares":
-    # shares <name> — print grants one per line.
-    user = reg["users"].get(args[0])
-    if user is None:
-        sys.exit(1)
-    for p in user.get("sharedProjects", []):
-        print(p)
-
-elif op == "envlimits":
-    # envlimits <name> — emit the LSC_* budget env lines for instance.env.
-    # All values are USD; 0 = unlimited. The fork enforces per-provider caps;
-    # LSC_LIMIT_TOTAL_USD mirrors monthlyBudgetUsd (budget-check reads the
-    # registry directly, but the total is exported for the fork's convenience).
-    name = args[0]
-    user = reg["users"].get(name)
-    if user is None:
-        sys.exit(1)
-    pb = user.get("providerBudgets") or {}
-    claude_m, claude_h = provider_amounts(pb, "claude")
-    codex_m, codex_h = provider_amounts(pb, "codex")
-    total = float(user.get("monthlyBudgetUsd") or 0)
-
-    def fmt(x):
-        # Integer-valued amounts print without a trailing ".0"; keep cents otherwise.
-        return str(int(x)) if float(x).is_integer() else f"{x:.2f}"
-
-    print(f"LSC_USER_NAME={name}")
-    print(f"LSC_LIMIT_TOTAL_USD={fmt(total)}")
-    print(f"LSC_LIMIT_CLAUDE_USD={fmt(claude_m)}")
-    print(f"LSC_LIMIT_CODEX_USD={fmt(codex_m)}")
-    print(f"LSC_LIMIT_CLAUDE_5H_USD={fmt(claude_h)}")
-    print(f"LSC_LIMIT_CODEX_5H_USD={fmt(codex_h)}")
-
 elif op == "list":
-    fmt = "{:<20} {:>9} {:>7} {:>13} {:>6} {:>6}  {:<28} {}"
-    print(fmt.format("NAME", "LOCALPORT", "TSPORT", "PROJECTLIMIT", "SHARED", "ADMIN", "TSLOGIN", "CREATED"))
+    fmt = "{:<20} {:>9} {:>13} {:>6}  {:<28} {}"
+    print(fmt.format("NAME", "LOCALPORT", "PROJECTLIMIT", "ADMIN", "GITHUBLOGIN", "CREATED"))
     for name, u in sorted(reg["users"].items()):
-        print(fmt.format(name, u["localPort"], u["tsPort"], u["projectLimit"],
-                         "yes" if u["sharedAccess"] else "no",
+        print(fmt.format(name, u["localPort"], u["projectLimit"],
                          "yes" if u["admin"] else "no",
-                         u.get("tsLogin") or "-", u["createdAt"]))
+                         u.get("githubLogin") or "-", u["createdAt"]))
 
 else:
     print(f"unknown registry op: {op}", file=sys.stderr)
@@ -448,17 +232,6 @@ PYEOF
 listening_ports_csv() {
     ss -ltnH 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' \
         | grep -E '^[0-9]+$' | sort -un | paste -sd, - || true
-}
-
-# CSV of HTTPS ports currently mapped by tailscale serve (443 implied when
-# the URL carries no explicit port).
-serve_ports_csv() {
-    {
-        tailscale serve status 2>/dev/null \
-            | grep -oE '^https://[^ ]+' \
-            | sed -E 's|^https://[^:/]+:?([0-9]*).*|\1|' \
-            | sed 's/^$/443/'
-    } | grep -E '^[0-9]+$' | sort -un | paste -sd, - || true
 }
 
 wait_for_health() {
@@ -494,16 +267,13 @@ verify_unit_owns_port() {
     return 1
 }
 
-# Roll back a failed `add`: stop/disable the unit, clear its serve mapping,
-# delete the directory this invocation created. The registry was never
-# touched (commit happens only after health), so nothing to undo there.
+# Roll back a failed `add`: stop/disable the unit and delete the directory this
+# invocation created. The registry was never touched (commit happens only after
+# health), so nothing to undo there.
 rollback_add() {
-    local name="$1" ts_port="$2" created_dir="$3"
+    local name="$1" created_dir="$2"
     echo "rolling back failed provision of '${name}' ..." >&2
     sudo systemctl disable --now "t3code@${name}.service" >/dev/null 2>&1 || true
-    if [[ -n "${ts_port}" ]] && (( ts_port != RESERVED_TS_PORT )); then
-        sudo tailscale serve --https="${ts_port}" off 2>/dev/null || true
-    fi
     # Safe: this exact path was verified absent at the start of this add and
     # created by this invocation; the instance never became healthy.
     if [[ -n "${created_dir}" && -d "${created_dir}" ]]; then
@@ -512,60 +282,44 @@ rollback_add() {
 }
 
 cmd_add() {
-    local name="" project_limit=3 admin=false ts_login=""
+    local name="" project_limit=3 admin=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --project-limit) project_limit="${2:?--project-limit needs a value}"; shift 2 ;;
             --admin) admin=true; shift ;;
-            --ts-login) ts_login="${2:?--ts-login needs a value}"; shift 2 ;;
             -*) die "unknown flag for add: $1" ;;
             *) [[ -n "${name}" ]] && die "unexpected argument: $1"; name="$1"; shift ;;
         esac
     done
-    [[ -n "${name}" ]] || die "usage: t3user add <name> [--project-limit N] [--admin] [--ts-login LOGIN]"
+    [[ -n "${name}" ]] || die "usage: t3user add <name> [--project-limit N] [--admin]"
     validate_name "${name}"
     [[ "${project_limit}" =~ ^[0-9]+$ ]] || die "--project-limit must be a number"
-    [[ -n "${ts_login}" ]] && validate_ts_login "${ts_login}"
 
     if registry_py exists "${name}"; then
         die "user '${name}' already exists (refusing to re-add)"
     fi
     [[ -e "${USERS_DIR}/${name}" ]] && die "base dir ${USERS_DIR}/${name} already exists; resolve manually"
 
-    # Allocate ports (no registry write yet; the held flock reserves the pair
+    # Allocate the local port (no registry write yet; the held flock reserves it
     # for the duration of this add). Skips listening ports, existing registry
-    # entries, live tailscale serve mappings, and production's 3773/443.
-    local ports
-    ports=$(registry_py alloc "$(listening_ports_csv)" "$(serve_ports_csv),$(listening_ports_csv)") \
-        || die "port allocation failed"
-    local local_port ts_port
-    read -r local_port ts_port <<< "${ports}"
+    # entries, and production's 3773.
+    local local_port
+    local_port=$(registry_py alloc "$(listening_ports_csv)") || die "port allocation failed"
     local_port=$(normalize_port "${local_port}") || die "allocator returned bad local port"
-    ts_port=$(normalize_port "${ts_port}") || die "allocator returned bad ts port"
     (( local_port != RESERVED_LOCAL_PORT )) || die "allocator returned reserved local port ${RESERVED_LOCAL_PORT}"
-    (( ts_port != RESERVED_TS_PORT )) || die "allocator returned reserved HTTPS port ${RESERVED_TS_PORT}"
 
     local base_dir="${USERS_DIR}/${name}"
     mkdir -p "${base_dir}"
     cat > "${base_dir}/instance.env" <<EOF
 # LateShift Cloud instance config for '${name}' (consumed by t3code@${name}.service)
 T3CODE_INSTANCE_PORT=${local_port}
-TS_SERVE_PORT=${ts_port}
 T3CODE_MAX_PROJECTS=${project_limit}
-# Budget limits (USD; 0 = unlimited). Rewritten by 't3user set' on any budget
-# change; the patched fork reads these for per-provider enforcement. New users
-# start with no budgets, so every limit is 0 (unlimited) here.
 LSC_USER_NAME=${name}
-LSC_LIMIT_TOTAL_USD=0
-LSC_LIMIT_CLAUDE_USD=0
-LSC_LIMIT_CODEX_USD=0
-LSC_LIMIT_CLAUDE_5H_USD=0
-LSC_LIMIT_CODEX_5H_USD=0
 EOF
 
-    echo "provisioning '${name}': local port ${local_port}, tailnet HTTPS port ${ts_port}"
+    echo "provisioning '${name}': local port ${local_port}"
     if ! sudo systemctl enable --now "t3code@${name}.service"; then
-        rollback_add "${name}" "${ts_port}" "${base_dir}"
+        rollback_add "${name}" "${base_dir}"
         die "systemctl enable --now t3code@${name} failed; rolled back (registry untouched)"
     fi
 
@@ -574,37 +328,23 @@ EOF
         echo "FAILED"
         echo "instance did not become healthy within ${HEALTH_TIMEOUT_SECS}s; recent logs:" >&2
         sudo journalctl -u "t3code@${name}" -n 20 --no-pager >&2 || true
-        rollback_add "${name}" "${ts_port}" "${base_dir}"
+        rollback_add "${name}" "${base_dir}"
         die "provision failed; rolled back (registry untouched)"
     fi
     if ! verify_unit_owns_port "${name}" "${local_port}"; then
-        rollback_add "${name}" "${ts_port}" "${base_dir}"
+        rollback_add "${name}" "${base_dir}"
         die "port ${local_port} answered but is not owned by t3code@${name}; rolled back (registry untouched)"
     fi
 
     # Instance is healthy and verified: persist it to the registry (atomic write).
-    registry_py commit "${name}" "${local_port}" "${ts_port}" "${project_limit}" "${admin}" "${ts_login}" \
-        || { rollback_add "${name}" "${ts_port}" "${base_dir}"; die "registry commit failed; rolled back"; }
-
-    # Best-effort tailnet reachability check (warn only: tailscale serve can
-    # lag a moment, and local health is the provisioning gate).
-    local ts_code
-    ts_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://${TAILNET_HOST}:${ts_port}/" || true)
-    if [[ "${ts_code}" != "200" ]]; then
-        sleep 3
-        ts_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://${TAILNET_HOST}:${ts_port}/" || true)
-    fi
-    if [[ "${ts_code}" == "200" ]]; then
-        echo "tailnet endpoint healthy (HTTP 200 on https://${TAILNET_HOST}:${ts_port}/)"
-    else
-        echo "warning: https://${TAILNET_HOST}:${ts_port}/ returned '${ts_code:-none}'; check 'tailscale serve status'" >&2
-    fi
+    registry_py commit "${name}" "${local_port}" "${project_limit}" "${admin}" \
+        || { rollback_add "${name}" "${base_dir}"; die "registry commit failed; rolled back"; }
 
     systemctl status "t3code@${name}" --no-pager -n 0 | head -6 || true
     echo
     echo "user '${name}' is up:"
     echo "  local:   http://127.0.0.1:${local_port}/"
-    echo "  tailnet: https://${TAILNET_HOST}:${ts_port}/"
+    echo "  public:  https://${name}.${PUBLIC_DOMAIN}/"
     echo "  pair:    t3user pair ${name}"
 
     # Sync the public gateway's per-user Caddy blocks (best-effort; the tailnet
@@ -625,14 +365,6 @@ cmd_remove() {
     validate_name "${name}"
     registry_py exists "${name}" || die "user '${name}' not found"
 
-    local ts_port_raw ts_port=""
-    ts_port_raw=$(registry_py get "${name}" tsPort)
-    if ! ts_port=$(normalize_port "${ts_port_raw}"); then
-        ${force} || die "registry tsPort '${ts_port_raw}' for '${name}' is invalid; refusing (use --force to skip serve cleanup)"
-        echo "warning: invalid tsPort '${ts_port_raw}'; skipping tailscale serve cleanup" >&2
-        ts_port=""
-    fi
-
     echo "stopping and disabling t3code@${name} ..."
     if ! sudo systemctl disable --now "t3code@${name}.service"; then
         if ${force}; then
@@ -644,12 +376,6 @@ cmd_remove() {
 
     # Clear any residual failed state so a removed user leaves no unit debris.
     sudo systemctl reset-failed "t3code@${name}.service" 2>/dev/null || true
-
-    # Clear the tailscale serve mapping this instance created. Numeric guard:
-    # never touch production's HTTPS 443.
-    if [[ -n "${ts_port}" ]] && (( ts_port != RESERVED_TS_PORT )); then
-        sudo tailscale serve --https="${ts_port}" off 2>/dev/null || true
-    fi
 
     if [[ -d "${USERS_DIR}/${name}" ]]; then
         # Collision-safe archive destination: UTC timestamp + nanoseconds, and
@@ -672,39 +398,9 @@ cmd_list() {
     registry_py list
 }
 
-# Atomically rewrite the LSC_* budget block in a user's instance.env from the
-# registry. Preserves all non-LSC lines (ports, T3CODE_MAX_PROJECTS). Values
-# come from registry_py envlimits (single source of truth). Mirrors the
-# projectLimit rewrite: temp file in the same dir, atomic rename. The instance
-# must be restarted for the fork to pick up new limits (never auto-restarted).
-write_instance_limits() {
-    local name="$1" env_file lines tmp
-    env_file="$(registry_py get "${name}" baseDir)/instance.env"
-    if [[ ! -f "${env_file}" ]]; then
-        echo "warning: ${env_file} not found; registry updated but no instance.env to rewrite" >&2
-        return 0
-    fi
-    lines="$(registry_py envlimits "${name}")" || die "failed to render env limits for '${name}'"
-    tmp="$(mktemp "${env_file}.tmp.XXXXXX")"
-    # Drop any existing LSC_* lines, keep everything else, then append the
-    # freshly rendered block.
-    grep -vE '^(LSC_USER_NAME|LSC_LIMIT_TOTAL_USD|LSC_LIMIT_CLAUDE_USD|LSC_LIMIT_CODEX_USD|LSC_LIMIT_CLAUDE_5H_USD|LSC_LIMIT_CODEX_5H_USD)=' "${env_file}" > "${tmp}" || true
-    printf '%s\n' "${lines}" >> "${tmp}"
-    mv "${tmp}" "${env_file}"
-    echo "updated budget limits in ${env_file}; restart t3code@${name} to apply"
-}
-
 # set <name> <key> <value> — update one registry field. For projectLimit the
-# instance.env T3CODE_MAX_PROJECTS line is rewritten too; for budget keys the
-# LSC_* block is rewritten. The caller must restart t3code@<name> for changes
-# to take effect.
-#
-# providerBudgets CLI shapes (all validated in registry_py):
-#   t3user set <n> providerBudgets.claude 20              # claude monthly = $20
-#   t3user set <n> providerBudgets.claude.monthly 20      # same, explicit
-#   t3user set <n> providerBudgets.claude.fiveHour 5      # claude 5h window = $5
-#   t3user set <n> providerBudgets.codex '{"monthly":30,"fiveHour":8}'
-#   t3user set <n> providerBudgets '{"claude":20,"codex":{"monthly":30,"fiveHour":8}}'
+# instance.env T3CODE_MAX_PROJECTS line is rewritten too. The caller must
+# restart t3code@<name> for changes to take effect.
 cmd_set() {
     [[ $# -eq 3 ]] || die "usage: t3user set <name> <key> <value>"
     local name="$1" key="$2" value="$3"
@@ -715,34 +411,16 @@ cmd_set() {
         projectLimit)
             [[ "${value}" =~ ^[0-9]{1,3}$ ]] || die "projectLimit must be an integer 0-999"
             ;;
-        sharedAccess|admin)
+        admin)
             [[ "${value}" == "true" || "${value}" == "false" ]] || die "${key} must be 'true' or 'false'"
-            ;;
-        tsLogin)
-            [[ -n "${value}" ]] && validate_ts_login "${value}"
             ;;
         githubLogin)
             [[ -z "${value}" || "${value}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]] || die "invalid githubLogin"
             ;;
-        monthlyBudgetUsd)
-            [[ "${value}" =~ ^[0-9]+(\.[0-9]{1,2})?$ ]] || die "monthlyBudgetUsd must be a number (0 = unlimited)"
-            ;;
-        providerBudgets|providerBudgets.*)
-            # Shape/provider/amount validation happens in registry_py (JSON and
-            # numeric parsing live there); nothing to pre-check here.
-            ;;
-        *) die "key '${key}' is not settable (allowed: projectLimit, sharedAccess, tsLogin, githubLogin, admin, monthlyBudgetUsd, providerBudgets[.<provider>[.<monthly|fiveHour>]])" ;;
+        *) die "key '${key}' is not settable (allowed: projectLimit, admin, githubLogin)" ;;
     esac
 
     registry_py set "${name}" "${key}" "${value}"
-
-    # Budget changes rewrite the LSC_* block (which always includes
-    # LSC_USER_NAME and LSC_LIMIT_TOTAL_USD) atomically.
-    case "${key}" in
-        monthlyBudgetUsd|providerBudgets|providerBudgets.*)
-            write_instance_limits "${name}"
-            ;;
-    esac
 
     if [[ "${key}" == "projectLimit" ]]; then
         local env_file
@@ -767,89 +445,22 @@ cmd_set() {
     echo "set ${name}.${key} = ${value}"
 }
 
-# Validate a shared-project path: absolute, exists, and under an allowed root.
-# Realpath resolution prevents symlink/.. escapes out of the allowed roots.
-validate_shared_path() {
-    local path="$1" real
-    [[ "${path}" == /* ]] || die "shared project path must be absolute"
-    real=$(realpath -e "${path}" 2>/dev/null) || die "path '${path}' does not exist"
-    case "${real}" in
-        /home/dev/shared/*|/home/dev/projects/*) ;;
-        *) die "shared projects must live under /home/dev/shared/ or /home/dev/projects/ (got ${real})" ;;
-    esac
-    [[ -d "${real}" ]] || die "'${real}' is not a directory"
-    echo "${real}"
-}
-
-cmd_share() {
-    [[ $# -eq 2 ]] || die "usage: t3user share <name> <abs-path>"
-    local name="$1" path real base_dir
-    validate_name "${name}"
-    registry_py exists "${name}" || die "user '${name}' not found"
-    real=$(validate_shared_path "$2")
-    base_dir=$(registry_py get "${name}" baseDir)
-
-    "${T3_CLI}" project add "${real}" --base-dir "${base_dir}" \
-        || die "t3 project add failed for '${real}' on ${name}'s instance"
-    registry_py share "${name}" "${real}"
-    # Shared repos: everyone uses their own GitHub identity; the owner
-    # auto-invites the sharee as a push collaborator on the repo (they must
-    # accept the GitHub invite). Best-effort: an invite failure must not
-    # fail the share itself.
-    case "${real}" in
-        /home/dev/shared/*)
-            local gh_login
-            gh_login=$(registry_py get "${name}" githubLogin 2>/dev/null || true)
-            if [[ -n "${gh_login}" && "${gh_login}" != "None" && -x "${LATESHIFT_ROOT}/bin/lsc-shared-collab" ]]; then
-                "${LATESHIFT_ROOT}/bin/lsc-shared-collab" "${real}" "${gh_login}" \
-                    || echo "t3user: warning: collaborator invite failed for '${name}' on '${real}'; add them manually on GitHub" >&2
-            else
-                echo "t3user: note: '${name}' has no githubLogin set; add them as a GitHub collaborator manually once they connect GitHub" >&2
-            fi
-            ;;
-    esac
-    echo "shared '${real}' with '${name}'"
-}
-
-cmd_unshare() {
-    [[ $# -eq 2 ]] || die "usage: t3user unshare <name> <abs-path>"
-    local name="$1" path real base_dir
-    validate_name "${name}"
-    registry_py exists "${name}" || die "user '${name}' not found"
-    # Resolve without -e: the target dir may already be gone; fall back to raw.
-    real=$(realpath -m "$2" 2>/dev/null || echo "$2")
-    base_dir=$(registry_py get "${name}" baseDir)
-
-    "${T3_CLI}" project remove "${real}" --base-dir "${base_dir}" \
-        || echo "warning: t3 project remove failed (project may not be registered); clearing grant anyway" >&2
-    registry_py unshare "${name}" "${real}"
-    echo "unshared '${real}' from '${name}'"
-}
-
 cmd_pair() {
-    local name="" ttl="1h" public=false
+    local name="" ttl="1h"
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --ttl) ttl="${2:?--ttl needs a value}"; shift 2 ;;
-            --public) public=true; shift ;;
             -*) die "unknown flag for pair: $1" ;;
             *) [[ -n "${name}" ]] && die "unexpected argument: $1"; name="$1"; shift ;;
         esac
     done
-    [[ -n "${name}" ]] || die "usage: t3user pair <name> [--ttl 1h] [--public]"
+    [[ -n "${name}" ]] || die "usage: t3user pair <name> [--ttl 1h]"
     validate_name "${name}"
     registry_py exists "${name}" || die "user '${name}' not found"
 
-    local base_dir ts_port base_url
+    local base_dir base_url
     base_dir=$(registry_py get "${name}" baseDir)
-    ts_port=$(normalize_port "$(registry_py get "${name}" tsPort)") || die "registry tsPort for '${name}' is invalid"
-
-    # Default: tailnet URL. --public: the public gateway hostname (Cloudflare).
-    if ${public}; then
-        base_url="https://${name}.${PUBLIC_DOMAIN}"
-    else
-        base_url="https://${TAILNET_HOST}:${ts_port}"
-    fi
+    base_url="https://${name}.${PUBLIC_DOMAIN}"
 
     "${T3_CLI}" auth pairing create \
         --base-dir "${base_dir}" \
@@ -862,7 +473,7 @@ main() {
     [[ $# -ge 1 ]] || usage 1
     local cmd="$1"; shift
     case "${cmd}" in
-        add|remove|pair|list|set|share|unshare)
+        add|remove|pair|list|set)
             # Serialize ALL registry access (reads included) across concurrent
             # invocations; lock is taken before first-time registry creation.
             mkdir -p "${LATESHIFT_ROOT}"

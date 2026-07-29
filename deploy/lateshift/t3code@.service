@@ -1,6 +1,6 @@
 [Unit]
 Description=T3 Code instance for user %i (LateShift Cloud)
-After=network-online.target tailscaled.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -42,17 +42,13 @@ ProtectHome=read-only
 
 # Writable carve-outs (the ONLY paths an instance may modify):
 #   - its own base dir (all instance state: userdata, projects, worktrees, caches)
-#   - the shared collaboration root
 #   - the shared agent credential/state dirs (claude/codex write sessions,
 #     caches and refreshed OAuth tokens here — see README tradeoffs)
-#   - /run/tailscale so the server can (re)configure `tailscale serve`
 ReadWritePaths=/home/dev/services/lateshift/users/%i
-ReadWritePaths=/home/dev/shared
 ReadWritePaths=/home/dev/.claude
 ReadWritePaths=/home/dev/.claude.json
 ReadWritePaths=/home/dev/.codex
 ReadWritePaths=/home/dev/.cache
-ReadWritePaths=/run/tailscale
 
 # Private /tmp and /var/tmp per instance (no cross-instance tmp leakage).
 PrivateTmp=yes

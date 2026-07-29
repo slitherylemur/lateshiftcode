@@ -431,32 +431,3 @@ export function removePendingToken(login) {
   writePendingTokens(map);
   return true;
 }
-
-// ---------------------------------------------------------------- notify
-
-/**
- * Fire-and-forget email via Resend when a new signup request lands. Never
- * throws; silently skips when resendApiKey is unconfigured.
- */
-export async function notifySignup(config, { login, name }) {
-  if (!config.resendApiKey || !config.notifyEmail) return;
-  try {
-    const safeLogin = String(login);
-    const safeName = name ? String(name) : "(no name)";
-    await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${config.resendApiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        from: "LateShift Cloud <onboarding@resend.dev>",
-        to: [config.notifyEmail],
-        subject: `LateShift Cloud: access request from ${safeLogin}`,
-        text: `A new GitHub user requested access to LateShift Cloud.\n\nLogin: ${safeLogin}\nName: ${safeName}\n\nApprove or deny in the admin panel.`,
-      }),
-    });
-  } catch {
-    // Notification failures must never break signup.
-  }
-}

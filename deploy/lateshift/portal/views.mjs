@@ -63,23 +63,6 @@ function intFmt(n) {
   return num.toLocaleString("en-US");
 }
 
-// "in 2h 14m" style countdown to a future epoch-ms instant.
-function untilLabel(ms) {
-  const diff = Number(ms) - Date.now();
-  if (!Number.isFinite(diff) || diff <= 0) return "now";
-  const mins = Math.round(diff / 60000);
-  if (mins < 60) return `${mins}m`;
-  const h = Math.floor(mins / 60);
-  const rm = mins % 60;
-  return rm ? `${h}h ${rm}m` : `${h}h`;
-}
-
-function clockUtc(ms) {
-  const d = new Date(Number(ms));
-  if (Number.isNaN(d.getTime())) return "—";
-  return `${d.toISOString().slice(11, 16)} UTC`;
-}
-
 const CSS = `
   :root {
     --bg: #0b0e14;
@@ -378,30 +361,6 @@ const CSS = `
   .center-page { max-width: 520px; margin: 40px auto 0; }
   .yesno { font-size: 13px; }
 
-  /* ---- Subscription totals (rings + window bars) ---- */
-  .sub-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
-  .sub-card { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 18px; }
-  .sub-head { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
-  .sub-head .name { font-weight: 650; font-size: 15px; }
-  .sub-body { display: flex; align-items: center; gap: 18px; }
-  .ring {
-    position: relative; width: 96px; height: 96px; border-radius: 50%; flex: none;
-    background: conic-gradient(var(--pc, var(--accent)) calc(var(--pct, 0) * 1%), var(--ring-track) 0);
-  }
-  .ring.over { background: conic-gradient(var(--red) calc(var(--pct, 0) * 1%), var(--ring-track) 0); }
-  .ring::before { content: ""; position: absolute; inset: 11px; border-radius: 50%; background: var(--surface-2); }
-  .ring .ring-pct { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 16px; }
-  .sub-meta { flex: 1; min-width: 0; }
-  .sub-meta .big { font-size: 20px; font-weight: 650; letter-spacing: -0.01em; }
-  .sub-meta .cap { font-size: 12.5px; color: var(--muted); }
-  .window { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
-  .window .wrow { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 12.5px; }
-  .window .wrow .amt { font-weight: 650; font-size: 13.5px; }
-  .bar { height: 8px; border-radius: 999px; background: var(--ring-track); overflow: hidden; margin-top: 7px; }
-  .bar > span { display: block; height: 100%; background: var(--pc, var(--accent)); }
-  .bar.over > span { background: var(--red); }
-  .approx { font-size: 11.5px; color: var(--muted); margin-top: 8px; }
-
   /* ---- Master / detail admin layout ---- */
   .admin-grid { display: grid; grid-template-columns: 300px 1fr; gap: 20px; align-items: start; }
   @media (max-width: 860px) { .admin-grid { grid-template-columns: 1fr; } }
@@ -425,26 +384,6 @@ const CSS = `
   .setting-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
   .setting { display: flex; flex-direction: column; gap: 6px; }
   .setting .k { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
-
-  /* Share manager switches */
-  .share-list { list-style: none; margin: 0; padding: 0; }
-  .share-list li { display: flex; align-items: center; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--border); }
-  .share-list li:last-child { border-bottom: none; }
-  .share-list .sp-name { flex: 1; min-width: 0; }
-  .share-list .sp-name .sub { display: block; font-size: 11.5px; color: var(--muted); word-break: break-all; }
-  .switch { display: inline-flex; align-items: center; gap: 8px; background: none; border: none; padding: 0; cursor: pointer; font: inherit; color: var(--muted); }
-  .switch .track {
-    width: 40px; height: 22px; border-radius: 999px; background: var(--ring-track);
-    border: 1px solid var(--border-strong); position: relative; transition: background 120ms ease;
-  }
-  .switch .track::after {
-    content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
-    background: var(--muted); transition: transform 120ms ease, background 120ms ease;
-  }
-  .switch.on .track { background: var(--accent); border-color: var(--accent); }
-  .switch.on .track::after { transform: translateX(18px); background: var(--accent-ink); }
-  .switch .lbl { font-size: 12px; min-width: 26px; text-align: left; }
-  .switch.on .lbl { color: var(--accent); }
 
   /* Leaderboard */
   .lb { list-style: none; margin: 0; padding: 0; }
@@ -592,18 +531,7 @@ export function renderHero({ identityLogin, githubEnabled } = {}) {
 
 // 2) User dashboard.
 export function renderDashboard(props) {
-  const {
-    csrf,
-    identity,
-    user,
-    instanceStatus,
-    projects,
-    usage,
-    isAdmin,
-    budgetPaused,
-    monthCostUsd,
-    github,
-  } = props;
+  const { identity, user, instanceStatus, projects, usage, isAdmin, github } = props;
 
   const githubCard = `<div class="card">
     <h2>GitHub</h2>
@@ -621,44 +549,8 @@ export function renderDashboard(props) {
     links: isAdmin ? [{ href: "/admin", label: "Admin" }] : [],
   });
 
-  const pausedBanner = budgetPaused
-    ? `<div class="banner banner-warn">Your workspace is paused: this month's usage
-       (${esc(money(budgetPaused.monthCostUsd))}) reached your
-       ${esc(money(budgetPaused.monthlyBudgetUsd))} budget. It resumes automatically
-       next month, or ask your admin to raise the budget.</div>`
-    : "";
-
-  const budgetLine =
-    user.monthlyBudgetUsd > 0
-      ? `<p class="muted" style="margin:10px 0 0;font-size:13px">This month:
-         ${esc(money(monthCostUsd ?? 0))} of ${esc(money(user.monthlyBudgetUsd))} budget.</p>`
-      : "";
-
-  const sharedProjectsHtml = user.sharedProjects?.length
-    ? `<div class="card">
-        <h2>Shared projects</h2>
-        <ul class="shared-list">
-          ${user.sharedProjects
-            .map((p) => `<li><span class="path mono">${esc(p)}</span></li>`)
-            .join("")}
-        </ul>
-        <p class="muted" style="font-size:13px;margin:12px 0 0">These appear inside your workspace. Work in worktree mode to avoid clashing with teammates in the same project.</p>
-      </div>`
-    : "";
-
-  const openForms = `<div class="actions-row">
-    <form method="POST" action="/open" class="inline">
-      ${hiddenInput("csrf", csrf)}
-      <button type="submit" class="btn btn-primary btn-big">Open my workspace</button>
-    </form>
-    ${
-      user.sharedAccess
-        ? `<form method="POST" action="/open-shared" class="inline">
-      ${hiddenInput("csrf", csrf)}
-      <button type="submit" class="btn btn-big">Open shared Roblox workspace</button>
-    </form>`
-        : ""
-    }
+  const openLink = `<div class="actions-row">
+    <a class="btn btn-primary btn-big" href="https://${esc(user.name)}.lateshiftcloud.com/">Open my workspace</a>
   </div>`;
 
   const usageHtml = usage
@@ -706,23 +598,19 @@ export function renderDashboard(props) {
   const body = `<main class="container">
     <div class="greeting">
       <h1 style="margin:0">Welcome back, ${esc(user.name)}</h1>
-      ${statusChip(budgetPaused ? "paused (budget)" : instanceStatus)}
+      ${statusChip(instanceStatus)}
     </div>
-    ${pausedBanner}
 
     <div class="card">
       <h2>Workspace</h2>
-      ${openForms}
+      ${openLink}
     </div>
 
     ${githubCard}
 
-    ${sharedProjectsHtml}
-
     <div class="card">
       <h2>Usage</h2>
       ${usageHtml}
-      ${budgetLine}
     </div>
 
     <div class="section-title">Work history</div>
@@ -734,82 +622,8 @@ export function renderDashboard(props) {
 
 // ---- admin sub-renderers ------------------------------------------------
 
-const PROVIDERS = [
-  { key: "claude", label: "Claude", color: "var(--accent)" },
-  { key: "codex", label: "Codex", color: "var(--info)" },
-];
-
-function ring(pct, color) {
-  const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
-  const over = Number(pct) > 100;
-  const shown = pct == null ? "—" : `${Math.round(Number(pct))}%`;
-  return `<div class="ring${over ? " over" : ""}" style="--pct:${clamped};--pc:${color}">
-    <div class="ring-pct">${esc(shown)}</div>
-  </div>`;
-}
-
-function renderSubscription(subscription) {
-  const { totals, windows, limits } = subscription;
-  const cards = PROVIDERS.map((p) => {
-    const color = p.color;
-    const monthCost = Number(totals[p.key] || 0);
-    const monthCap = limits[p.key];
-    const monthPct = monthCap ? (monthCost / monthCap) * 100 : null;
-
-    const w = windows[p.key];
-    const winCost = w ? Number(w.cost || 0) : 0;
-    const winCap = limits[`${p.key}5h`];
-    const winPct = winCap ? Math.min(100, (winCost / winCap) * 100) : winCost > 0 ? 100 : 0;
-    const winOver = winCap ? winCost > winCap : false;
-    const resetHtml = w
-      ? `resets in ${esc(untilLabel(w.reset))} · ${esc(clockUtc(w.reset))}`
-      : "no activity yet";
-
-    const capLine = monthCap
-      ? `<span class="cap">of ${esc(money(monthCap))} / mo cap</span>`
-      : `<span class="cap">no monthly cap set</span>`;
-
-    return `<div class="sub-card">
-      <div class="sub-head">
-        <span class="sdot" style="background:${color};box-shadow:none"></span>
-        <span class="name">${esc(p.label)}</span>
-      </div>
-      <div class="sub-body">
-        ${ring(monthPct, color)}
-        <div class="sub-meta">
-          <div class="big">${esc(money(monthCost))}</div>
-          ${capLine}
-          <div class="cap" style="margin-top:4px">month-to-date, all instances</div>
-        </div>
-      </div>
-      <div class="window">
-        <div class="wrow">
-          <span>Current 5-hour window</span>
-          <span class="amt">${esc(money(winCost))}${winCap ? ` <span class="muted">/ ${esc(money(winCap))}</span>` : ""}</span>
-        </div>
-        <div class="bar${winOver ? " over" : ""}" style="--pc:${color}"><span style="width:${winPct}%"></span></div>
-        <div class="wrow" style="margin-top:6px"><span class="muted">${resetHtml}</span></div>
-      </div>
-      <div class="approx">Approximate — 5-hour windows are inferred from turn activity across all instances.</div>
-    </div>`;
-  }).join("");
-
-  const otherTotal = Number(totals.other || 0);
-  const otherLine =
-    otherTotal > 0
-      ? `<p class="muted" style="font-size:12.5px;margin:14px 0 0">Other providers this month: ${esc(money(otherTotal))}.</p>`
-      : "";
-
-  return `<div class="card">
-    <h2>Subscription usage</h2>
-    <div class="sub-grid">${cards}</div>
-    ${otherLine}
-  </div>`;
-}
-
 function userSdot(u) {
   if (u.isSelf) return "self";
-  if (u.budgetPaused) return "bad";
   if (u.instanceStatus === "active") return "ok";
   if (u.instanceStatus === "failed") return "bad";
   return "";
@@ -843,71 +657,6 @@ function renderUserList(users, self, selectedKey, csrf) {
   </div>`;
 }
 
-function workspaceCard(self, csrf) {
-  if (!self.workspaceConfigured) {
-    return `<div class="card">
-      <h2>Your workspace</h2>
-      <p class="muted" style="margin:0">The shared production workspace URL is not configured.</p>
-    </div>`;
-  }
-  return `<div class="card">
-    <h2>Your workspace</h2>
-    <p class="muted" style="margin:0 0 14px">Open your own LateShift workspace, or the shared production workspace. A one-time pairing link is minted and you are redirected into it.</p>
-    <div class="actions-row">
-      <form method="POST" action="/admin/open-workspace" class="inline">
-        ${hiddenInput("csrf", csrf)}
-        <button type="submit" class="btn btn-primary btn-big">Open my workspace</button>
-      </form>
-      <form method="POST" action="/admin/open-workspace" class="inline">
-        ${hiddenInput("csrf", csrf)}
-        ${hiddenInput("shared", "1")}
-        <button type="submit" class="btn btn-big">Open production workspace</button>
-      </form>
-    </div>
-  </div>`;
-}
-
-function shareManager(user, sharedDirs, csrf, { readOnly = false } = {}) {
-  if (!sharedDirs.length) {
-    return `<div class="card">
-      <h2>Share manager</h2>
-      <p class="muted" style="margin:0">No shareable projects — nothing under <code>/home/dev/shared/</code> yet.</p>
-    </div>`;
-  }
-  const granted = new Set(user?.sharedProjects ?? []);
-  const rows = sharedDirs
-    .map((d) => {
-      const on = readOnly ? true : granted.has(d.path);
-      if (readOnly) {
-        return `<li>
-          <span class="sp-name">${esc(d.name)}<span class="sub mono">${esc(d.path)}</span></span>
-          <span class="switch on" aria-hidden="true"><span class="track"></span><span class="lbl">all</span></span>
-        </li>`;
-      }
-      const action = on ? "/admin/unshare-project" : "/admin/share-project";
-      return `<li>
-        <span class="sp-name">${esc(d.name)}<span class="sub mono">${esc(d.path)}</span></span>
-        <form method="POST" action="${action}" class="inline">
-          ${hiddenInput("name", user.name)}
-          ${hiddenInput("path", d.path)}
-          ${hiddenInput("csrf", csrf)}
-          <button type="submit" class="switch ${on ? "on" : ""}" title="${on ? "Revoke access" : "Grant access"}">
-            <span class="track"></span><span class="lbl">${on ? "on" : "off"}</span>
-          </button>
-        </form>
-      </li>`;
-    })
-    .join("");
-  const note = readOnly
-    ? `<p class="muted" style="font-size:12.5px;margin:12px 0 0">As admin you have access to every shared project.</p>`
-    : `<p class="muted" style="font-size:12.5px;margin:12px 0 0">Toggling grants or revokes the project in <code>${esc(user.name)}</code>'s workspace immediately (via <code>t3user share/unshare</code>).</p>`;
-  return `<div class="card">
-    <h2>Share manager</h2>
-    <ul class="share-list">${rows}</ul>
-    ${note}
-  </div>`;
-}
-
 function userSettingsCard(u, csrf) {
   return `<div class="card">
     <h2>Settings</h2>
@@ -922,34 +671,7 @@ function userSettingsCard(u, csrf) {
         </form>
       </div>
       <div class="setting">
-        <span class="k">Monthly budget (USD)</span>
-        <form method="POST" action="/admin/set-budget" class="row" style="gap:8px">
-          ${hiddenInput("name", u.name)}
-          ${hiddenInput("csrf", csrf)}
-          <input type="number" name="budget" min="0" max="100000" step="0.01" value="${esc(u.monthlyBudgetUsd || 0)}" class="narrow" style="width:90px">
-          <button type="submit" class="btn btn-sm">Set</button>
-        </form>
-        <span class="k" style="text-transform:none;font-weight:500;color:var(--muted)">${u.monthlyBudgetUsd > 0 ? `${esc(money(u.monthCostUsd ?? 0))} used this month` : "unlimited"}</span>
-      </div>
-      <div class="setting">
-        <span class="k">Tailnet login</span>
-        <form method="POST" action="/admin/set-tslogin" class="row" style="gap:8px">
-          ${hiddenInput("name", u.name)}
-          ${hiddenInput("csrf", csrf)}
-          <input type="text" name="tsLogin" value="${esc(u.tsLogin ?? "")}" placeholder="user@example.com" style="flex:1;min-width:150px">
-          <button type="submit" class="btn btn-sm">Set</button>
-        </form>
-      </div>
-      <div class="setting">
         <span class="k">Flags</span>
-        <div class="row" style="gap:8px">
-          <span class="yesno">Shared access: <strong>${u.sharedAccess ? "yes" : "no"}</strong></span>
-          <form method="POST" action="/admin/toggle-shared" class="inline">
-            ${hiddenInput("name", u.name)}
-            ${hiddenInput("csrf", csrf)}
-            <button type="submit" class="btn btn-sm">Toggle</button>
-          </form>
-        </div>
         <div class="row" style="gap:8px">
           <span class="yesno">Admin: <strong>${u.admin ? "yes" : "no"}</strong></span>
           <form method="POST" action="/admin/toggle-admin" class="inline">
@@ -963,22 +685,17 @@ function userSettingsCard(u, csrf) {
   </div>`;
 }
 
-function pairAndDangerCard(u, csrf) {
+function lifecycleCard(u, csrf) {
   return `<div class="card">
-    <h2>Access &amp; lifecycle</h2>
+    <h2>Lifecycle</h2>
     <div class="row" style="gap:12px">
-      <form method="POST" action="/admin/pair" class="inline">
-        ${hiddenInput("name", u.name)}
-        ${hiddenInput("csrf", csrf)}
-        <button type="submit" class="btn">Generate pairing link</button>
-      </form>
       <form method="POST" action="/admin/remove-user" class="inline">
         ${hiddenInput("name", u.name)}
         ${hiddenInput("csrf", csrf)}
         <button type="submit" class="btn btn-danger">Remove user…</button>
       </form>
     </div>
-    <p class="muted" style="font-size:12.5px;margin:12px 0 0">Ports <code>${esc(u.localPort)}</code> / <code>${esc(u.tsPort)}</code> · 30-day spend ${u.cost30dUsd != null ? esc(money(u.cost30dUsd)) : "—"}.</p>
+    <p class="muted" style="font-size:12.5px;margin:12px 0 0">Port <code>${esc(u.localPort)}</code> · 30-day spend ${u.cost30dUsd != null ? esc(money(u.cost30dUsd)) : "—"}.</p>
   </div>`;
 }
 
@@ -993,15 +710,13 @@ function githubStatusLine(github) {
 }
 
 function renderDetail(props) {
-  const { users, self, selectedKey, sharedDirs, csrf } = props;
+  const { users, self, selectedKey, csrf } = props;
 
   // Admin's own account with no registry user of their own.
   if (selectedKey === "@self" && !self.present) {
     return `<div>
       <div class="detail-title"><h2>${esc(self.login || "Your account")}</h2><span class="badge-you">you · admin</span></div>
-      <p class="muted" style="margin:0 0 20px">Your admin account has no separate LateShift workspace of its own — you work in the shared production workspace.</p>
-      ${workspaceCard(self, csrf)}
-      ${shareManager(null, sharedDirs, csrf, { readOnly: true })}
+      <p class="muted" style="margin:0 0 20px">Your admin account has no LateShift workspace of its own.</p>
     </div>`;
   }
 
@@ -1012,22 +727,15 @@ function renderDetail(props) {
 
   const selfBadge = u.isSelf ? '<span class="badge-you">you</span>' : "";
   const adminBadge = u.admin ? '<span class="badge-admin">admin</span>' : "";
-  const statusHtml = statusChip(u.budgetPaused ? "paused (budget)" : u.instanceStatus);
-  const selfWorkspace = u.isSelf ? workspaceCard(self, csrf) : "";
-  const share = u.isSelf
-    ? shareManager(u, sharedDirs, csrf, { readOnly: true })
-    : shareManager(u, sharedDirs, csrf);
+  const statusHtml = statusChip(u.instanceStatus);
 
   return `<div>
     <div class="detail-title">
       <h2>${esc(u.name)}</h2>${adminBadge}${selfBadge}${statusHtml}
     </div>
-    <p class="muted" style="margin:0 0 20px">${u.tsLogin ? `Tailnet: ${esc(u.tsLogin)}` : "No tailnet login mapped."}</p>
     ${githubStatusLine(u.github)}
-    ${selfWorkspace}
     ${userSettingsCard(u, csrf)}
-    ${pairAndDangerCard(u, csrf)}
-    ${share}
+    ${lifecycleCard(u, csrf)}
   </div>`;
 }
 
@@ -1067,16 +775,8 @@ function addUserCard(csrf) {
           <input type="text" id="au-name" name="name" pattern="[a-z0-9-]{2,20}" required>
         </div>
         <div class="field">
-          <label for="au-tslogin">Tailnet login</label>
-          <input type="text" id="au-tslogin" name="tsLogin" placeholder="user@github or email">
-        </div>
-        <div class="field">
           <label for="au-limit">Project limit</label>
           <input type="number" id="au-limit" name="projectLimit" value="3" min="0" max="999" class="narrow">
-        </div>
-        <div class="field" style="flex-direction:row;align-items:center;gap:7px;padding-bottom:9px">
-          <input type="checkbox" id="au-shared" name="sharedAccess">
-          <label for="au-shared">Shared access</label>
         </div>
         <button type="submit" class="btn btn-primary">Create user</button>
       </div>
@@ -1085,7 +785,7 @@ function addUserCard(csrf) {
   </div>`;
 }
 
-// 3) Admin page — master/detail with subscription totals and leaderboard.
+// 3) Admin page — master/detail with the usage leaderboard.
 // Awaiting-approval page shown to an unknown GitHub user after OAuth.
 export function renderAwaitingApproval({ login, name, avatar, denied } = {}) {
   const who = name ? `${esc(name)} (@${esc(login)})` : `@${esc(login)}`;
@@ -1155,8 +855,6 @@ export function renderAdmin(props) {
     users,
     self,
     selectedKey,
-    sharedDirs,
-    subscription,
     leaderboard,
     aggregate,
     flash,
@@ -1175,13 +873,11 @@ export function renderAdmin(props) {
       <div class="stat"><div class="label">Total cost (30d)</div><div class="value">${esc(money(aggregate.totalCost30dUsd))}</div></div>
     </div>
 
-    ${renderSubscription(subscription)}
-
     ${renderPending(pending, csrf)}
 
     <div class="admin-grid">
       ${renderUserList(users, self, selectedKey, csrf)}
-      ${renderDetail({ users, self, selectedKey, sharedDirs, csrf })}
+      ${renderDetail({ users, self, selectedKey, csrf })}
     </div>
 
     ${renderLeaderboard(leaderboard)}
@@ -1220,38 +916,6 @@ export function renderConfirm({
     </div>
   </main>`;
   return layout({ title: `${title} — LateShift Cloud`, body, navHtml: nav() });
-}
-
-// 5) Pairing-link result page.
-export function renderPairResult({ name, url, backHref }) {
-  const body = `<main class="container">
-    <div class="card center-page">
-      <h1>Pairing link for ${esc(name)}</h1>
-      <code class="paste-box" id="pair-url">${esc(url)}</code>
-      <p class="muted" style="font-size:13.5px">This link is one-time and expires soon. Send it to the user over a trusted channel.</p>
-      <div class="row">
-        <button type="button" class="btn" id="copy-btn">Copy</button>
-        <a class="nav-link" href="${esc(backHref)}">Back</a>
-      </div>
-    </div>
-  </main>`;
-  const extraScript = `
-<script>
-(function () {
-  var btn = document.getElementById('copy-btn');
-  if (!navigator.clipboard || !navigator.clipboard.writeText) {
-    btn.style.display = 'none';
-    return;
-  }
-  btn.addEventListener('click', function () {
-    navigator.clipboard.writeText(document.getElementById('pair-url').textContent).then(function () {
-      btn.textContent = 'Copied';
-      setTimeout(function () { btn.textContent = 'Copy'; }, 1500);
-    }).catch(function () {});
-  });
-})();
-</script>`;
-  return layout({ title: "Pairing link — LateShift Cloud", body, navHtml: nav(), extraScript });
 }
 
 // 6) Generic message/result page.

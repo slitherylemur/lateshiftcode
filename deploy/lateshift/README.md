@@ -14,19 +14,17 @@ t3code.service                     production instance (DO NOT TOUCH)
 t3code@<user>.service              one templated unit per LateShift user
   runs: bin/run-instance.sh <user>
     -> node .../bin.mjs serve --base-dir /home/dev/services/lateshift/users/<user>
-         --port $T3CODE_INSTANCE_PORT --tailscale-serve --tailscale-serve-port $TS_SERVE_PORT
-  port 3780+ ->  tailscale serve HTTPS 8460+
+         --port $T3CODE_INSTANCE_PORT
+  port 3780+ ->  reached only through the Caddy gateway on 127.0.0.1:8880
 ```
 
 - Each user gets a fully isolated T3 base dir at
   `/home/dev/services/lateshift/users/<user>` (all state under `userdata/`).
-- Local HTTP ports are allocated sequentially from **3780**; tailnet HTTPS
-  ports from **8460**. Port **3773** and HTTPS **443** are reserved for
-  production and are guarded against in both the launcher and the registry.
-- The server itself configures `tailscale serve` for its HTTPS port on startup
-  (via `--tailscale-serve --tailscale-serve-port`). One HTTPS port maps to one
-  backend, root path only.
-- Tailnet hostname: `t3cloud.taild7c97b.ts.net`.
+- Local HTTP ports are allocated sequentially from **3780**. Port **3773** is
+  reserved for production and is guarded against in both the launcher and the
+  registry.
+- LateShift makes **no** use of Tailscale. `tailscaled` still runs on the box
+  for production's `tailscale serve` 443 mapping only; nothing here touches it.
 
 ## Files
 
@@ -56,45 +54,29 @@ temp file in the same directory, `fsync`, atomic rename.
   "users": {
     "<name>": {
       "localPort": 3780,
-      "tsPort": 8460,
       "baseDir": "/home/dev/services/lateshift/users/<name>",
       "projectLimit": 3,
-      "sharedAccess": false,
       "admin": false,
-      "tsLogin": "alice@github",
-      "monthlyBudgetUsd": 0,
-      "providerBudgets": { "claude": 20, "codex": { "monthly": 30, "fiveHour": 8 } },
-      "sharedProjects": ["/home/dev/shared/demo-shared"],
+      "githubLogin": "alice",
       "createdAt": "2026-07-27T00:00:00Z"
     }
   },
-  "nextLocalPort": 3781,
-  "nextTsPort": 8461
+  "nextLocalPort": 3781
 }
 ```
 
 - `localPort` — 127.0.0.1 HTTP port the instance binds.
-- `tsPort` — HTTPS port on the tailnet (`https://t3cloud.taild7c97b.ts.net:<tsPort>/`).
 - `baseDir` — the instance's `--base-dir`.
 - `projectLimit` — mirrored into `instance.env` as `T3CODE_MAX_PROJECTS`.
-- `sharedAccess` — reserved: whether the user can see shared Roblox project dirs.
 - `admin` — portal admin flag.
-- `tsLogin` — tailnet identity mapped to this instance (unique across users).
-- `monthlyBudgetUsd` — total monthly USD cap enforced by `bin/budget-check`
-  (0 = unlimited; see "Budgets" below). Mirrored to `instance.env` as
-  `LSC_LIMIT_TOTAL_USD`.
-- `providerBudgets` — per-provider USD caps (see "Budgets"). Each provider
-  value is **either** a number (monthly cap, legacy shape) **or**
-  `{ "monthly": X, "fiveHour": Y }`. Absent/0 = unlimited. Mirrored to
-  `instance.env` as `LSC_LIMIT_{CLAUDE,CODEX}_USD` and `LSC_LIMIT_{CLAUDE,CODEX}_5H_USD`.
-- `sharedProjects` — absolute paths granted to this user via `t3user share`
-  (registered as projects on the user's own instance).
-- `nextLocalPort` / `nextTsPort` — allocator cursors. Allocation starts at the
-  cursor and skips ports that are reserved (3773/443), already in registry
-  entries, currently listening (`ss -ltn`), or mapped by `tailscale serve`;
-  cursors only advance past committed ports, so ports of removed users are
-  not reused. All port values are numerically normalized (leading zeros/`+`
-  stripped, 1-65535 enforced) before any comparison or use.
+- `githubLogin` — the GitHub OAuth login mapped to this workspace (the sole
+  identity system).
+- `nextLocalPort` — allocator cursor. Allocation starts at the cursor and skips
+  ports that are reserved (3773), already in registry entries, or currently
+  listening (`ss -ltn`); the cursor only advances past committed ports, so
+  ports of removed users are not reused. Port values are numerically
+  normalized (leading zeros/`+` stripped, 1-65535 enforced) before any
+  comparison or use.
 
 ## `instance.env`
 
@@ -102,24 +84,14 @@ Consumed by `t3code@<name>.service` via `EnvironmentFile=`:
 
 ```
 T3CODE_INSTANCE_PORT=3780   # local HTTP port
-TS_SERVE_PORT=8460          # tailnet HTTPS port
 T3CODE_MAX_PROJECTS=3       # per-user project limit (unset/0/invalid = unlimited)
 T3CODE_SERVER_ROOT=...      # optional: override the server build checkout
-# Budget limits (USD; 0 = unlimited). Written by t3user on add and on any
-# budget `set`; the patched fork reads them for per-provider enforcement.
-LSC_USER_NAME=alice         # the user's name (always written)
-LSC_LIMIT_TOTAL_USD=0       # = monthlyBudgetUsd (always written)
-LSC_LIMIT_CLAUDE_USD=0      # claude monthly cap
-LSC_LIMIT_CODEX_USD=0       # codex monthly cap
-LSC_LIMIT_CLAUDE_5H_USD=0   # claude 5-hour rolling-window cap
-LSC_LIMIT_CODEX_5H_USD=0    # codex 5-hour rolling-window cap
+LSC_USER_NAME=alice         # the user's name (written on add)
 ```
 
-The CLI takes flags rather than env vars, so `run-instance.sh` translates the
-port/limit vars into `--port` / `--tailscale-serve-port` and execs node. The
-`LSC_*` budget vars are consumed by the patched fork (not by `run-instance.sh`).
-`t3user` rewrites only the `LSC_*` block (and, separately, `T3CODE_MAX_PROJECTS`)
-atomically; restart the instance to apply changes.
+The CLI takes flags rather than env vars, so `run-instance.sh` translates
+`T3CODE_INSTANCE_PORT` into `--port` and execs node. `t3user` rewrites
+`T3CODE_MAX_PROJECTS` atomically on `set`; restart the instance to apply.
 
 ## Server build (patched fork)
 
@@ -179,124 +151,16 @@ never double-count. Ledger writes are fail-open: an insert failure is
 logged and never breaks turn ingestion, so gaps are possible if the DB is
 unhealthy.
 
-## Shared projects
+## `/home/dev/shared`
 
-`/home/dev/shared/` is the single **share root** — the one place shared
-collaboration project dirs live (it is a writable carve-out inside every
-instance's sandbox). `t3user share <name> <abs-path>` grants a directory to a
-user by running `t3 project add <path> --base-dir <their base dir>` on their own
-instance and recording the grant in `sharedProjects`; `unshare` reverses it.
-Grants are **per-user** — sharing a dir with one user never exposes it to
-another. Paths must resolve (via `realpath`) under `/home/dev/shared/` or
-`/home/dev/projects/`.
-
-Notable contents:
-
-- `/home/dev/shared/skyjourney-cloud` — relocated here from
-  `/home/dev/projects/`; still a normal git repo (remote
-  `github.com/slitherylemur/skyjourney-cloud`). Its production registration was
-  re-pointed to this path via `t3 project add`/`delete`. Granted to `slither`
-  only.
-- `/home/dev/shared/demo-shared` — demo shared dir.
-
-The admin's personal scratch area is simply their own instance's default
-project area (nothing extra is provisioned for it).
-
-### Shared-repo git identity (owner override)
-
-Per-instance GitHub identity (above) is right for a user's **own** repos, but a
-checkout under `/home/dev/shared/` is opened by **several** users' instances at
-once. By the owner's decision, git activity in shared repos is attributed to,
-and pushed as, the **owner** (`slitherylemur`) rather than each sharer — the AI
-chat is visible to every sharer anyway, so per-person attribution there adds
-nothing, and it means **no teammate needs push rights** to the owner's repos.
-
-This is enforced with **local (per-repo) git config**, which overrides the
-per-instance `GIT_CONFIG_GLOBAL` inside every sandbox:
-
-- `user.name` = `slitherylemur`, `user.email` =
-  `67226924+slitherylemur@users.noreply.github.com` (owner's GitHub no-reply,
-  id from the public API).
-- `credential.helper` is **reset** (an empty helper clears the inherited list,
-  including the per-instance `gh` helper) and set to **only**
-  `store --file=/home/dev/shared/.lsc-git-credentials`, so pushes use the
-  shared owner token regardless of who the sandbox's `gh` CLI is logged in as.
-  `gh` itself stays per-user (it reads `GH_CONFIG_DIR`, not git's helpers).
-
-`bin/lsc-shared-git-setup <repo-dir>` applies this (idempotent) and is called
-**best-effort** by `t3user share` for any granted path under `/home/dev/shared`
-(a failure — e.g. the path is not a git repo — warns but never fails the share).
-
-**The shared token** lives in `/home/dev/shared/.lsc-git-credentials`
-(git-credential-store format, `https://x-access-token:<TOKEN>@github.com`, mode
-`600` `dev:dev`, created **empty**; pushes fail until a token is installed).
-The owner installs it with:
-
-```sh
-/home/dev/services/lateshift/bin/lsc-shared-git-token <token>
-# or, to be prompted (input hidden):
-/home/dev/services/lateshift/bin/lsc-shared-git-token
-```
-
-It validates the token against `api.github.com/user` (rejecting an invalid one
-with no write) and stores it atomically at mode `600`.
-
-> **Security tradeoff — read this.** `/home/dev/shared` is a `ReadWritePath` in
-> **every** sharer's sandbox, so **any sharer's instance can read this token**.
-> Whatever the token can do, every sharer can do. Use a GitHub **fine-grained
-> PAT scoped to only the shared repositories**, granting only *Contents:
-> read/write* and *Pull requests: read/write*. Do **not** use a classic PAT or
-> any account-wide token here — a leak would expose far more than the shared
-> repos.
-
-## Budgets
-
-Two independent budget mechanisms:
-
-1. **Total monthly cap** (`monthlyBudgetUsd`) — enforced by `bin/budget-check`
-   (runs every 10 min from `lateshift-budget.timer`). Over budget → the whole
-   instance is **paused** (`systemctl stop` + a `BUDGET_PAUSED` marker); back
-   under budget → resumed. This is a hard stop of the instance and is unchanged
-   by the per-provider work below.
-2. **Per-provider caps** (`providerBudgets`) — a monthly cap and/or a 5-hour
-   rolling-window cap per provider (`claude`, `codex`). These are **enforced
-   inside the patched fork**, not by stopping the instance (the underlying
-   subscriptions throttle in 5-hour windows, so a soft per-provider cap is more
-   useful than a box-wide pause). `budget-check` never reads these.
-
-`t3user` mirrors every budget value into the user's `instance.env` on `add` and
-on any budget `set`, then you restart the instance to apply:
-
-| instance.env var          | source                                    |
-| ------------------------- | ----------------------------------------- |
-| `LSC_USER_NAME`           | the user name (always)                    |
-| `LSC_LIMIT_TOTAL_USD`     | `monthlyBudgetUsd` (always)               |
-| `LSC_LIMIT_CLAUDE_USD`    | `providerBudgets.claude` monthly          |
-| `LSC_LIMIT_CODEX_USD`     | `providerBudgets.codex` monthly           |
-| `LSC_LIMIT_CLAUDE_5H_USD` | `providerBudgets.claude` fiveHour         |
-| `LSC_LIMIT_CODEX_5H_USD`  | `providerBudgets.codex` fiveHour          |
-
-All values are USD; `0` (or absent) means unlimited.
-
-### Setting per-provider budgets
-
-The registry value for a provider is **either** a bare number (monthly cap,
-backward-compatible shape) **or** an object `{"monthly": X, "fiveHour": Y}`.
-`t3user set` accepts all of these paths (validated in the CLI):
-
-```sh
-t3user set alice providerBudgets.claude 20             # claude monthly = $20
-t3user set alice providerBudgets.claude.monthly 20     # same, explicit
-t3user set alice providerBudgets.claude.fiveHour 5     # claude 5-hour window = $5
-t3user set alice providerBudgets.codex '{"monthly":30,"fiveHour":8}'
-t3user set alice providerBudgets '{"claude":20,"codex":{"monthly":30,"fiveHour":8}}'
-```
-
-- Providers are limited to `claude` and `codex`; sub-fields to `monthly` /
-  `fiveHour`; amounts to `0`-`100000`. A provider whose `fiveHour` is `0`
-  stores as the compact bare-number form (so the legacy shape round-trips).
-- Each accepted `set` rewrites the `LSC_*` block in `instance.env`; **restart
-  the instance** (`sudo systemctl restart t3code@<name>`) to apply.
+`/home/dev/shared/` still holds the collaboration repos that were placed there
+under the previous design, but **there is no sharing mechanism in this tree
+any more**: the `sharedProjects` registry grants, `t3user share/unshare`, the
+shared owner-identity git config, the shared PAT at `.lsc-git-credentials` and
+the portal's share manager are all deleted, and `/home/dev/shared` is no longer
+a `ReadWritePaths` carve-out in the instance sandbox. Shared workspaces are
+re-introduced by W6 (see `docs/architecture-v2.md` §5) as per-project UNIX
+accounts and groups. The data under `/home/dev/shared` was left untouched.
 
 ## Sandbox
 
@@ -322,10 +186,8 @@ production `t3code.service` is a separate unit and is **not** affected.
 
 - `/home/dev/services/lateshift/users/%i` — the instance's own base dir (all
   its state: `userdata`, `projects`, `worktrees`, `caches`).
-- `/home/dev/shared` — the shared collaboration root.
 - `/home/dev/.claude`, `/home/dev/.claude.json`, `/home/dev/.codex`,
   `/home/dev/.cache` — agent credential/state dirs (see tradeoffs).
-- `/run/tailscale` — so the server can (re)configure `tailscale serve`.
 - Network is unrestricted; `/tmp` and `/var/tmp` are private per instance
   (`PrivateTmp=yes`).
 
@@ -379,8 +241,8 @@ workspace's git author identity. After that, `git clone`/`push` and the `gh`
 CLI work against your own repos, and commits are authored as you. The helper is
 exposed on every instance's `PATH` from
 `/home/dev/services/lateshift/instance-bin/` (a dedicated dir holding only
-user-facing tools; the admin `bin/` with `t3user`/`budget-check` is **not** on
-the instance PATH).
+user-facing tools; the admin `bin/` with `t3user` is **not** on the instance
+PATH).
 
 > **Migration caveat (one-time).** The previous shared `slitherylemur` identity
 > is gone: after this change, **existing instances (`slither`, `testuser`) can
@@ -414,38 +276,31 @@ instances end to end (pairing-token exchange → wsTicket → WebSocket RPC). Se
 ## `t3user` CLI
 
 ```
-t3user add <name> [--project-limit N] [--admin] [--ts-login LOGIN]
+t3user add <name> [--project-limit N] [--admin]
                                                  # provision + enable + start + health-wait
 t3user remove <name> [--force]                   # stop+disable unit, archive base dir (no rm -rf of live data)
 t3user list                                      # table of registered users
 t3user set <name> <key> <value>                  # update a registry field (see below)
-t3user share <name> <abs-path>                   # grant a shared project dir (t3 project add on their instance)
-t3user unshare <name> <abs-path>                 # revoke a shared project dir
-t3user pair <name> [--ttl 1h]                    # one-time pairing URL for the instance
+t3user pair <name> [--ttl 1h]                    # one-time pairing URL for the instance (admin/debug only)
 ```
 
-`set` keys: `projectLimit`, `sharedAccess`, `admin`, `tsLogin`,
-`monthlyBudgetUsd`, and `providerBudgets[.<provider>[.monthly|.fiveHour]]`
-(see "Budgets"). `projectLimit` and any budget key rewrite `instance.env`
-atomically; restart the instance to apply.
+`set` keys: `projectLimit`, `admin`, `githubLogin`. `projectLimit` rewrites
+`instance.env` atomically; restart the instance to apply.
 
 - Names must match `[a-z0-9-]{2,20}`; `add` refuses existing users; extra
   positional arguments are rejected on every subcommand.
 - `add` only commits to `users.json` after the instance is healthy: unit
   `is-active`, local HTTP 200, and the listening PID confirmed inside the
-  unit's cgroup. On any failure it stops/disables the unit, clears the serve
-  mapping, deletes the just-created dir, and exits nonzero with the registry
-  untouched (the flock held across the whole `add` keeps the port pair
-  reserved meanwhile). After commit it also probes the tailnet HTTPS URL and
-  warns (does not fail) if unreachable.
+  unit's cgroup. On any failure it stops/disables the unit, deletes the
+  just-created dir, and exits nonzero with the registry untouched (the flock
+  held across the whole `add` keeps the port reserved meanwhile).
 - `remove` aborts before archiving/deregistering if `systemctl disable --now`
   fails, unless `--force` is given. It archives to
   `/home/dev/services/lateshift/archive/<name>-<utc-ts>-<nanos>` (fails rather
-  than overwrite an existing destination) and clears the instance's
-  `tailscale serve` HTTPS mapping (numerically guarded to never touch 443).
+  than overwrite an existing destination).
 - `pair` uses `t3 auth pairing create` with
-  `--base-url https://t3cloud.taild7c97b.ts.net:<tsPort>` (works via direct
-  SQLite access while the instance runs).
+  `--base-url https://<name>.lateshiftcloud.com`. Pairing is no longer part of
+  any user-facing flow — sign-in is GitHub OAuth through the portal.
 
 ## Resource caps
 

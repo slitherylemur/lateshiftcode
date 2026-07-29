@@ -7,7 +7,7 @@
 // probing sqlite_master first.
 
 import { DatabaseSync } from "node:sqlite";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 
 function withDb(dbPath, fn, fallback) {
   if (!dbPath || !existsSync(dbPath)) return fallback;
@@ -160,9 +160,6 @@ export function readCostThisMonth(dbPath) {
 // portal charges against: "claude", "codex", or "other". The turn_usage column
 // is provider_name (e.g. "claudeAgent", "codex"); normalize defensively.
 
-/** Fixed subscription session-window length: 5 hours, in ms. */
-export const WINDOW_MS = 5 * 60 * 60 * 1000;
-
 export function normalizeProvider(name) {
   const s = String(name || "").toLowerCase();
   if (s.includes("claude") || s.includes("anthropic")) return "claude";
@@ -197,85 +194,4 @@ export function readMonthProviderCost(dbPath) {
     },
     { claude: 0, codex: 0, other: 0, total: 0 },
   );
-}
-
-/**
- * Individual turns since an instant, as {bucket, ts (ms), cost}. Used to build
- * a fleet-wide, per-provider view by concatenating across instances and then
- * running computeProviderWindows() over the merged array.
- */
-export function readProviderTurns(dbPath, sinceIso) {
-  return withDb(
-    dbPath,
-    (db) => {
-      if (!hasTable(db, "turn_usage")) return [];
-      const rows = db
-        .prepare(
-          `SELECT provider_name AS p, total_cost_usd AS c, completed_at AS t
-             FROM turn_usage WHERE completed_at >= ? AND completed_at IS NOT NULL`,
-        )
-        .all(sinceIso);
-      const out = [];
-      for (const r of rows) {
-        const ts = Date.parse(r.t);
-        if (Number.isNaN(ts)) continue;
-        out.push({ bucket: normalizeProvider(r.p), ts, cost: Number(r.c) || 0 });
-      }
-      return out;
-    },
-    [],
-  );
-}
-
-/**
- * Fleet-wide current 5-hour session window per provider bucket.
- *
- * Semantics (must match the budget-check / dashboard agents): fixed 5-hour
- * blocks, re-anchored at the first turn that follows >= 5 hours of inactivity
- * for that provider across ALL instances combined. From the anchor, time is
- * partitioned into fixed 5h blocks; the "current" block is the one containing
- * `now`. usage = summed cost of turns since the current block start; reset =
- * block start + 5h. This is an APPROXIMATION of the provider's real limiter.
- *
- * @param turns array of {bucket, ts, cost} (any order, any providers)
- * @returns { claude|codex|other: {cost, blockStart, reset} | null }
- */
-export function computeProviderWindows(turns, now = Date.now()) {
-  const byBucket = { claude: [], codex: [], other: [] };
-  for (const t of turns) {
-    (byBucket[t.bucket] ??= []).push(t);
-  }
-  const result = {};
-  for (const [bucket, arr] of Object.entries(byBucket)) {
-    if (!arr.length) {
-      result[bucket] = null;
-      continue;
-    }
-    arr.sort((a, b) => a.ts - b.ts);
-    let anchor = arr[0].ts;
-    for (let i = 1; i < arr.length; i++) {
-      if (arr[i].ts - arr[i - 1].ts >= WINDOW_MS) anchor = arr[i].ts;
-    }
-    const blockIndex = Math.max(0, Math.floor((now - anchor) / WINDOW_MS));
-    const blockStart = anchor + blockIndex * WINDOW_MS;
-    const reset = blockStart + WINDOW_MS;
-    let cost = 0;
-    for (const t of arr) if (t.ts >= blockStart) cost += t.cost;
-    result[bucket] = { cost, blockStart, reset };
-  }
-  return result;
-}
-
-/** Budget-pause marker written by bin/budget-check, or null. */
-export function readBudgetPaused(baseDir) {
-  try {
-    const raw = JSON.parse(readFileSync(`${baseDir}/BUDGET_PAUSED`, "utf8"));
-    return {
-      pausedAt: raw.pausedAt ?? null,
-      monthCostUsd: Number(raw.monthCostUsd ?? 0),
-      monthlyBudgetUsd: Number(raw.monthlyBudgetUsd ?? 0),
-    };
-  } catch {
-    return null;
-  }
 }
