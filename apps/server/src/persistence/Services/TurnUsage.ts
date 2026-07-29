@@ -25,6 +25,7 @@ export const TurnUsageRecord = Schema.Struct({
   inputTokens: Schema.NullOr(Schema.Int),
   outputTokens: Schema.NullOr(Schema.Int),
   cachedInputTokens: Schema.NullOr(Schema.Int),
+  cacheCreationInputTokens: Schema.NullOr(Schema.Int),
   reasoningOutputTokens: Schema.NullOr(Schema.Int),
   durationMs: Schema.NullOr(Schema.Int),
   usageJson: Schema.NullOr(Schema.String),

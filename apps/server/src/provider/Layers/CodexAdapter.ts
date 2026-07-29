@@ -40,6 +40,12 @@ import * as EffectCodexSchema from "effect-codex-app-server/schema";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import { getCodexServiceTierOptionValue } from "../../codexModelOptions.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+// LateShift (architecture-v2 section 4 / W3-B): Codex `turn.completed` carries
+// no usage payload upstream, so every Codex turn writes an all-NULL turn_usage
+// ledger row and the shared-pool leaderboard is systematically wrong in
+// Claude's favour. The tracker below folds `thread/tokenUsage/updated` into the
+// completing turn. Fork-owned module; no upstream code is modified by it.
+import { attachCodexTurnUsage, makeCodexTurnUsageTracker } from "../../lateshift/codexTurnUsage.ts";
 
 import {
   ProviderAdapterRequestError,
@@ -1447,10 +1453,18 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ),
         );
 
+        // One tracker per session: events for this thread arrive in order on
+        // this stream, which is exactly the ordering the tracker assumes.
+        const turnUsageTracker = makeCodexTurnUsageTracker();
+
         const eventFiber = yield* Stream.runForEach(runtime.events, (event) =>
           Effect.gen(function* () {
             yield* writeNativeEvent(event);
-            const runtimeEvents = mapToRuntimeEvents(event, event.threadId);
+            const runtimeEvents = attachCodexTurnUsage(
+              turnUsageTracker,
+              event,
+              mapToRuntimeEvents(event, event.threadId),
+            );
             if (runtimeEvents.length === 0) {
               yield* Effect.logDebug("ignoring unhandled Codex provider event", {
                 method: event.method,
