@@ -19,12 +19,18 @@ import { loadConfig, loadRegistry, resolveIdentity, NAME_RE } from "./lib/regist
 import * as auth from "./lib/auth.mjs";
 import {
   readWorkHistory,
-  readUsageSummary,
   readCostSince,
   readCostThisMonth,
   readMonthProviderCost,
+  readMonthProviderTokenUsage,
+  mergeProviderTokenUsage,
+  emptyProviderUsageMap,
   stateDbPath,
 } from "./lib/history.mjs";
+// Pool remaining (provider truth) vs share of consumption (our attribution)
+// are two strictly separate things and come from two separate modules on
+// purpose. See lib/rateLimits.mjs.
+import { readPoolStatus, DEFAULT_SNAPSHOT_DIR } from "./lib/rateLimits.mjs";
 import * as actions from "./lib/actions.mjs";
 import * as ops from "./lib/ops.mjs";
 import * as views from "./views.mjs";
@@ -141,10 +147,64 @@ function buildContext(req) {
   return { config, users, identity, principal, session, isPublic };
 }
 
+const SNAPSHOT_DIR = process.env.LSC_RATE_LIMIT_SNAPSHOT_DIR || DEFAULT_SNAPSHOT_DIR;
+
+/**
+ * Month-to-date share of consumption for every registry user.
+ *
+ * This is OUR attribution from the turn_usage ledger, never provider truth.
+ * It is deliberately built for every signed-in user, not just admins: the
+ * leaderboard is the social mechanism that makes a shared subscription work,
+ * so everyone sees the same table.
+ *
+ * `share` is a share of the *recorded consumption*, i.e. of each other, not of
+ * the provider's pool — we cannot know the pool in token terms, only in the
+ * percentages the provider reports separately.
+ */
+function consumptionLeaderboard(users) {
+  const totals = emptyProviderUsageMap();
+  const entries = Object.values(users)
+    .map((u) => {
+      const usage = readMonthProviderTokenUsage(stateDbPath(u.baseDir));
+      mergeProviderTokenUsage(totals, usage);
+      return { name: u.name, usage };
+    })
+    .sort((a, b) => b.usage.total.billableTokens - a.usage.total.billableTokens);
+
+  const grand = totals.total.billableTokens;
+  return {
+    totals,
+    // A dollar figure is only meaningful where the provider gave us one. Codex
+    // never does, so we track how much of the ledger had a cost at all and the
+    // view can say so instead of implying Codex was free.
+    costCoverage: {
+      claudeRows: totals.claude.costRows,
+      codexRows: totals.codex.costRows,
+      codexTurns: totals.codex.turns,
+    },
+    rows: entries.map((e) => ({
+      name: e.name,
+      billableTokens: e.usage.total.billableTokens,
+      share: grand > 0 ? (e.usage.total.billableTokens / grand) * 100 : null,
+      turns: e.usage.total.turns,
+      claude: e.usage.claude,
+      codex: e.usage.codex,
+      other: e.usage.other,
+      costUsd: e.usage.total.costUsd,
+    })),
+  };
+}
+
 async function dashboardProps(ctx, csrf) {
   const { user } = ctx.principal;
   const dbPath = stateDbPath(user.baseDir);
   return {
+    // Provider truth: what is left in the shared pool. Never derived from
+    // turn_usage, never estimated when absent.
+    pool: readPoolStatus(SNAPSHOT_DIR),
+    // Our attribution: who consumed what. Visible to every user.
+    consumption: consumptionLeaderboard(ctx.users),
+    myUsage: readMonthProviderTokenUsage(dbPath),
     csrf,
     identity: {
       login: ctx.principal.login,
@@ -159,7 +219,6 @@ async function dashboardProps(ctx, csrf) {
     instanceStatus: await actions.instanceStatus(user.name),
     monthCostUsd: readCostThisMonth(dbPath),
     projects: readWorkHistory(dbPath),
-    usage: readUsageSummary(dbPath),
     isAdmin: ctx.principal.isAdmin,
     github: githubStatusFor(user),
   };
@@ -179,7 +238,6 @@ async function adminProps(ctx, csrf, flash, selectedParam) {
   const registryUsers = Object.values(ctx.users).sort((a, b) => a.name.localeCompare(b.name));
 
   const rows = [];
-  const leaderboard = [];
   let totalCost30d = 0;
   let activeCount = 0;
 
@@ -206,16 +264,7 @@ async function adminProps(ctx, csrf, flash, selectedParam) {
       github: githubStatusFor(u),
       isSelf,
     });
-    leaderboard.push({
-      name: u.name,
-      total: monthProv.total,
-      claude: monthProv.claude,
-      codex: monthProv.codex,
-      other: monthProv.other,
-    });
   }
-
-  leaderboard.sort((a, b) => b.total - a.total);
 
   const selfRow = rows.find((r) => r.isSelf) || null;
   const self = {
@@ -241,7 +290,8 @@ async function adminProps(ctx, csrf, flash, selectedParam) {
     users: rows,
     self,
     selectedKey,
-    leaderboard,
+    pool: readPoolStatus(SNAPSHOT_DIR),
+    consumption: consumptionLeaderboard(ctx.users),
     aggregate: {
       totalCost30dUsd: totalCost30d,
       userCount: rows.length,

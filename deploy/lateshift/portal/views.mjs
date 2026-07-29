@@ -22,11 +22,11 @@ const GITHUB_ICON =
   '<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" ' +
   'style="vertical-align:-2px;margin-right:7px" fill="currentColor">' +
   '<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 ' +
-  '0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 ' +
-  '1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 ' +
-  '0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 ' +
-  '1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 ' +
-  '3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 ' +
+  "0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 " +
+  "1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 " +
+  "0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 " +
+  "1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 " +
+  "3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 " +
   '8.01 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>';
 
 function relTime(iso) {
@@ -406,7 +406,199 @@ const CSS = `
   .pend-av-fb { display: inline-flex; align-items: center; justify-content: center; background: var(--surface-2); color: var(--muted); font-weight: 600; }
   .pend-login { font-weight: 600; }
   .pend-actions { display: flex; align-items: center; gap: 6px; }
+
+  /* Pool remaining (provider truth) — visually distinct from the leaderboard
+     so the two are never read as the same kind of number. */
+  .pool { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+  .pool-provider { border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; background: var(--surface-2); }
+  .pool-provider > h3 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .pool-win { padding: 8px 0; border-bottom: 1px solid var(--border); }
+  .pool-win:last-child { border-bottom: none; }
+  .pool-win-head { display: flex; align-items: baseline; gap: 8px; }
+  .pool-win-key { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .pool-win-pct { margin-left: auto; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .pool-meter { height: 8px; border-radius: 999px; background: var(--ring-track); overflow: hidden; margin: 6px 0 4px; }
+  .pool-meter > span { display: block; height: 100%; background: var(--accent); }
+  .pool-meter.warn > span { background: var(--warn, #d99a2b); }
+  .pool-meter.bad > span { background: var(--danger, #d9534f); }
+  .pool-sub { font-size: 11.5px; color: var(--muted); }
+  .pool-unknown { font-size: 13px; color: var(--muted); margin: 0; }
+  .pool-mini { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
+  .pool-mini b { color: var(--text, inherit); font-variant-numeric: tabular-nums; }
+  .est { font-size: 11.5px; color: var(--muted); font-weight: 400; }
 `;
+
+// ---------------------------------------------------------------- usage
+//
+// Two strictly separate displays, never blended:
+//
+//  (1) POOL REMAINING — provider truth. What Anthropic/OpenAI say is left of
+//      the shared subscription. Rendered below by renderPool*.
+//  (2) SHARE OF CONSUMPTION — our own attribution from the turn_usage ledger.
+//      Who used it, according to us. Rendered by renderConsumption().
+//
+// Rules encoded here:
+//  * a window label is printed exactly as the provider sent it. Never "weekly".
+//  * a missing or stale window renders "unknown". No extrapolation, ever.
+//  * resetsAt is printed as the provider's instant, with the raw value in the
+//    title attribute so it can be checked.
+//  * dollars appear only as a de-emphasised secondary line explicitly labelled
+//    an API-equivalent estimate. Never as spend against a cap.
+
+const PROVIDER_LABEL = { claude: "Claude", codex: "Codex", other: "Other" };
+
+function pctFmt(n) {
+  const num = Number(n);
+  if (!Number.isFinite(num)) return "unknown";
+  return `${num.toFixed(num < 10 ? 1 : 0)}%`;
+}
+
+function resetsLine(w) {
+  if (!w.resetsAtIso) return "reset time unknown";
+  const title = w.resetsAtRaw == null ? "" : ` title="provider resetsAt=${esc(w.resetsAtRaw)}"`;
+  return `<span${title}>resets ${esc(w.resetsAtIso.replace("T", " ").replace(/\.\d+Z$/, "Z"))}</span>`;
+}
+
+function poolWindow(w) {
+  if (w.stale || w.utilizationPercent === null) {
+    return `<div class="pool-win">
+      <div class="pool-win-head"><span class="pool-win-key">${esc(w.windowKey)}</span>
+        <span class="pool-win-pct">unknown</span></div>
+      <div class="pool-sub">last seen ${w.observedAt ? esc(relTime(w.observedAt)) : "never"}${
+        w.status ? ` · status ${esc(w.status)}` : ""
+      }</div>
+    </div>`;
+  }
+  const used = Math.max(0, Math.min(100, w.utilizationPercent));
+  const cls = used >= 90 ? "bad" : used >= 75 ? "warn" : "";
+  const duration =
+    w.windowDurationMins != null ? ` · window ${esc(intFmt(w.windowDurationMins))} min` : "";
+  return `<div class="pool-win">
+    <div class="pool-win-head">
+      <span class="pool-win-key">${esc(w.windowKey)}</span>
+      <span class="pool-win-pct">${esc(pctFmt(w.remainingPercent))} left</span>
+    </div>
+    <div class="pool-meter ${cls}"><span style="width:${used}%"></span></div>
+    <div class="pool-sub">${esc(pctFmt(used))} used${
+      w.status ? ` · ${esc(w.status)}` : ""
+    }${duration} · ${resetsLine(w)} · seen ${esc(relTime(w.observedAt))}</div>
+  </div>`;
+}
+
+function poolProvider(pool) {
+  const label = PROVIDER_LABEL[pool.provider] || pool.provider;
+  const inner =
+    pool && pool.known && pool.windows.length
+      ? pool.windows.map(poolWindow).join("")
+      : `<p class="pool-unknown">unknown — no rate-limit report received from ${esc(label)} yet.</p>`;
+  return `<div class="pool-provider"><h3>${esc(label)}</h3>${inner}</div>`;
+}
+
+/** Full pool-remaining card for the account/dashboard page. */
+export function renderPool(pool) {
+  const providers = ["claude", "codex"].map((p) => poolProvider(pool?.[p] ?? { provider: p }));
+  return `<div class="card">
+    <h2>Subscription pool <span class="muted" style="font-size:13px;font-weight:500">· reported by the provider</span></h2>
+    <div class="pool">${providers.join("")}</div>
+    <p class="muted" style="font-size:12px;margin:14px 0 0">
+      These are the providers' own numbers for the shared account, refreshed whenever any
+      workspace talks to them. Window names are the providers' own labels and their reset
+      behaviour does not always match the name. A window we have not heard about in the last
+      hour shows as <em>unknown</em> rather than a stale figure.
+    </p>
+  </div>`;
+}
+
+/** One-line pool summary for the top of a page. Says "unknown" when it is. */
+export function renderPoolMini(pool) {
+  const parts = ["claude", "codex"].map((p) => {
+    const entry = pool?.[p];
+    const label = PROVIDER_LABEL[p];
+    if (!entry || !entry.known) return `${esc(label)} <b>unknown</b>`;
+    const usable = entry.windows.filter((w) => !w.stale && w.utilizationPercent !== null);
+    if (!usable.length) return `${esc(label)} <b>unknown</b>`;
+    const worst = usable.reduce((a, b) => (b.utilizationPercent > a.utilizationPercent ? b : a));
+    return `${esc(label)} <b>${esc(pctFmt(worst.remainingPercent))} left</b> <span class="pool-win-key">${esc(worst.windowKey)}</span>`;
+  });
+  return `<div class="pool-mini">Pool remaining: ${parts.join(" · ")}</div>`;
+}
+
+/**
+ * Share-of-consumption leaderboard. Visible to every user, not admin-only.
+ * The headline number is tokens, not dollars.
+ */
+export function renderConsumption(consumption, { highlight = null } = {}) {
+  const rows = consumption?.rows ?? [];
+  if (!rows.length || rows.every((r) => r.billableTokens === 0)) {
+    return `<div class="card"><h2>Share of consumption</h2>
+      <p class="muted" style="margin:0">No usage recorded this month.</p></div>`;
+  }
+  const max = Math.max(1, ...rows.map((r) => r.billableTokens));
+  const items = rows
+    .map((r, i) => {
+      const pct = Math.max(2, (r.billableTokens / max) * 100);
+      const you = highlight && r.name === highlight ? '<span class="badge-you">you</span>' : "";
+      const brk = `C ${esc(intFmt(r.claude.billableTokens))} · X ${esc(intFmt(r.codex.billableTokens))}${
+        r.other.billableTokens > 0 ? ` · o ${esc(intFmt(r.other.billableTokens))}` : ""
+      }`;
+      return `<li>
+        <span class="rank">${i + 1}</span>
+        <span class="who">${esc(r.name)}${you}</span>
+        <span class="lbar"><span style="width:${pct}%"></span></span>
+        <span class="amt">${r.share == null ? "—" : esc(pctFmt(r.share))}</span>
+        <span class="brk" title="Claude / Codex billable tokens">${brk}</span>
+      </li>`;
+    })
+    .join("");
+
+  const totals = consumption.totals.total;
+  const cov = consumption.costCoverage;
+  // Cost is an aside, and an incomplete one: Codex reports no dollar figure, so
+  // saying "$X total" without that caveat would misattribute the whole cost to
+  // Claude users.
+  const costNote =
+    cov.codexTurns > 0
+      ? ` Codex reports no cost, so ${esc(intFmt(cov.codexTurns))} Codex turn${cov.codexTurns === 1 ? "" : "s"} contribute nothing to this figure.`
+      : "";
+  return `<div class="card">
+    <h2>Share of consumption <span class="muted" style="font-size:13px;font-weight:500">· month-to-date</span></h2>
+    <ul class="lb">${items}</ul>
+    <p class="muted" style="font-size:12px;margin:12px 0 0">
+      Share of the ${esc(intFmt(totals.billableTokens))} billable tokens (input + output, cache
+      excluded) this workspace group has recorded this month. C = Claude, X = Codex, o = other.
+      This is our own per-turn attribution, not a provider figure, and it is not the same thing
+      as the subscription pool above.
+    </p>
+    <p class="est" style="margin:6px 0 0">
+      API-equivalent estimate: ${esc(money(totals.costUsd))} — what these turns would have cost at
+      pay-as-you-go API rates. It is not money spent; the subscription is a flat fee.${costNote}
+    </p>
+  </div>`;
+}
+
+/** Per-user token detail for the account page. */
+export function renderMyUsage(myUsage) {
+  const t = myUsage?.total;
+  if (!t || t.turns === 0) {
+    return `<p class="muted" style="margin:0">No usage recorded this month.</p>`;
+  }
+  return `<div class="stats">
+    <div class="stat"><div class="label">Turns</div><div class="value">${esc(intFmt(t.turns))}</div></div>
+    <div class="stat"><div class="label">Billable tokens</div><div class="value">${esc(intFmt(t.billableTokens))}</div></div>
+    <div class="stat"><div class="label">Input</div><div class="value">${esc(intFmt(t.inputTokens))}</div></div>
+    <div class="stat"><div class="label">Output</div><div class="value">${esc(intFmt(t.outputTokens))}</div></div>
+    <div class="stat"><div class="label">Cache read</div><div class="value">${esc(intFmt(t.cachedInputTokens))}</div></div>
+    <div class="stat"><div class="label">Cache write</div><div class="value">${esc(intFmt(t.cacheCreationInputTokens))}</div></div>
+    <div class="stat"><div class="label">Reasoning</div><div class="value">${esc(intFmt(t.reasoningOutputTokens))}</div></div>
+  </div>
+  <p class="est" style="margin:12px 0 0">
+    API-equivalent estimate for your turns: ${esc(money(t.costUsd))}${
+      myUsage.codex.turns > 0
+        ? ` (excludes ${esc(intFmt(myUsage.codex.turns))} Codex turn${myUsage.codex.turns === 1 ? "" : "s"} — Codex reports no cost)`
+        : ""
+    }. Not money spent.
+  </p>`;
+}
 
 function statusChip(status) {
   const s = String(status ?? "");
@@ -531,7 +723,8 @@ export function renderHero({ identityLogin, githubEnabled } = {}) {
 
 // 2) User dashboard.
 export function renderDashboard(props) {
-  const { identity, user, instanceStatus, projects, usage, isAdmin, github } = props;
+  const { identity, user, instanceStatus, projects, isAdmin, github, pool, consumption, myUsage } =
+    props;
 
   const githubCard = `<div class="card">
     <h2>GitHub</h2>
@@ -553,14 +746,7 @@ export function renderDashboard(props) {
     <a class="btn btn-primary btn-big" href="https://${esc(user.name)}.lateshiftcloud.com/">Open my workspace</a>
   </div>`;
 
-  const usageHtml = usage
-    ? `<div class="stats">
-        <div class="stat"><div class="label">Total cost</div><div class="value">${esc(money(usage.totalCostUsd))}</div></div>
-        <div class="stat"><div class="label">Turns</div><div class="value">${esc(intFmt(usage.turns))}</div></div>
-        <div class="stat"><div class="label">Input tokens</div><div class="value">${esc(intFmt(usage.inputTokens))}</div></div>
-        <div class="stat"><div class="label">Output tokens</div><div class="value">${esc(intFmt(usage.outputTokens))}</div></div>
-      </div>`
-    : `<p class="muted" style="margin:0">No usage recorded yet.</p>`;
+  const usageHtml = renderMyUsage(myUsage);
 
   const projectsHtml =
     projects.length === 0
@@ -600,6 +786,7 @@ export function renderDashboard(props) {
       <h1 style="margin:0">Welcome back, ${esc(user.name)}</h1>
       ${statusChip(instanceStatus)}
     </div>
+    ${renderPoolMini(pool)}
 
     <div class="card">
       <h2>Workspace</h2>
@@ -608,10 +795,14 @@ export function renderDashboard(props) {
 
     ${githubCard}
 
+    ${renderPool(pool)}
+
     <div class="card">
-      <h2>Usage</h2>
+      <h2>Your usage <span class="muted" style="font-size:13px;font-weight:500">· month-to-date</span></h2>
       ${usageHtml}
     </div>
+
+    ${renderConsumption(consumption, { highlight: user.name })}
 
     <div class="section-title">Work history</div>
     ${projectsHtml}
@@ -739,30 +930,9 @@ function renderDetail(props) {
   </div>`;
 }
 
-function renderLeaderboard(leaderboard) {
-  if (!leaderboard.length) {
-    return `<div class="card"><h2>Usage leaderboard</h2><p class="muted" style="margin:0">No users yet.</p></div>`;
-  }
-  const max = Math.max(1e-9, ...leaderboard.map((l) => l.total));
-  const rows = leaderboard
-    .map((l, i) => {
-      const pct = Math.max(2, (l.total / max) * 100);
-      const brk = `C ${esc(money(l.claude))} · X ${esc(money(l.codex))}${l.other > 0 ? ` · o ${esc(money(l.other))}` : ""}`;
-      return `<li>
-        <span class="rank">${i + 1}</span>
-        <span class="who">${esc(l.name)}</span>
-        <span class="lbar"><span style="width:${pct}%"></span></span>
-        <span class="amt">${esc(money(l.total))}</span>
-        <span class="brk" title="Claude / Codex breakdown">${brk}</span>
-      </li>`;
-    })
-    .join("");
-  return `<div class="card">
-    <h2>Usage leaderboard <span class="muted" style="font-size:13px;font-weight:500">· month-to-date</span></h2>
-    <ul class="lb">${rows}</ul>
-    <p class="muted" style="font-size:12px;margin:12px 0 0">C = Claude, X = Codex, o = other.</p>
-  </div>`;
-}
+// The old dollar-denominated leaderboard was removed with W3-C: it ranked
+// users by an API-equivalent price that Codex never reports, so every Codex
+// turn scored zero. renderConsumption() replaces it with token attribution.
 
 function addUserCard(csrf) {
   return `<div class="card">
@@ -823,7 +993,11 @@ function renderPending(pending, csrf) {
           .slice(0, 20) || "user";
       const avatar = pReq.avatar
         ? `<img src="${esc(pReq.avatar)}" alt="" class="pend-av">`
-        : `<span class="pend-av pend-av-fb">${esc(String(pReq.login || "?").slice(0, 1).toUpperCase())}</span>`;
+        : `<span class="pend-av pend-av-fb">${esc(
+            String(pReq.login || "?")
+              .slice(0, 1)
+              .toUpperCase(),
+          )}</span>`;
       return `<div class="pend-row">
       <div class="pend-who">${avatar}<div>
         <div class="pend-login">@${login}</div>
@@ -849,17 +1023,8 @@ function renderPending(pending, csrf) {
 }
 
 export function renderAdmin(props) {
-  const {
-    csrf,
-    identity,
-    users,
-    self,
-    selectedKey,
-    leaderboard,
-    aggregate,
-    flash,
-    pending,
-  } = props;
+  const { csrf, identity, users, self, selectedKey, aggregate, flash, pending, pool, consumption } =
+    props;
 
   const navHtml = nav({ identity, links: [{ href: "/", label: "Dashboard" }] });
 
@@ -870,8 +1035,10 @@ export function renderAdmin(props) {
     <div class="stats" style="margin-bottom:20px">
       <div class="stat"><div class="label">Users</div><div class="value">${esc(intFmt(aggregate.userCount))}</div></div>
       <div class="stat"><div class="label">Active instances</div><div class="value">${esc(intFmt(aggregate.activeCount))}</div></div>
-      <div class="stat"><div class="label">Total cost (30d)</div><div class="value">${esc(money(aggregate.totalCost30dUsd))}</div></div>
+      <div class="stat"><div class="label">API-equivalent (30d)</div><div class="value">${esc(money(aggregate.totalCost30dUsd))}</div><div class="est">estimate, not spend</div></div>
     </div>
+
+    ${renderPoolMini(pool)}
 
     ${renderPending(pending, csrf)}
 
@@ -880,7 +1047,9 @@ export function renderAdmin(props) {
       ${renderDetail({ users, self, selectedKey, csrf })}
     </div>
 
-    ${renderLeaderboard(leaderboard)}
+    ${renderPool(pool)}
+
+    ${renderConsumption(consumption)}
 
     ${addUserCard(csrf)}
   </main>`;

@@ -195,3 +195,129 @@ export function readMonthProviderCost(dbPath) {
     { claude: 0, codex: 0, other: 0, total: 0 },
   );
 }
+
+// ------------------------------------------------- share of consumption
+//
+// This is OUR attribution, not provider truth. It answers "who used the shared
+// subscription", and it is the only thing the leaderboard is allowed to be
+// built on. It must never be mixed with the pool-remaining numbers that come
+// from rateLimits.mjs.
+//
+// The headline metric is `billableTokens = input_tokens + output_tokens`.
+// Deliberately NOT a sum of every token column:
+//   * cache reads and cache writes are priced differently from fresh input and
+//     adding them produces a number that means nothing;
+//   * reasoning_output_tokens is (for Codex) reported alongside output tokens
+//     and we cannot prove it is disjoint, so summing it in risks
+//     double-counting Codex against Claude.
+// The other columns are still returned so the account page can show them.
+//
+// Cost is returned separately and may be null-ish: Codex reports no dollar
+// figure at all, so `costUsd` for Codex is 0 with `costKnown:false`. Callers
+// must present cost as an API-equivalent estimate, never as spend.
+
+function emptyProviderUsage() {
+  return {
+    turns: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    reasoningOutputTokens: 0,
+    billableTokens: 0,
+    costUsd: 0,
+    costRows: 0,
+  };
+}
+
+function emptyProviderUsageMap() {
+  return {
+    claude: emptyProviderUsage(),
+    codex: emptyProviderUsage(),
+    other: emptyProviderUsage(),
+    total: emptyProviderUsage(),
+  };
+}
+
+function hasColumn(db, table, column) {
+  try {
+    return db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all()
+      .some((c) => c.name === column);
+  } catch {
+    return false;
+  }
+}
+
+function addUsage(target, row, cacheCreation) {
+  target.turns += Number(row.turns) || 0;
+  target.inputTokens += Number(row.inputTokens) || 0;
+  target.outputTokens += Number(row.outputTokens) || 0;
+  target.cachedInputTokens += Number(row.cachedInputTokens) || 0;
+  target.cacheCreationInputTokens += cacheCreation;
+  target.reasoningOutputTokens += Number(row.reasoningOutputTokens) || 0;
+  target.billableTokens += (Number(row.inputTokens) || 0) + (Number(row.outputTokens) || 0);
+  target.costUsd += Number(row.costUsd) || 0;
+  target.costRows += Number(row.costRows) || 0;
+}
+
+/**
+ * Token consumption for one instance since `sinceIso`, bucketed by provider.
+ * Always returns the full shape (zeros when there is no DB, no table and no
+ * rows) so callers can sum across users without null checks.
+ *
+ * `cache_creation_input_tokens` only exists after LateShift migration 036; on
+ * an older database the column is absent and that bucket stays 0 rather than
+ * failing the whole query.
+ */
+export function readProviderTokenUsage(dbPath, sinceIso = null) {
+  return withDb(
+    dbPath,
+    (db) => {
+      const out = emptyProviderUsageMap();
+      if (!hasTable(db, "turn_usage")) return out;
+      const cacheWriteCol = hasColumn(db, "turn_usage", "cache_creation_input_tokens")
+        ? "COALESCE(SUM(cache_creation_input_tokens), 0)"
+        : "0";
+      const where = sinceIso ? "WHERE completed_at >= ?" : "";
+      const rows = db
+        .prepare(
+          `SELECT provider_name AS provider,
+                  COUNT(*) AS turns,
+                  COALESCE(SUM(input_tokens), 0) AS inputTokens,
+                  COALESCE(SUM(output_tokens), 0) AS outputTokens,
+                  COALESCE(SUM(cached_input_tokens), 0) AS cachedInputTokens,
+                  ${cacheWriteCol} AS cacheCreationInputTokens,
+                  COALESCE(SUM(reasoning_output_tokens), 0) AS reasoningOutputTokens,
+                  COALESCE(SUM(total_cost_usd), 0) AS costUsd,
+                  SUM(CASE WHEN total_cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS costRows
+             FROM turn_usage ${where}
+            GROUP BY provider_name`,
+        )
+        .all(...(sinceIso ? [sinceIso] : []));
+      for (const row of rows) {
+        const cacheCreation = Number(row.cacheCreationInputTokens) || 0;
+        addUsage(out[normalizeProvider(row.provider)], row, cacheCreation);
+        addUsage(out.total, row, cacheCreation);
+      }
+      return out;
+    },
+    emptyProviderUsageMap(),
+  );
+}
+
+/** Month-to-date variant of {@link readProviderTokenUsage}. */
+export function readMonthProviderTokenUsage(dbPath) {
+  return readProviderTokenUsage(dbPath, monthStartIso());
+}
+
+/** Add `b` into `a` in place. Used to aggregate across users. */
+export function mergeProviderTokenUsage(a, b) {
+  for (const bucket of ["claude", "codex", "other", "total"]) {
+    for (const key of Object.keys(a[bucket])) a[bucket][key] += b[bucket][key];
+  }
+  return a;
+}
+
+export { emptyProviderUsageMap };
