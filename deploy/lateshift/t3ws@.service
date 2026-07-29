@@ -76,14 +76,16 @@ SuccessExitStatus=130
 # be owned by a workspace account: an account that owns /run/lsc could create
 # /run/lsc/<other-workspace>/http.sock and impersonate another workspace to the
 # gateway.
-RuntimeDirectory=lsc/%i
-RuntimeDirectoryMode=0750
-# `+` runs this as root outside the sandbox. RuntimeDirectory is created owned
-# by User=/Group= of the unit, so the group has to be corrected to caddy.
-ExecStartPre=+/usr/bin/chgrp caddy /run/lsc/%i
-ExecStartPre=+/usr/bin/chmod 0750 /run/lsc/%i
-# RuntimeDirectory is removed on stop, so a stale socket cannot cause EADDRINUSE
-# on restart. run-workspace.sh unlinks defensively as well.
+# W8 finding: RuntimeDirectory= cannot be used here. systemd (255) re-applies
+# the RuntimeDirectory ownership (User=:Group= of the unit) when it spawns the
+# MAIN process, silently undoing any +ExecStartPre chgrp -- observed live: the
+# dir came up <ws>:<ws> despite the chgrp. Instead the directory is created by
+# a root ExecStartPre with the right owner/group in one step, and /run/lsc/%i
+# is carved out of ProtectSystem=strict explicitly ('-' because the
+# carve-out is evaluated for the ExecStartPre spawn too, BEFORE the dir exists). The dir is NOT removed on
+# stop; run-workspace.sh unlinks a stale socket defensively at start.
+ExecStartPre=+/usr/bin/install -d -m 0750 -o %i -g caddy /run/lsc/%i
+ReadWritePaths=-/run/lsc/%i
 
 # Resource caps: box has 7.6 GiB RAM / 4 cores; production t3code uses ~1 GiB.
 # Each instance idles around 1 GiB, so soft-cap at 1 GiB, hard-cap at 1.5 GiB,
@@ -140,12 +142,16 @@ BindPaths=/home/dev/.codex:/home/dev/services/lateshift/workspaces/%i/home/.code
 # Read-only: the server bundle it executes and the user-facing helper bin.
 BindReadOnlyPaths=/home/dev/services/lateshift/checkout
 BindReadOnlyPaths=/home/dev/services/lateshift/instance-bin
+# The launcher itself (ExecStart=) must exist inside the mount namespace too;
+# ProtectHome=tmpfs removes /home/dev/services/lateshift/bin unless bound in.
+# Found in W8: the unit 203/EXECs without this line.
+BindReadOnlyPaths=/home/dev/services/lateshift/bin
 
 # Defence in depth. With ProtectHome=tmpfs these paths are already absent, but
 # an accidental future BindPaths must not resurrect them.
-InaccessiblePaths=/home/dev/services/lateshift/secrets
-InaccessiblePaths=/home/dev/.config/gh
-InaccessiblePaths=/home/dev/.gitconfig
+InaccessiblePaths=-/home/dev/services/lateshift/secrets
+InaccessiblePaths=-/home/dev/.config/gh
+InaccessiblePaths=-/home/dev/.gitconfig
 
 # Private /tmp and /var/tmp per instance (no cross-instance tmp leakage).
 PrivateTmp=yes

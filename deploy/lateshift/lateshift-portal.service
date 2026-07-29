@@ -5,6 +5,11 @@ Wants=network-online.target
 
 [Service]
 User=dev
+# W8 finding: /run/lsc/<ws> is 0750 <ws>:caddy (W5), so the portal cannot see
+# workspace sockets as plain dev and /authz answered 503 for every valid
+# member. The portal is the auth authority; give the PROCESS (not the dev
+# user at large) the caddy group so it can stat and health-check sockets.
+SupplementaryGroups=caddy
 WorkingDirectory=/home/dev/services/lateshift/portal
 Environment=PATH=/home/dev/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PORT=3790

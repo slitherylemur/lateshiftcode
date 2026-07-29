@@ -211,6 +211,13 @@ def save():
             f.flush()
             os.fsync(f.fileno())
         os.chmod(tmp, 0o640)
+        # The portal runs as dev and must read the registry (W8 finding:
+        # root:root 0640 fail-closed every /authz). Group dev, never world.
+        try:
+            import grp
+            os.chown(tmp, 0, grp.getgrnam("dev").gr_gid)
+        except (KeyError, PermissionError):
+            pass
         os.rename(tmp, REGISTRY)
     except BaseException:
         try:

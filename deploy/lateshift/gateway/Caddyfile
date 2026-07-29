@@ -79,6 +79,18 @@
 			}
 		}
 
+		# Portal-owned JSON endpoints the web app calls UNPREFIXED (the
+		# architecture reserves /api/lsc/* to the portal, section 3; found
+		# broken in W8: these routed to the workspace, which serves neither).
+		# /api/lsc/thread-attribution deliberately stays on the workspace
+		# (W6-D serves it from the instance, gateway-only).
+		@lscapi path /api/lsc/projects /api/lsc/select-workspace
+		handle @lscapi {
+			reverse_proxy {$LSC_PORTAL_UPSTREAM:127.0.0.1:3790} {
+				header_up X-Forwarded-Proto https
+			}
+		}
+
 		# Everything else IS the workspace: authorize, then proxy to the
 		# socket the portal returned. /authz fails closed; see
 		# portal/lib/workspaces.mjs for the decision table.

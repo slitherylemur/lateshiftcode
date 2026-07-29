@@ -22,7 +22,11 @@ export default defineConfig({
   },
   staged: {
     // Formatter only for now — no lint or typecheck on commit.
-    "*": "vp fmt",
+    // Scoped to extensions the formatter actually handles: a commit that
+    // stages only deploy/** (units, Caddyfile, shell, python) used to make
+    // `vp fmt` fail with "Expected at least one target file" and abort the
+    // commit (found in W8).
+    "*.{ts,tsx,js,jsx,mjs,cjs,json,jsonc,md,css,html,yaml,yml}": "vp fmt",
   },
   fmt: {
     ignorePatterns: [
