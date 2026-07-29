@@ -65,7 +65,8 @@ export GH_CONFIG_DIR="${identity_dir}/gh"
 export GIT_CONFIG_GLOBAL="${identity_dir}/gitconfig"
 
 # First-run scaffolding (idempotent; dev-owned because this launcher runs as dev).
-mkdir -p "${GH_CONFIG_DIR}"
+[ -d "${identity_dir}" ] || mkdir "${identity_dir}"
+[ -d "${GH_CONFIG_DIR}" ] || mkdir "${GH_CONFIG_DIR}"
 chmod 700 "${identity_dir}" "${GH_CONFIG_DIR}"
 
 # Seed a placeholder global gitconfig if absent: a per-user author identity plus
