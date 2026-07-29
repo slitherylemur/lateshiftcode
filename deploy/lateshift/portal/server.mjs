@@ -30,6 +30,7 @@ import {
   stateDbPath,
 } from "./lib/history.mjs";
 import * as actions from "./lib/actions.mjs";
+import * as ops from "./lib/ops.mjs";
 import * as views from "./views.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -578,6 +579,33 @@ async function handleGet(req, res, url) {
   );
 }
 
+// POST /internal/ops/<action> - the guarded ops broker (see lib/ops.mjs).
+// Loopback-only, CSRF-EXEMPT machine RPC like /internal/roblox-create: auth is
+// the X-Ops-Token bearer secret (constant-time compared in ops.checkAuth), and
+// any X-Forwarded-Host request is rejected so the public gateway can never
+// reach it. Never touches production (t3code.service / 3773 / 443).
+async function handleOps(req, res, url) {
+  const gate = ops.checkAuth(req);
+  if (!gate.ok) {
+    json(res, gate.status, { ok: false, detail: gate.detail });
+    return;
+  }
+  let body;
+  try {
+    body = JSON.parse(await readBody(req, 64 * 1024));
+  } catch {
+    json(res, 400, { ok: false, detail: "invalid JSON body" });
+    return;
+  }
+  if (!body || typeof body !== "object") {
+    json(res, 400, { ok: false, detail: "body must be a JSON object" });
+    return;
+  }
+  const action = url.pathname.slice("/internal/ops/".length);
+  const { status, payload } = await ops.handleOps(action, body);
+  json(res, status, payload);
+}
+
 // POST /internal/roblox-create — loopback-only machine broker that performs the
 // entire privileged, keyless Roblox project creation on behalf of a sandboxed
 // instance. It is intentionally CSRF-EXEMPT: it is not a browser form endpoint
@@ -623,6 +651,9 @@ async function handleRobloxCreate(req, res) {
 async function handlePost(req, res, url) {
   // Machine broker endpoint — handled before any CSRF/form logic (see
   // handleRobloxCreate for the CSRF-exemption and X-Forwarded-Host rejection).
+  if (url.pathname.startsWith("/internal/ops/")) {
+    return handleOps(req, res, url);
+  }
   if (url.pathname === "/internal/roblox-create") {
     return handleRobloxCreate(req, res);
   }

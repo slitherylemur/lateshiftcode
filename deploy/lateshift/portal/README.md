@@ -134,3 +134,61 @@ gateway). It reads the forwarded `Cookie` and `X-Authz-Host: <public hostname>`:
 > be set (owned by another agent — do not edit `t3user` here). Until `t3user`
 > accepts `githubLogin`, public GitHub sign-in cannot match an approved user by
 > login. The `/authz` matrix, sessions, and OAuth flow are otherwise complete.
+
+## Ops broker (`/internal/ops/<action>`) — lib/ops.mjs
+
+A loopback-only, **CSRF-exempt** machine RPC that lets the admin's *sandboxed*
+T3 workspace modify and redeploy the LateShift Cloud system it runs inside,
+while being structurally **incapable of touching production** (`t3code.service`,
+port 3773 / 443, `/home/dev/.t3`, cloudflared). Same posture as
+`/internal/roblox-create`.
+
+**Auth.** Every request must carry `X-Ops-Token` matching the secret stored two
+places by design:
+
+- `…/users/slither/identity/ops-token` — inside the admin's base dir, readable
+  by their sandbox (its own identity copy).
+- `…/secrets/ops-token` — the copy the portal validates against
+  (constant-time). This dir is `InaccessiblePaths=` for every instance sandbox,
+  so no sandbox can read the validating secret.
+
+Both are `600 dev:dev`, 32-byte hex. Any request bearing `X-Forwarded-Host` is
+rejected `403` (the public gateway can never reach this route). Bad/absent token
+→ `401`.
+
+**Safety.** `assertOpsUnit()` builds systemctl/journalctl targets only for
+`t3code@<name>` template instances or a fixed whitelist; the bare production
+unit can never be named (`PRODUCTION_UNITS` guard). Production appears **only**
+as a read-only health bit in `status`. All shell-outs are `execFile` (argv
+arrays). Every action appends one line — action, params minus secrets, outcome —
+to `…/ops-audit.log` (append, 600). Secrets are never logged.
+
+**Actions** (all `POST http://127.0.0.1:3790/internal/ops/<action>`, JSON in/out
+`{ok, …}`):
+
+1. `status` `{}` → instance states, portal/caddy/budget-timer states, production
+   health bit, checkout branch+commit, portal branch+commit.
+2. `rebuild-checkout` `{branch}` (`[A-Za-z0-9._/-]{1,80}`) → in the build
+   checkout: fetch origin `<branch>`, `reset --hard`, `pnpm install
+   --prefer-offline`, `vp pack` (apps/server), web build, branding. Synchronous
+   with generous timeouts; returns per-stage tail output; stops at first failure.
+3. `restart-instance` `{name, delaySeconds?}` → only `t3code@<name>`. For the
+   **calling workspace** (`slither`) a bare call is refused; pass
+   `delaySeconds` (10-300) to schedule a delayed self-restart via
+   `systemd-run --on-active=<N>s --unit=lsc-delayed-restart-<name>` (refused if
+   one is already pending) so the instance restarts *after* the turn. Other
+   instances: immediate restart + health-poll of `localPort` (200 within 60s).
+4. `deploy-portal` `{}` → the portal redeploys **itself**. In-process (as dev) it
+   backs up the installed dir to `portal.bak-<ts>` and rsyncs the source over it
+   (`static/` preserved), then hands restart + `/healthz` poll + **auto-rollback**
+   to a **detached `systemd-run` supervisor** (`lsc-portal-redeploy`) that is
+   independent of the portal process — so the HTTP response is sent *before* the
+   restart. On failed healthz the supervisor restores the backup and restarts
+   again, recording the final outcome to the audit log. Verify via
+   `status`/`healthz`.
+5. `update-gateway` `{}` → runs `render-gateway` (reloads caddy).
+6. `logs` `{unit, lines<=200}` → `journalctl` for whitelisted units only
+   (`t3code@*`, `lateshift-portal`, `caddy`, `lateshift-budget.service`) — never
+   production `t3code.service`.
+7. `pull-infra` `{}` → `git fetch origin` + ahead/behind of `lateshift-cloud`
+   vs origin (read-only; no merge).
