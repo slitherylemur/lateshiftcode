@@ -192,16 +192,17 @@ provider:
 The directory is shared by every instance and is last-writer-wins: rate limits
 describe the subscription, not the user, so every instance observes the same
 facts. Storing them per-instance would mean N copies of one fact and the portal
-guessing which is freshest. Create the directory once — the unit deliberately
-does not:
-
-    sudo install -d -o dev -g dev -m 0755 /home/dev/services/lateshift/state/rate-limits
+guessing which is freshest. `lsw init` creates the directory (2775 `dev:lsc-agents`, setgid so each
+instance can replace the previous instance's file); the unit deliberately does
+not.
 
 Operational notes:
 
-- Enabled only by `T3CODE_RATE_LIMIT_SNAPSHOT_DIR` in `t3code@.service`. Unset
+- Enabled only by `T3CODE_RATE_LIMIT_SNAPSHOT_DIR` in `t3ws@.service`. Unset
   (desktop, upstream dev) the store is a no-op, so this cannot affect upstream.
-- `ReadWritePaths=-...` in the unit is prefixed with `-` on purpose: a missing
+- `BindPaths=-...` in the unit is prefixed with `-` on purpose (and it must be
+  a bind, not a `ReadWritePaths`: under `ProtectHome=tmpfs` the path does not
+  otherwise exist in the namespace at all): a missing
   telemetry directory must never stop a workspace from starting. It degrades to
   a logged warning and the portal shows "unknown".
 - Writes are write-tmp-then-rename, so a reader never sees a torn file.

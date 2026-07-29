@@ -73,6 +73,9 @@ def render(users):
             continue
         # http:// scheme so Caddy binds these on http_port (8880), not 443.
         lines.append(f"http://{name}.{DOMAIN} {{")
+        # Strip attacker-supplied identity/ops headers before anything
+        # else in the block (snippet lives in the main Caddyfile).
+        lines.append("\timport lsc_strip_identity")
         lines.append(f"\timport lsc_gated {port}")
         lines.append("}")
         lines.append("")

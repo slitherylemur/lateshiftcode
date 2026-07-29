@@ -45,6 +45,21 @@ ARCHIVE_DIR="${LATESHIFT_ROOT}/archive"
 # Shared, fleet-wide telemetry (provider rate-limit snapshots). Not per-user.
 STATE_DIR="${LATESHIFT_ROOT}/state"
 RATE_LIMIT_DIR="${STATE_DIR}/rate-limits"
+
+# Provisioning-rollback state. Carried over from the W1-B fix to `t3user`, which
+# this tool replaces -- the defect must not come back with the rewrite.
+# PROVISION_COMMITTED flips to 1 only once the registry commit has succeeded;
+# the EXIT trap armed by arm_provision_rollback rolls back whenever it is still
+# 0. PROVISION_ROLLED_BACK makes rollback_provision idempotent, so an explicit
+# call followed by the trap cannot run it twice.
+PROVISION_COMMITTED=0
+PROVISION_ROLLED_BACK=0
+PROVISION_WS=""
+PROVISION_USER=""
+PROVISION_GROUP=""
+PROVISION_DIR=""
+PROVISION_CREATED_ACCOUNT=false
+PROVISION_CREATED_GROUP=false
 LOCK_FILE="${LATESHIFT_ROOT}/.registry-v2.lock"
 RUNTIME_ROOT="${LSW_RUNTIME_ROOT:-/run/lsc}"
 AGENT_GROUP="lsc-agents"          # shared Claude/Codex credential group (see R3)
@@ -566,6 +581,10 @@ verify_socket_ownership() {
 # only what THIS invocation created.
 rollback_provision() {
     local ws="$1" unix_user="$2" group="$3" created_dir="$4" created_account="$5" created_group="$6"
+    if [[ "${PROVISION_ROLLED_BACK}" == 1 ]]; then
+        return 0
+    fi
+    PROVISION_ROLLED_BACK=1
     echo "lsw: rolling back failed provision of '${ws}' ..." >&2
     run systemctl disable --now "t3ws@${ws}.service" >/dev/null 2>&1 || true
     run systemctl reset-failed "t3ws@${ws}.service" >/dev/null 2>&1 || true
@@ -581,6 +600,35 @@ rollback_provision() {
     if [[ "${created_group}" == "true" && -n "${group}" ]] && unix_group_exists "${group}"; then
         run groupdel "${group}" || echo "lsw: warning: groupdel ${group} failed" >&2
     fi
+}
+
+# Arm the unconditional rollback. Everything between this call and
+# disarm_provision_rollback is a PARTIAL provision: an unexpected non-zero
+# command under `set -e`, or a signal (Ctrl-C, or SIGTERM/SIGHUP from a
+# supervisor or a dropped SSH session), would otherwise exit leaving a base dir
+# and possibly a UNIX account and an enabled unit behind with NO registry entry.
+# That bricks the name: `lsw user add` then dies at "base dir ... already
+# exists" while `lsw user remove` dies at "user not found". Only the
+# *anticipated* failures called rollback_provision; the trap covers the rest.
+arm_provision_rollback() {
+    PROVISION_COMMITTED=0
+    PROVISION_ROLLED_BACK=0
+    PROVISION_WS="$1"
+    PROVISION_USER="$2"
+    PROVISION_GROUP="$3"
+    PROVISION_DIR="$4"
+    PROVISION_CREATED_ACCOUNT="$5"
+    PROVISION_CREATED_GROUP="$6"
+    trap 'if [[ "${PROVISION_COMMITTED}" != 1 ]]; then rollback_provision "${PROVISION_WS}" "${PROVISION_USER}" "${PROVISION_GROUP}" "${PROVISION_DIR}" "${PROVISION_CREATED_ACCOUNT}" "${PROVISION_CREATED_GROUP}"; fi' EXIT
+    # Signals must unwind through the EXIT trap instead of killing the shell.
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+}
+
+# The workspace is real from here on and must NEVER be rolled back by the trap.
+disarm_provision_rollback() {
+    PROVISION_COMMITTED=1
+    trap - EXIT INT TERM HUP
 }
 
 start_and_verify() {
@@ -630,6 +678,8 @@ cmd_user_add() {
     local created_account=false
     unix_user_exists "${unix_user}" || created_account=true
 
+    arm_provision_rollback "${ws}" "${unix_user}" "" "${base_dir}" "${created_account}" "false"
+
     ensure_agent_group
     create_workspace_account "${unix_user}"
     create_base_dir "${ws}" "${unix_user}"
@@ -645,6 +695,7 @@ cmd_user_add() {
         rollback_provision "${ws}" "${unix_user}" "" "${base_dir}" "${created_account}" "false"
         die "registry commit failed; rolled back"
     fi
+    disarm_provision_rollback
     info "'${login}' is up: workspace ${ws}, socket $(socket_path_for "${ws}")"
 }
 
@@ -712,6 +763,8 @@ cmd_team_add() {
     unix_user_exists "${unix_user}" || created_account=true
     unix_group_exists "${group}" || created_group=true
 
+    arm_provision_rollback "${ws}" "${unix_user}" "${group}" "${base_dir}" "${created_account}" "${created_group}"
+
     ensure_agent_group
     create_workspace_account "${unix_user}"
     unix_group_exists "${group}" || run groupadd --system "${group}"
@@ -751,6 +804,7 @@ cmd_team_add() {
         rollback_provision "${ws}" "${unix_user}" "${group}" "${base_dir}" "${created_account}" "${created_group}"
         die "registry commit failed; rolled back"
     fi
+    disarm_provision_rollback
     info "team workspace '${ws}' is up: socket $(socket_path_for "${ws}")"
     echo "lsw: repos are cloned in fresh from GitHub (architecture-v2 D9); there is no promotion path." >&2
 }
