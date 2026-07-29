@@ -1,5 +1,17 @@
 # LateShift Cloud — per-user T3 Code instances
 
+> **SUPERSEDED IN PART (architecture-v2 W5).** `t3user`, `run-instance.sh` and
+> `t3code@.service` are DELETED on this branch and replaced by `lsw`,
+> `run-workspace.sh` and `t3ws@.service`. Read **`README-isolation.md`** first.
+>
+> Specifically dead here: the **local port allocator** (both cursors, the
+> reserved 3773/443 guards, the never-reuse rule), the `users.json` registry
+> format, `/home/dev/shared`, and the "`## t3user` CLI" section. Instances now
+> listen on a UNIX socket and each runs as its own UNIX account.
+>
+> The rest of this file still describes the live v1 stack and is kept for the
+> cutover window.
+
 This directory is the source of truth for the multi-instance ("LateShift Cloud")
 deployment on host `t3cloud`. The installed copies live under `/etc/systemd/system/`
 and `/home/dev/services/lateshift/`; changes should be made here first, then

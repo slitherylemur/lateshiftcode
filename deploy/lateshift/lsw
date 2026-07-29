@@ -1,0 +1,1010 @@
+#!/usr/bin/env bash
+# lsw - LateShift Cloud workspace provisioning CLI.
+#
+# Successor to `t3user`. Renamed rather than rewritten in place because:
+#   * it no longer provisions "users" -- it provisions WORKSPACES (personal and
+#     team), of which users are one input;
+#   * the live `t3user` and the live users.json must keep working untouched for
+#     the whole parallel-build cutover window (architecture-v2 D11), so the two
+#     tools have to coexist on the box without either shadowing the other.
+#
+# Usage:
+#   lsw init                                     create shared groups + dirs (idempotent)
+#   lsw migrate [--from PATH]                    seed registry.json from the legacy users.json
+#   lsw list                                     show users, workspaces, memberships
+#   lsw user add <github-login> [--project-limit N] [--admin]
+#   lsw user remove <github-login> [--force]
+#   lsw team add <project> [--project-limit N] [--member LOGIN]...
+#   lsw team remove <project> [--force]
+#   lsw member add <project> <github-login>
+#   lsw member remove <project> <github-login>
+#   lsw set <github-login> <key> <value>         keys: projectLimit, admin, status
+#
+# Every subcommand accepts --dry-run: it prints the exact privileged commands it
+# would run and writes nothing.
+#
+# State lives under /home/dev/services/lateshift:
+#   registry.json                users + workspaces + memberships (this tool is the ONLY writer)
+#   workspaces/<ws>/             per-workspace base dir (0750 <ws>:dev)
+#   workspaces/<ws>/instance.env consumed by t3ws@<ws>.service
+#   archive/                     timestamped archives of removed workspaces (never deleted)
+#
+# SAFETY: this tool only ever manages t3ws@<workspace> template units. It must
+# never touch `t3code.service` (production), `t3code@<name>.service` (the legacy
+# fleet), cloudflared, or HTTPS port 443.
+set -euo pipefail
+
+# LSW_ROOT/LSW_RUNTIME_ROOT exist so the script can be exercised end to end
+# against a scratch tree (--dry-run plus a throwaway root) without touching the
+# live one. Production always uses the defaults.
+LATESHIFT_ROOT="${LSW_ROOT:-/home/dev/services/lateshift}"
+REGISTRY="${LATESHIFT_ROOT}/registry.json"
+LEGACY_REGISTRY="${LATESHIFT_ROOT}/users.json"
+WORKSPACES_DIR="${LATESHIFT_ROOT}/workspaces"
+ARCHIVE_DIR="${LATESHIFT_ROOT}/archive"
+# Shared, fleet-wide telemetry (provider rate-limit snapshots). Not per-user.
+STATE_DIR="${LATESHIFT_ROOT}/state"
+RATE_LIMIT_DIR="${STATE_DIR}/rate-limits"
+LOCK_FILE="${LATESHIFT_ROOT}/.registry-v2.lock"
+RUNTIME_ROOT="${LSW_RUNTIME_ROOT:-/run/lsc}"
+AGENT_GROUP="lsc-agents"          # shared Claude/Codex credential group (see R3)
+PORTAL_GROUP="dev"                # portal reads workspace state.sqlite as `dev`
+CADDY_GROUP="caddy"               # gid 988 on this box; owns the socket dirs
+HEALTH_TIMEOUT_SECS=90
+DEFAULT_PROJECT_LIMIT=3
+
+DRY_RUN=false
+
+die() { echo "lsw: $*" >&2; exit 1; }
+info() { echo "lsw: $*"; }
+
+usage() {
+    sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+# run <cmd...> -- execute a privileged/mutating command, or print it under
+# --dry-run. Every state change in this script goes through run() or through
+# registry_py, so --dry-run is total rather than best-effort.
+run() {
+    if ${DRY_RUN}; then
+        printf 'DRY-RUN:'; printf ' %q' "$@"; printf '\n'
+        return 0
+    fi
+    "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Naming
+# ---------------------------------------------------------------------------
+
+validate_github_login() {
+    local v="$1"
+    [[ "${v}" =~ ^[A-Za-z0-9](-?[A-Za-z0-9])*$ ]] || die "invalid GitHub login '${v}'"
+    (( ${#v} <= 39 )) || die "invalid GitHub login '${v}': longer than 39 characters"
+}
+
+validate_project() {
+    local v="$1"
+    [[ "${v}" =~ ^[a-z0-9](-?[a-z0-9])*$ ]] || die "invalid project name '${v}' (allowed: [a-z0-9-])"
+    (( ${#v} >= 2 && ${#v} <= 24 )) || die "invalid project name '${v}': must be 2-24 characters"
+    case "${v}" in
+        t3code|production|prod|lateshift|caddy|dev|root|admin) die "project name '${v}' is reserved" ;;
+    esac
+}
+
+# UNIX account names are capped at 32 characters by useradd, but a GitHub login
+# may be 39. Derive a deterministic, collision-resistant slug instead of failing:
+# short logins keep the readable "u-<login>" form; long ones are truncated and
+# suffixed with a hash of the FULL login, so two logins sharing a 21-character
+# prefix still get different accounts. The registry stores the mapping; the slug
+# is never shown to users (architecture-v2 D12).
+unix_user_for_login() {
+    local login_lc="${1,,}" slug
+    slug="u-${login_lc}"
+    if (( ${#slug} > 30 )); then
+        slug="u-${login_lc:0:21}-$(printf '%s' "${login_lc}" | sha256sum | cut -c1-6)"
+    fi
+    printf '%s' "${slug}"
+}
+
+unix_user_for_team() { printf 't-%s' "$1"; }
+group_for_team()     { printf 'w-t-%s' "$1"; }
+
+# ---------------------------------------------------------------------------
+# Registry (python3; there is no jq on this box)
+# ---------------------------------------------------------------------------
+
+registry_py() {
+    if ${DRY_RUN}; then
+        # Read-only ops still execute under --dry-run, otherwise every
+        # precondition check would trivially "pass" and the dry run would
+        # exercise none of the real logic. Everything that WRITES is printed.
+        case "$1" in
+            get|user-exists|ws-exists|list|members|migrate-plan) : ;;
+            *) printf 'DRY-RUN: registry_py'; printf ' %q' "$@"; printf '\n'; return 0 ;;
+        esac
+    fi
+    LSW_REGISTRY="${REGISTRY}" python3 - "$@" <<'PYEOF'
+import datetime, json, os, re, sys, tempfile
+
+REGISTRY = os.environ["LSW_REGISTRY"]
+SCHEMA_VERSION = 2
+op = sys.argv[1]
+args = sys.argv[2:]
+
+def blank():
+    return {"schemaVersion": SCHEMA_VERSION, "users": {}, "workspaces": {}}
+
+if os.path.exists(REGISTRY):
+    with open(REGISTRY) as f:
+        reg = json.load(f)
+else:
+    reg = blank()
+reg.setdefault("schemaVersion", SCHEMA_VERSION)
+reg.setdefault("users", {})
+reg.setdefault("workspaces", {})
+
+if reg["schemaVersion"] != SCHEMA_VERSION:
+    sys.exit("registry schemaVersion %r is not %d; refusing to touch it"
+             % (reg["schemaVersion"], SCHEMA_VERSION))
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def save():
+    # Crash-safe write: temp file in the same dir -> fsync -> atomic rename ->
+    # fsync the directory so the rename itself survives a power loss.
+    reg_dir = os.path.dirname(REGISTRY)
+    fd, tmp = tempfile.mkstemp(prefix="registry.json.tmp.", dir=reg_dir)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(reg, f, indent=2, sort_keys=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o640)
+        os.rename(tmp, REGISTRY)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    dfd = os.open(reg_dir, os.O_DIRECTORY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+def ws_of(wid):
+    ws = reg["workspaces"].get(wid)
+    if ws is None:
+        sys.exit("workspace '%s' not found" % wid)
+    return ws
+
+if op == "ensure":
+    if not os.path.exists(REGISTRY):
+        reg["createdAt"] = now()
+        save()
+
+elif op == "user-exists":
+    sys.exit(0 if args[0].lower() in reg["users"] else 1)
+
+elif op == "ws-exists":
+    sys.exit(0 if args[0] in reg["workspaces"] else 1)
+
+elif op == "get":
+    # get <kind:user|workspace> <id> <field>
+    kind, ident, field = args[0], args[1], args[2]
+    src = reg["users"] if kind == "user" else reg["workspaces"]
+    ident = ident.lower() if kind == "user" else ident
+    if ident not in src:
+        sys.exit(1)
+    value = src[ident].get(field)
+    print("" if value is None else (json.dumps(value) if isinstance(value, (list, dict)) else value))
+
+elif op == "commit-personal":
+    # commit-personal <login> <unixUser> <wsId> <projectLimit> <admin>
+    login, unix_user, wid = args[0], args[1], args[2]
+    project_limit, admin = int(args[3]), args[4] == "true"
+    key = login.lower()
+    if key in reg["users"]:
+        sys.exit("user '%s' already present at commit time" % login)
+    if wid in reg["workspaces"]:
+        sys.exit("workspace '%s' already present at commit time" % wid)
+    reg["users"][key] = {
+        "githubLogin": login,
+        "unixUser": unix_user,
+        "personalWorkspace": wid,
+        "admin": admin,
+        "status": "active",
+        "avatarUrl": None,
+        "createdAt": now(),
+    }
+    reg["workspaces"][wid] = {
+        "id": wid,
+        "kind": "personal",
+        "unixUser": unix_user,
+        "unixGroup": unix_user,
+        "baseDir": "/home/dev/services/lateshift/workspaces/%s" % wid,
+        "socketPath": "/run/lsc/%s/http.sock" % wid,
+        "unit": "t3ws@%s.service" % wid,
+        "projectLimit": project_limit,
+        "owner": login,
+        "members": [login],
+        "createdAt": now(),
+    }
+    save()
+
+elif op == "commit-team":
+    # commit-team <project> <unixUser> <unixGroup> <wsId> <projectLimit> <member>...
+    project, unix_user, unix_group, wid = args[0], args[1], args[2], args[3]
+    project_limit = int(args[4])
+    members = args[5:]
+    if wid in reg["workspaces"]:
+        sys.exit("workspace '%s' already present at commit time" % wid)
+    for m in members:
+        if m.lower() not in reg["users"]:
+            sys.exit("member '%s' has no personal workspace; add the user first" % m)
+    reg["workspaces"][wid] = {
+        "id": wid,
+        "kind": "team",
+        "project": project,
+        "unixUser": unix_user,
+        "unixGroup": unix_group,
+        "baseDir": "/home/dev/services/lateshift/workspaces/%s" % wid,
+        "socketPath": "/run/lsc/%s/http.sock" % wid,
+        "unit": "t3ws@%s.service" % wid,
+        "projectLimit": project_limit,
+        "owner": None,
+        "members": [reg["users"][m.lower()]["githubLogin"] for m in members],
+        "createdAt": now(),
+    }
+    save()
+
+elif op == "remove-workspace":
+    wid = args[0]
+    ws = ws_of(wid)
+    if ws["kind"] == "personal":
+        owner = (ws.get("owner") or "").lower()
+        reg["users"].pop(owner, None)
+        # A removed user must not linger as a member of any team.
+        for other in reg["workspaces"].values():
+            other["members"] = [m for m in other.get("members", []) if m.lower() != owner]
+    del reg["workspaces"][wid]
+    save()
+
+elif op == "member-add":
+    wid, login = args[0], args[1]
+    ws = ws_of(wid)
+    if ws["kind"] != "team":
+        sys.exit("workspace '%s' is personal; membership is fixed" % wid)
+    user = reg["users"].get(login.lower())
+    if user is None:
+        sys.exit("user '%s' is not provisioned; run 'lsw user add %s' first" % (login, login))
+    if any(m.lower() == login.lower() for m in ws["members"]):
+        sys.exit("'%s' is already a member of '%s'" % (login, wid))
+    ws["members"].append(user["githubLogin"])
+    save()
+
+elif op == "member-remove":
+    wid, login = args[0], args[1]
+    ws = ws_of(wid)
+    if ws["kind"] != "team":
+        sys.exit("workspace '%s' is personal; membership is fixed" % wid)
+    before = len(ws["members"])
+    ws["members"] = [m for m in ws["members"] if m.lower() != login.lower()]
+    if len(ws["members"]) == before:
+        sys.exit("'%s' is not a member of '%s'" % (login, wid))
+    save()
+
+elif op == "members":
+    print("\n".join(ws_of(args[0]).get("members", [])))
+
+elif op == "set":
+    login, key, value = args[0].lower(), args[1], args[2]
+    user = reg["users"].get(login)
+    if user is None:
+        sys.exit("user '%s' not found" % args[0])
+    if key == "projectLimit":
+        if not (value.isdigit() and 0 <= int(value) <= 999):
+            sys.exit("projectLimit must be an integer 0-999")
+        reg["workspaces"][user["personalWorkspace"]]["projectLimit"] = int(value)
+    elif key == "admin":
+        if value not in ("true", "false"):
+            sys.exit("admin must be 'true' or 'false'")
+        user["admin"] = value == "true"
+    elif key == "status":
+        if value not in ("active", "pending", "suspended"):
+            sys.exit("status must be active|pending|suspended")
+        user["status"] = value
+    else:
+        sys.exit("key '%s' is not settable (allowed: projectLimit, admin, status)" % key)
+    save()
+
+elif op == "list":
+    print("USERS")
+    fmt = "  {:<24} {:<24} {:<20} {:>6} {:<10} {}"
+    print(fmt.format("GITHUB LOGIN", "UNIX USER", "PERSONAL WORKSPACE", "ADMIN", "STATUS", "CREATED"))
+    for key, u in sorted(reg["users"].items()):
+        print(fmt.format(u["githubLogin"], u["unixUser"], u["personalWorkspace"],
+                         "yes" if u["admin"] else "no", u["status"], u["createdAt"]))
+    print()
+    print("WORKSPACES")
+    wfmt = "  {:<24} {:<9} {:<24} {:>6}  {}"
+    print(wfmt.format("ID", "KIND", "UNIX USER", "LIMIT", "MEMBERS"))
+    for wid, w in sorted(reg["workspaces"].items()):
+        print(wfmt.format(wid, w["kind"], w["unixUser"], w["projectLimit"],
+                          ", ".join(w.get("members", [])) or "-"))
+
+elif op == "migrate-plan":
+    # migrate-plan <legacy-users.json>
+    # Emits a tab-separated plan for the bash side. Writes nothing.
+    with open(args[0]) as f:
+        legacy = json.load(f)
+    for name, u in sorted(legacy.get("users", {}).items()):
+        login = u.get("githubLogin")
+        legacy_only = "false"
+        if not login:
+            # No GitHub identity was ever recorded (e.g. the `testuser` canary).
+            # The new model keys everything on the GitHub login, so we cannot
+            # invent one. Emit the row flagged so the caller reports it and the
+            # admin sets the real login before the workspace is usable.
+            login = name
+            legacy_only = "true"
+        if not re.fullmatch(r"[A-Za-z0-9](-?[A-Za-z0-9])*", login):
+            print("SKIP\t%s\tunmappable login %r" % (name, login))
+            continue
+        print("USER\t%s\t%s\t%d\t%s\t%s" % (
+            name, login, int(u.get("projectLimit", 3)),
+            "true" if u.get("admin") else "false", legacy_only))
+        for p in u.get("sharedProjects", []) or []:
+            # Old-style share grants have no equivalent: sharing is now a team
+            # workspace, which is born empty and cloned fresh (D9). Report them
+            # so the admin can recreate them deliberately.
+            # Report the GITHUB LOGIN, not the legacy account name: lsw team
+            # add --member only accepts provisioned logins, so printing the
+            # legacy name would hand the admin a command that cannot work.
+            print("DROPPED-SHARE\t%s\t%s" % (login, p))
+        if u.get("monthlyBudgetUsd"):
+            print("DROPPED-BUDGET\t%s\t%s" % (name, u["monthlyBudgetUsd"]))
+
+else:
+    sys.exit("unknown registry op: %s" % op)
+PYEOF
+}
+
+# ---------------------------------------------------------------------------
+# Host-side helpers
+# ---------------------------------------------------------------------------
+
+require_root() {
+    [[ "${EUID}" -eq 0 ]] || die "must run as root (provisioning creates UNIX accounts)"
+}
+
+unix_user_exists() { getent passwd "$1" >/dev/null 2>&1; }
+unix_group_exists() { getent group "$1" >/dev/null 2>&1; }
+
+# UNIX group members of <group>, one per line (secondary members only, which is
+# what we use groups for here).
+group_members() {
+    getent group "$1" 2>/dev/null | awk -F: '{print $4}' | tr ',' '\n' | sed '/^$/d' | sort
+}
+
+ensure_agent_group() {
+    if ! unix_group_exists "${AGENT_GROUP}"; then
+        run groupadd --system "${AGENT_GROUP}"
+    fi
+    # The shared Claude/Codex credentials must be group-readable AND WRITABLE by
+    # every workspace account: the CLIs refresh their OAuth tokens in place, and
+    # a read-only mount breaks refresh. setgid on the directories so files the
+    # CLIs create later stay in the group.
+    #
+    # THIS MEANS CREDENTIAL ISOLATION IS NOT ACHIEVED. Any agent in any
+    # workspace can read the shared subscription token. Per-workspace UNIX
+    # accounts buy BOX isolation only. Known and accepted: architecture-v2 R3.
+    # NOTE /home/dev/.cache is deliberately absent from this list. t3ws@.service
+    # no longer shares it; each workspace gets its own <base>/home/.cache. A
+    # shared writable package cache is a cross-workspace code-execution path.
+    local p
+    for p in /home/dev/.claude /home/dev/.codex; do
+        [[ -e "${p}" ]] || continue
+        run chgrp -R "${AGENT_GROUP}" "${p}"
+        run chmod -R g+rwX "${p}"
+        run find "${p}" -type d -exec chmod g+s {} +
+    done
+    if [[ -e /home/dev/.claude.json ]]; then
+        run chgrp "${AGENT_GROUP}" /home/dev/.claude.json
+        run chmod 660 /home/dev/.claude.json
+    fi
+}
+
+# Provider rate-limit snapshots are written by EVERY workspace instance and
+# read by the portal (which runs as `dev`). 2775 dev:lsc-agents: setgid so the
+# JSON files each instance drops here stay group-writable and the next instance
+# can replace them. Nothing user-identifying is stored -- these describe the
+# shared subscription's remaining window, not anyone's work.
+ensure_rate_limit_dir() {
+    run mkdir -p "${RATE_LIMIT_DIR}"
+    run chown "dev:${AGENT_GROUP}" "${STATE_DIR}" "${RATE_LIMIT_DIR}"
+    run chmod 2775 "${RATE_LIMIT_DIR}"
+    run chmod 0755 "${STATE_DIR}"
+}
+
+cmd_init() {
+    require_root
+    run mkdir -p "${WORKSPACES_DIR}" "${ARCHIVE_DIR}"
+    run chmod 755 "${WORKSPACES_DIR}"
+    run chmod 750 "${ARCHIVE_DIR}"
+    ensure_agent_group
+    ensure_rate_limit_dir
+    registry_py ensure
+    unix_group_exists "${CADDY_GROUP}" || die "group '${CADDY_GROUP}' does not exist; is Caddy installed?"
+    if [[ ! -f /etc/tmpfiles.d/lsc.conf ]]; then
+        echo "lsw: WARNING /etc/tmpfiles.d/lsc.conf is not installed." >&2
+        echo "     Install deploy/lateshift/tmpfiles-lsc.conf there and run" >&2
+        echo "     'systemd-tmpfiles --create' BEFORE starting any t3ws@ unit," >&2
+        echo "     or the first workspace to start will own ${RUNTIME_ROOT}." >&2
+    fi
+    info "init complete (registry: ${REGISTRY})"
+}
+
+# Create the UNIX account for a workspace. System account: no password, no login
+# shell, no home of its own (the base dir is passed explicitly to the server and
+# HOME is pinned to /home/dev by the unit).
+create_workspace_account() {
+    local unix_user="$1"
+    if unix_user_exists "${unix_user}"; then
+        info "UNIX account ${unix_user} already exists (reusing)"
+    else
+        run useradd --system --no-create-home --home-dir /nonexistent \
+            --shell /usr/sbin/nologin --user-group "${unix_user}"
+    fi
+    run usermod -aG "${AGENT_GROUP}" "${unix_user}"
+}
+
+# Base dir layout. Group is `dev` (the portal's account) at 0750 so the portal
+# can read userdata/state.sqlite for usage attribution -- it reads the DBs
+# directly, there is no API. No OTHER workspace account is in group dev, so this
+# does not weaken cross-workspace isolation.
+create_base_dir() {
+    local ws="$1" unix_user="$2" base_dir="${WORKSPACES_DIR}/$1"
+    run mkdir -p "${base_dir}"
+    run chown "${unix_user}:${PORTAL_GROUP}" "${base_dir}"
+    run chmod 0750 "${base_dir}"
+
+    # <base>/home is the workspace's HOME (t3ws@.service pins it there). It must
+    # be owned by, and writable by, the workspace account: the agent CLIs write
+    # temp files directly in $HOME. The three entries created inside it are the
+    # BIND MOUNT TARGETS for the shared Claude/Codex credentials -- systemd would
+    # create them itself, but pre-creating them with the right owner keeps the
+    # on-disk layout obvious and stops a first start from leaving root-owned
+    # stubs behind if the bind is ever removed.
+    run mkdir -p "${base_dir}/home/.claude" "${base_dir}/home/.codex" "${base_dir}/home/.cache"
+    run touch "${base_dir}/home/.claude.json"
+    run chown -R "${unix_user}:${unix_user}" "${base_dir}/home"
+    run chmod 0700 "${base_dir}/home"
+}
+
+write_instance_env() {
+    local ws="$1" project_limit="$2" base_dir="${WORKSPACES_DIR}/$1"
+    if ${DRY_RUN}; then
+        echo "DRY-RUN: write ${base_dir}/instance.env (T3CODE_MAX_PROJECTS=${project_limit})"
+        return 0
+    fi
+    local tmp
+    tmp="$(mktemp "${base_dir}/instance.env.tmp.XXXXXX")"
+    cat > "${tmp}" <<EOF
+# LateShift Cloud workspace config for '${ws}' (consumed by t3ws@${ws}.service)
+LSC_WORKSPACE=${ws}
+T3CODE_MAX_PROJECTS=${project_limit}
+EOF
+    # root-owned, group-readable by the workspace account (whose primary group
+    # is its own name, created by `useradd --user-group`). The instance must
+    # read this file but must never be able to rewrite its own project limit.
+    chmod 0640 "${tmp}"
+    # Group is the workspace account's own primary group (created by
+    # `useradd --user-group`, so it is named after the account, which for both
+    # personal and team workspaces equals the workspace id). Named explicitly
+    # rather than reusing ${ws} so this keeps working if the two ever diverge.
+    chown "root:$(id -gn "${ws}")" "${tmp}"
+    mv -f "${tmp}" "${base_dir}/instance.env"
+}
+
+socket_path_for() { printf '%s/%s/http.sock' "${RUNTIME_ROOT}" "$1"; }
+
+wait_for_health() {
+    local ws="$1" sock deadline=$((SECONDS + HEALTH_TIMEOUT_SECS)) code
+    sock="$(socket_path_for "${ws}")"
+    if ${DRY_RUN}; then echo "DRY-RUN: wait for HTTP 200 over ${sock}"; return 0; fi
+    while (( SECONDS < deadline )); do
+        if [[ -S "${sock}" ]]; then
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+                    --unix-socket "${sock}" 'http://localhost/' || true)
+            if [[ "${code}" == "200" ]] \
+               && [[ "$(systemctl is-active "t3ws@${ws}.service" 2>/dev/null)" == "active" ]]; then
+                echo "healthy (HTTP ${code} over ${sock}, unit active)"
+                return 0
+            fi
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+# The port-based equivalent of this check (verify_unit_owns_port) asked "is the
+# thing answering on this port really our unit?". With a unix socket the same
+# question is answered by the filesystem: confirm the socket is a socket, sits
+# in the workspace's own runtime dir, is owned by the workspace account, and
+# that the unit's main PID is live inside its cgroup.
+verify_socket_ownership() {
+    local ws="$1" unix_user="$2" sock owner mode main_pid cgroup_procs
+    sock="$(socket_path_for "${ws}")"
+    if ${DRY_RUN}; then echo "DRY-RUN: verify ownership of ${sock}"; return 0; fi
+    [[ -S "${sock}" ]] || { echo "${sock} is not a socket" >&2; return 1; }
+    owner="$(stat -c '%U' "${sock}")"
+    [[ "${owner}" == "${unix_user}" ]] || {
+        echo "${sock} is owned by '${owner}', not '${unix_user}'" >&2; return 1; }
+    mode="$(stat -c '%U:%G %a' "${RUNTIME_ROOT}/${ws}")"
+    [[ "${mode}" == "${unix_user}:${CADDY_GROUP} 750" ]] || {
+        echo "${RUNTIME_ROOT}/${ws} is '${mode}', expected '${unix_user}:${CADDY_GROUP} 750'" >&2
+        return 1; }
+    main_pid="$(systemctl show -p MainPID --value "t3ws@${ws}.service" 2>/dev/null || echo 0)"
+    [[ "${main_pid}" =~ ^[0-9]+$ && "${main_pid}" -gt 0 ]] || {
+        echo "t3ws@${ws} has no main PID" >&2; return 1; }
+    cgroup_procs="/sys/fs/cgroup/system.slice/system-t3ws.slice/t3ws@${ws}.service/cgroup.procs"
+    if [[ -r "${cgroup_procs}" ]] && ! grep -qx "${main_pid}" "${cgroup_procs}"; then
+        echo "main PID ${main_pid} is not in t3ws@${ws}.service's cgroup" >&2
+        return 1
+    fi
+    echo "socket ${sock} confirmed owned by ${unix_user}, dir ${mode}, main pid ${main_pid}"
+}
+
+# Full rollback of a failed provision. The registry is committed only after
+# health, so there is nothing to undo there -- this unwinds host state only, and
+# only what THIS invocation created.
+rollback_provision() {
+    local ws="$1" unix_user="$2" group="$3" created_dir="$4" created_account="$5" created_group="$6"
+    echo "lsw: rolling back failed provision of '${ws}' ..." >&2
+    run systemctl disable --now "t3ws@${ws}.service" >/dev/null 2>&1 || true
+    run systemctl reset-failed "t3ws@${ws}.service" >/dev/null 2>&1 || true
+    if [[ -n "${created_dir}" && -d "${created_dir}" ]]; then
+        # Safe: this exact path was verified absent at the start of this command
+        # and created by this invocation; the instance never became healthy, so
+        # it contains no user data.
+        run rm -rf "${created_dir}"
+    fi
+    if [[ "${created_account}" == "true" ]] && unix_user_exists "${unix_user}"; then
+        run userdel "${unix_user}" || echo "lsw: warning: userdel ${unix_user} failed" >&2
+    fi
+    if [[ "${created_group}" == "true" && -n "${group}" ]] && unix_group_exists "${group}"; then
+        run groupdel "${group}" || echo "lsw: warning: groupdel ${group} failed" >&2
+    fi
+}
+
+start_and_verify() {
+    local ws="$1" unix_user="$2"
+    run systemctl daemon-reload
+    if ! run systemctl enable --now "t3ws@${ws}.service"; then
+        return 1
+    fi
+    echo -n "waiting for health on $(socket_path_for "${ws}") ... "
+    if ! wait_for_health "${ws}"; then
+        echo "FAILED"
+        echo "workspace did not become healthy within ${HEALTH_TIMEOUT_SECS}s; recent logs:" >&2
+        journalctl -u "t3ws@${ws}" -n 30 --no-pager >&2 || true
+        return 1
+    fi
+    verify_socket_ownership "${ws}" "${unix_user}" || return 1
+}
+
+# ---------------------------------------------------------------------------
+# Personal workspaces
+# ---------------------------------------------------------------------------
+
+cmd_user_add() {
+    require_root
+    local login="" project_limit="${DEFAULT_PROJECT_LIMIT}" admin=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --project-limit) project_limit="${2:?--project-limit needs a value}"; shift 2 ;;
+            --admin) admin=true; shift ;;
+            -*) die "unknown flag for 'user add': $1" ;;
+            *) [[ -n "${login}" ]] && die "unexpected argument: $1"; login="$1"; shift ;;
+        esac
+    done
+    [[ -n "${login}" ]] || die "usage: lsw user add <github-login> [--project-limit N] [--admin]"
+    validate_github_login "${login}"
+    [[ "${project_limit}" =~ ^[0-9]{1,3}$ ]] || die "--project-limit must be an integer 0-999"
+
+    local ws unix_user base_dir
+    ws="$(unix_user_for_login "${login}")"
+    unix_user="${ws}"
+    base_dir="${WORKSPACES_DIR}/${ws}"
+
+    registry_py user-exists "${login}" && die "user '${login}' already exists (refusing to re-add)"
+    registry_py ws-exists "${ws}" && die "workspace '${ws}' already exists (refusing to re-add)"
+    [[ -e "${base_dir}" ]] && die "base dir ${base_dir} already exists; resolve manually"
+
+    local created_account=false
+    unix_user_exists "${unix_user}" || created_account=true
+
+    ensure_agent_group
+    create_workspace_account "${unix_user}"
+    create_base_dir "${ws}" "${unix_user}"
+    write_instance_env "${ws}" "${project_limit}"
+
+    info "provisioning personal workspace '${ws}' for GitHub login '${login}'"
+    if ! start_and_verify "${ws}" "${unix_user}"; then
+        rollback_provision "${ws}" "${unix_user}" "" "${base_dir}" "${created_account}" "false"
+        die "provision failed; rolled back (registry untouched)"
+    fi
+
+    if ! registry_py commit-personal "${login}" "${unix_user}" "${ws}" "${project_limit}" "${admin}"; then
+        rollback_provision "${ws}" "${unix_user}" "" "${base_dir}" "${created_account}" "false"
+        die "registry commit failed; rolled back"
+    fi
+    info "'${login}' is up: workspace ${ws}, socket $(socket_path_for "${ws}")"
+}
+
+cmd_user_remove() {
+    require_root
+    local login="" force=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force) force=true; shift ;;
+            -*) die "unknown flag for 'user remove': $1" ;;
+            *) [[ -n "${login}" ]] && die "unexpected argument: $1"; login="$1"; shift ;;
+        esac
+    done
+    [[ -n "${login}" ]] || die "usage: lsw user remove <github-login> [--force]"
+    validate_github_login "${login}"
+    registry_py user-exists "${login}" || die "user '${login}' not found"
+    local ws unix_user
+    ws="$(registry_py get user "${login}" personalWorkspace)"
+    unix_user="$(registry_py get user "${login}" unixUser)"
+    archive_workspace "${ws}" "${unix_user}" "${force}"
+    registry_py remove-workspace "${ws}"
+    info "user '${login}' and workspace '${ws}' removed (data archived, never deleted)"
+    echo "lsw: NOTE remove '${unix_user}' from any team groups you no longer want it in:" >&2
+    id -nG "${unix_user}" 2>/dev/null | tr ' ' '\n' | grep '^w-t-' || true
+}
+
+# ---------------------------------------------------------------------------
+# Team workspaces
+# ---------------------------------------------------------------------------
+
+cmd_team_add() {
+    require_root
+    local project="" project_limit="${DEFAULT_PROJECT_LIMIT}" members=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --project-limit) project_limit="${2:?--project-limit needs a value}"; shift 2 ;;
+            --member) members+=("${2:?--member needs a value}"); shift 2 ;;
+            -*) die "unknown flag for 'team add': $1" ;;
+            *) [[ -n "${project}" ]] && die "unexpected argument: $1"; project="$1"; shift ;;
+        esac
+    done
+    [[ -n "${project}" ]] || die "usage: lsw team add <project> [--project-limit N] [--member LOGIN]..."
+    validate_project "${project}"
+    [[ "${project_limit}" =~ ^[0-9]{1,3}$ ]] || die "--project-limit must be an integer 0-999"
+
+    local ws unix_user group base_dir
+    ws="$(unix_user_for_team "${project}")"
+    unix_user="${ws}"
+    group="$(group_for_team "${project}")"
+    base_dir="${WORKSPACES_DIR}/${ws}"
+
+    registry_py ws-exists "${ws}" && die "team workspace '${ws}' already exists"
+    [[ -e "${base_dir}" ]] && die "base dir ${base_dir} already exists; resolve manually"
+
+    # Every member must already have a personal workspace: their UNIX account is
+    # what goes into the team group. Check ALL of them before creating anything.
+    local m
+    for m in "${members[@]:-}"; do
+        [[ -n "${m}" ]] || continue
+        validate_github_login "${m}"
+        registry_py user-exists "${m}" || die "member '${m}' is not provisioned; run 'lsw user add ${m}' first"
+    done
+
+    local created_account=false created_group=false
+    unix_user_exists "${unix_user}" || created_account=true
+    unix_group_exists "${group}" || created_group=true
+
+    ensure_agent_group
+    create_workspace_account "${unix_user}"
+    unix_group_exists "${group}" || run groupadd --system "${group}"
+    create_base_dir "${ws}" "${unix_user}"
+    write_instance_env "${ws}" "${project_limit}"
+
+    # The team's PROJECT directory is the shared surface: owned by the team
+    # account, group-readable by w-t-<project>, setgid so files created inside
+    # keep the group. This is what makes a share grant real access control
+    # rather than a UI listing filter.
+    #
+    # userdata/ (threads, state.sqlite) and identity/ (the team's scoped PAT)
+    # are deliberately NOT in the group: a member reaches the team's threads by
+    # connecting to the team INSTANCE through the gateway, never by reading the
+    # DB from their personal instance. Keeping them 0700 means a member's
+    # personal workspace cannot exfiltrate the team PAT or read the DB directly.
+    run mkdir -p "${base_dir}/projects" "${base_dir}/userdata" "${base_dir}/identity"
+    run chown "${unix_user}:${group}" "${base_dir}/projects"
+    run chmod 2750 "${base_dir}/projects"
+    run chown "${unix_user}:${PORTAL_GROUP}" "${base_dir}/userdata"
+    run chmod 0750 "${base_dir}/userdata"
+    run chown "${unix_user}:${unix_user}" "${base_dir}/identity"
+    run chmod 0700 "${base_dir}/identity"
+
+    for m in "${members[@]:-}"; do
+        [[ -n "${m}" ]] || continue
+        run usermod -aG "${group}" "$(registry_py get user "${m}" unixUser)"
+    done
+
+    info "provisioning team workspace '${ws}' (group ${group})"
+    if ! start_and_verify "${ws}" "${unix_user}"; then
+        rollback_provision "${ws}" "${unix_user}" "${group}" "${base_dir}" "${created_account}" "${created_group}"
+        die "provision failed; rolled back (registry untouched)"
+    fi
+
+    if ! registry_py commit-team "${project}" "${unix_user}" "${group}" "${ws}" "${project_limit}" "${members[@]:-}"; then
+        rollback_provision "${ws}" "${unix_user}" "${group}" "${base_dir}" "${created_account}" "${created_group}"
+        die "registry commit failed; rolled back"
+    fi
+    info "team workspace '${ws}' is up: socket $(socket_path_for "${ws}")"
+    echo "lsw: repos are cloned in fresh from GitHub (architecture-v2 D9); there is no promotion path." >&2
+}
+
+cmd_team_remove() {
+    require_root
+    local project="" force=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force) force=true; shift ;;
+            -*) die "unknown flag for 'team remove': $1" ;;
+            *) [[ -n "${project}" ]] && die "unexpected argument: $1"; project="$1"; shift ;;
+        esac
+    done
+    [[ -n "${project}" ]] || die "usage: lsw team remove <project> [--force]"
+    validate_project "${project}"
+    local ws group
+    ws="$(unix_user_for_team "${project}")"
+    group="$(group_for_team "${project}")"
+    registry_py ws-exists "${ws}" || die "team workspace '${ws}' not found"
+    archive_workspace "${ws}" "${ws}" "${force}"
+    unix_group_exists "${group}" && run groupdel "${group}"
+    registry_py remove-workspace "${ws}"
+    info "team workspace '${ws}' removed (data archived, never deleted)"
+}
+
+# ---------------------------------------------------------------------------
+# Membership
+# ---------------------------------------------------------------------------
+
+# Membership has THREE representations that must agree: the registry, the UNIX
+# group, and the target instance's project list. Today's system has two
+# unreconciled sources of truth and an unshare path that clears the grant even
+# when the instance operation fails. Here we refuse to act unless the two
+# representations this tool owns already agree, change both, then re-verify.
+#
+# The instance-side project list is NOT yet reconciled here -- that is W6-B, and
+# until it lands `lsw member` prints exactly what remains to be done rather than
+# pretending the change is complete.
+assert_membership_consistent() {
+    local ws="$1" group="$2" reg_members unix_members expected diff
+    reg_members="$(registry_py members "${ws}" | tr '[:upper:]' '[:lower:]' | sort)"
+    unix_members="$(group_members "${group}")"
+    expected=""
+    local m
+    while IFS= read -r m; do
+        [[ -n "${m}" ]] || continue
+        expected+="$(registry_py get user "${m}" unixUser)"$'\n'
+    done <<< "${reg_members}"
+    expected="$(printf '%s' "${expected}" | sed '/^$/d' | sort)"
+    if ! diff="$(diff <(printf '%s\n' "${expected}") <(printf '%s\n' "${unix_members}"))"; then
+        echo "lsw: registry membership and UNIX group '${group}' disagree:" >&2
+        echo "${diff}" >&2
+        die "refusing to change membership while the two sources of truth disagree"
+    fi
+}
+
+cmd_member() {
+    require_root
+    local action="${1:?usage: lsw member add|remove <project> <github-login>}"; shift
+    [[ "${action}" == "add" || "${action}" == "remove" ]] || die "usage: lsw member add|remove <project> <github-login>"
+    local project="${1:?project required}" login="${2:?github login required}"
+    validate_project "${project}"
+    validate_github_login "${login}"
+
+    local ws group unix_user
+    ws="$(unix_user_for_team "${project}")"
+    group="$(group_for_team "${project}")"
+    registry_py ws-exists "${ws}" || die "team workspace '${ws}' not found"
+    registry_py user-exists "${login}" || die "user '${login}' is not provisioned"
+    unix_group_exists "${group}" || die "UNIX group '${group}' is missing; registry and host disagree"
+    unix_user="$(registry_py get user "${login}" unixUser)"
+
+    assert_membership_consistent "${ws}" "${group}"
+
+    if [[ "${action}" == "add" ]]; then
+        registry_py member-add "${ws}" "${login}" || die "registry update failed; nothing changed"
+        if ! run usermod -aG "${group}" "${unix_user}"; then
+            registry_py member-remove "${ws}" "${login}" || true
+            die "usermod failed; registry change reverted"
+        fi
+    else
+        registry_py member-remove "${ws}" "${login}" || die "registry update failed; nothing changed"
+        if ! run gpasswd -d "${unix_user}" "${group}"; then
+            registry_py member-add "${ws}" "${login}" || true
+            die "gpasswd failed; registry change reverted"
+        fi
+    fi
+
+    ${DRY_RUN} || assert_membership_consistent "${ws}" "${group}"
+    info "membership updated: ${action} ${login} -> ${ws}"
+    echo "lsw: TWO steps remain and are NOT done by this tool yet (W6-B):" >&2
+    echo "     1. reconcile the team instance's project list" >&2
+    echo "     2. restart t3ws@${ws} -- supplementary group changes only take" >&2
+    echo "        effect for processes started after the change" >&2
+    if [[ "${action}" == "remove" ]]; then
+        echo "     3. rotate the team's fine-grained PAT (architecture-v2 open question 2)" >&2
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Removal / archive
+# ---------------------------------------------------------------------------
+
+archive_workspace() {
+    local ws="$1" unix_user="$2" force="$3" base_dir="${WORKSPACES_DIR}/$1"
+    info "stopping and disabling t3ws@${ws} ..."
+    if ! run systemctl disable --now "t3ws@${ws}.service"; then
+        if [[ "${force}" == "true" ]]; then
+            echo "lsw: warning: disabling t3ws@${ws} failed; continuing due to --force" >&2
+        else
+            die "failed to stop/disable t3ws@${ws}; aborting before archive (use --force to override)"
+        fi
+    fi
+    run systemctl reset-failed "t3ws@${ws}.service" >/dev/null 2>&1 || true
+
+    if [[ -d "${base_dir}" ]]; then
+        local dest="${ARCHIVE_DIR}/${ws}-$(date -u +%Y%m%d-%H%M%S)-$(date +%N)"
+        [[ -e "${dest}" ]] && die "archive destination ${dest} already exists; refusing to overwrite"
+        run mv -T "${base_dir}" "${dest}"
+        # Reassign ownership BEFORE deleting the account. Otherwise the archive
+        # is left owned by a dangling uid, which a future useradd could reuse --
+        # silently handing a new workspace read access to a removed one's data.
+        run chown -R "root:${PORTAL_GROUP}" "${dest}"
+        run chmod -R go-w "${dest}"
+        info "archived base dir to ${dest}"
+    fi
+    if unix_user_exists "${unix_user}"; then
+        run userdel "${unix_user}" || echo "lsw: warning: userdel ${unix_user} failed" >&2
+    fi
+    run rm -rf "${RUNTIME_ROOT:?}/${ws:?}" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Migration from the legacy users.json
+# ---------------------------------------------------------------------------
+
+cmd_migrate() {
+    require_root
+    local source="${LEGACY_REGISTRY}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --from) source="${2:?--from needs a path}"; shift 2 ;;
+            -*) die "unknown flag for migrate: $1" ;;
+            *) die "unexpected argument: $1" ;;
+        esac
+    done
+    [[ -f "${source}" ]] || die "legacy registry ${source} not found"
+
+    # Read-only against the legacy registry -- the shadow stack is SEEDED from
+    # the live one, never migrated in place. users.json is not touched.
+    local plan
+    plan="$(registry_py migrate-plan "${source}")"
+
+    local kind a b c d e failed=0
+    while IFS=$'\t' read -r kind a b c d e; do
+        case "${kind}" in
+            USER)
+                echo "== ${a}: GitHub login '${b}', projectLimit ${c}, admin ${d}"
+                if [[ "${e}" == "true" ]]; then
+                    echo "   WARNING legacy account with no githubLogin; '${b}' is a placeholder." >&2
+                    echo "   The new model keys everything on the GitHub login. Provision it, then" >&2
+                    echo "   remove and re-add under the real login before anyone signs in." >&2
+                fi
+                local flags=(--project-limit "${c}")
+                [[ "${d}" == "true" ]] && flags+=(--admin)
+                if registry_py user-exists "${b}"; then
+                    echo "   already present in registry.json; skipping"
+                elif ! cmd_user_add "${b}" "${flags[@]}" </dev/null; then
+                    echo "   FAILED to provision '${b}'" >&2
+                    failed=$((failed + 1))
+                fi
+                ;;
+            DROPPED-SHARE)
+                echo "   DROPPED share grant ${a} -> ${b}" >&2
+                echo "   Sharing is now a team workspace, born empty and cloned fresh (D9)." >&2
+                echo "   Recreate deliberately with: lsw team add <project> --member ${a}" >&2
+                ;;
+            DROPPED-BUDGET)
+                echo "   DROPPED budget ${a} = ${b} USD (budgets are deleted, architecture-v2 D5)" >&2
+                ;;
+            SKIP)
+                echo "   SKIPPED ${a}: ${b}" >&2
+                failed=$((failed + 1))
+                ;;
+        esac
+    done <<< "${plan}"
+
+    (( failed == 0 )) || die "${failed} entr(ies) could not be migrated; see above"
+    info "migration complete; ${source} was not modified"
+}
+
+cmd_list() {
+    [[ $# -eq 0 ]] || die "list takes no arguments"
+    registry_py list
+}
+
+cmd_set() {
+    require_root
+    [[ $# -eq 3 ]] || die "usage: lsw set <github-login> <key> <value>"
+    local login="$1" key="$2" value="$3"
+    validate_github_login "${login}"
+    registry_py user-exists "${login}" || die "user '${login}' not found"
+    registry_py set "${login}" "${key}" "${value}"
+    if [[ "${key}" == "projectLimit" ]]; then
+        local ws
+        ws="$(registry_py get user "${login}" personalWorkspace)"
+        write_instance_env "${ws}" "${value}"
+        info "rewrote ${WORKSPACES_DIR}/${ws}/instance.env; restart t3ws@${ws} to apply"
+    fi
+    info "set ${login}.${key} = ${value}"
+}
+
+# ---------------------------------------------------------------------------
+
+main() {
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run) DRY_RUN=true; shift ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    set -- "${args[@]:-}"
+    [[ $# -ge 1 && -n "${1:-}" ]] || usage 1
+    local cmd="$1"; shift
+
+    case "${cmd}" in
+        init|migrate|list|set)
+            mkdir -p "${LATESHIFT_ROOT}"
+            exec 9> "${LOCK_FILE}"
+            flock 9
+            registry_py ensure
+            "cmd_${cmd}" "$@"
+            ;;
+        user|team)
+            local sub="${1:?usage: lsw ${cmd} add|remove ...}"; shift
+            [[ "${sub}" == "add" || "${sub}" == "remove" ]] || die "usage: lsw ${cmd} add|remove ..."
+            mkdir -p "${LATESHIFT_ROOT}"
+            exec 9> "${LOCK_FILE}"
+            flock 9
+            registry_py ensure
+            "cmd_${cmd}_${sub}" "$@"
+            ;;
+        member)
+            mkdir -p "${LATESHIFT_ROOT}"
+            exec 9> "${LOCK_FILE}"
+            flock 9
+            registry_py ensure
+            cmd_member "$@"
+            ;;
+        -h|--help|help) usage 0 ;;
+        *) die "unknown command '${cmd}' (try: init, migrate, list, user, team, member, set)" ;;
+    esac
+}
+
+main "$@"

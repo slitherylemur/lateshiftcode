@@ -142,11 +142,25 @@ const HttpServerLive = Layer.unwrap(
         Effect.promise(() => import("@effect/platform-node/NodeHttpServer")),
         Effect.promise(() => import("node:http")),
       ]);
-      return NodeHttpServer.layer(NodeHttp.createServer, {
-        host: config.host ?? "127.0.0.1",
-        port: config.port,
-        gracefulShutdownTimeout: HTTP_PREEMPTIVE_SHUTDOWN_GRACE_MS,
-      });
+      // LateShift Cloud: `config.socketPath` binds a UNIX domain socket instead
+      // of a TCP port, so a workspace is reachable only through the gateway
+      // (kernel-enforced by the socket directory's permissions). Node's
+      // `server.listen({ path })` is passed straight through by
+      // @effect/platform-node, and every downstream consumer of the server
+      // address already handles the `UnixAddress` case.
+      return NodeHttpServer.layer(
+        NodeHttp.createServer,
+        config.socketPath !== undefined
+          ? {
+              path: config.socketPath,
+              gracefulShutdownTimeout: HTTP_PREEMPTIVE_SHUTDOWN_GRACE_MS,
+            }
+          : {
+              host: config.host ?? "127.0.0.1",
+              port: config.port,
+              gracefulShutdownTimeout: HTTP_PREEMPTIVE_SHUTDOWN_GRACE_MS,
+            },
+      );
     }
   }),
 );

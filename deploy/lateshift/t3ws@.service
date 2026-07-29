@@ -1,0 +1,174 @@
+[Unit]
+Description=LateShift Cloud workspace %i
+After=network-online.target
+Wants=network-online.target
+
+# ---------------------------------------------------------------------------
+# %i is the WORKSPACE ID and is simultaneously:
+#   * the UNIX account the instance runs as   (u-<login> or t-<project>)
+#   * the runtime directory name              (/run/lsc/%i)
+#   * the base dir name                       (.../lateshift/workspaces/%i)
+# `lsw` guarantees all four exist and agree before it ever enables this unit.
+#
+# This replaces t3code@.service, which ran EVERY instance as the single `dev`
+# account with a blanket ReadWritePaths=/home/dev/shared carve-out -- i.e. every
+# user could read and write every other user's shared data. That is the whole
+# point of this template: isolation is now kernel-enforced, not conventional.
+# ---------------------------------------------------------------------------
+
+[Service]
+User=%i
+Group=%i
+# The shared Claude/Codex subscription credentials are group-owned by
+# lsc-agents and must stay WRITABLE (the CLIs refresh OAuth tokens in place; a
+# read-only mount breaks refresh). KNOWN, ACCEPTED LIMIT (architecture-v2 R3):
+# this means credential isolation is NOT achieved. Per-workspace UNIX accounts
+# buy box isolation only -- any agent in any workspace can read the shared
+# subscription token, because it must be able to use it.
+SupplementaryGroups=lsc-agents
+
+# HOME is the workspace's OWN directory, not /home/dev.
+#
+# The earlier draft of this unit pinned HOME=/home/dev so the agent CLIs would
+# find ~/.claude etc. That is broken under ProtectHome=tmpfs: /home/dev is then
+# a root-owned 0755 tmpfs, so $HOME itself is NOT writable and any tool that
+# writes a dotfile or a temp file directly in $HOME (claude writes
+# ~/.claude.json via a temp-file-plus-rename in $HOME) fails with EACCES.
+#
+# Instead HOME is <base>/home, which the workspace account owns, and the SHARED
+# credential dirs are bind-mounted INTO it at the conventional names. The CLIs
+# see exactly the paths they expect, and $HOME is writable.
+Environment=HOME=/home/dev/services/lateshift/workspaces/%i/home
+Environment=PATH=/home/dev/.local/bin:/home/dev/.rokit/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=/home/dev/services/lateshift/workspaces/%i
+EnvironmentFile=/home/dev/services/lateshift/workspaces/%i/instance.env
+# Real usage telemetry (architecture-v2 section 4). Re-sited here from
+# t3code@.service, which this template replaces. The server writes the latest
+# provider rate-limit snapshot into this directory, one JSON file per provider,
+# and the portal reads it. Rate limits are a property of the shared
+# SUBSCRIPTION, not of a workspace, so every instance shares the directory and
+# last writer wins. Unset in desktop/dev builds, where the store is a no-op.
+Environment=T3CODE_RATE_LIMIT_SNAPSHOT_DIR=/home/dev/services/lateshift/state/rate-limits
+ExecStart=/home/dev/services/lateshift/bin/run-workspace.sh %i
+Restart=on-failure
+RestartSec=5
+# The server exits 130 on SIGTERM; treat a requested stop as success so a plain
+# `systemctl stop` does not leave the unit in a residual failed state.
+SuccessExitStatus=130
+
+# --- Socket, and who may reach it -------------------------------------------
+# The instance binds /run/lsc/%i/http.sock and NOTHING listens on TCP. Access is
+# gated by the DIRECTORY, never by a post-listen chmod of the socket: Node
+# creates the socket with a umask-derived mode (0775 was observed in spike
+# W0-A), so between listen() and any chmod the socket would be world-
+# connectable. 0750 <workspace>:caddy on the parent directory closes that window
+# entirely -- only Caddy's group can even traverse to the socket.
+#
+# /run/lsc itself is created root-owned 0755 by tmpfiles-lsc.conf. It MUST NOT
+# be owned by a workspace account: an account that owns /run/lsc could create
+# /run/lsc/<other-workspace>/http.sock and impersonate another workspace to the
+# gateway.
+RuntimeDirectory=lsc/%i
+RuntimeDirectoryMode=0750
+# `+` runs this as root outside the sandbox. RuntimeDirectory is created owned
+# by User=/Group= of the unit, so the group has to be corrected to caddy.
+ExecStartPre=+/usr/bin/chgrp caddy /run/lsc/%i
+ExecStartPre=+/usr/bin/chmod 0750 /run/lsc/%i
+# RuntimeDirectory is removed on stop, so a stale socket cannot cause EADDRINUSE
+# on restart. run-workspace.sh unlinks defensively as well.
+
+# Resource caps: box has 7.6 GiB RAM / 4 cores; production t3code uses ~1 GiB.
+# Each instance idles around 1 GiB, so soft-cap at 1 GiB, hard-cap at 1.5 GiB,
+# and allow bursts up to 1.5 cores. That leaves headroom for prod + 4-5 users.
+MemoryHigh=1G
+MemoryMax=1536M
+CPUQuota=150%
+TasksMax=512
+
+# --- Sandbox -----------------------------------------------------------------
+# Every property below is carried over from t3code@.service. See docs/internals.md
+# for why each one exists before changing any of them.
+
+# Kills sudo/setuid escalation inside instances (required). No agent can regain
+# privileges even though /usr/bin/sudo still exists on the box.
+NoNewPrivileges=yes
+
+# Whole filesystem read-only except the explicit mounts below. Blocks writes to
+# /etc, /home/dev/projects, /home/dev/services/t3code-production, and everything
+# outside the workspace's own area.
+ProtectSystem=strict
+
+# ProtectHome=tmpfs, not read-only. Under t3code@.service the whole of /home/dev
+# was READABLE by every instance, which is exactly how the single shared
+# identity used to leak; InaccessiblePaths was a denylist patching that up. Here
+# /home is an empty tmpfs and the BindPaths below are an ALLOWLIST -- other
+# workspaces' base dirs, /home/dev/projects, ~/.config/gh, ~/.gitconfig and
+# ~/.ssh do not exist in this namespace at all.
+ProtectHome=tmpfs
+
+# Writable: this workspace's own base dir (all instance state, including its
+# HOME), plus the shared agent credential dirs mapped into that HOME.
+BindPaths=/home/dev/services/lateshift/workspaces/%i
+# Shared subscription rate-limit snapshots (see T3CODE_RATE_LIMIT_SNAPSHOT_DIR
+# above). Under ProtectHome=tmpfs this path does not exist in the namespace
+# unless it is bound in, so a plain ReadWritePaths (what t3code@.service used)
+# would not be enough. The directory is 2775 dev:lsc-agents and every workspace
+# account is in lsc-agents, so all instances can write it.
+#
+# The `-` prefix is deliberate: if `lsw init` has not created the directory yet,
+# the workspace must still start. The snapshot write then fails, the store logs
+# a warning and carries on, and the portal shows "unknown". Missing telemetry
+# must never take a workspace down.
+BindPaths=-/home/dev/services/lateshift/state/rate-limits
+BindPaths=/home/dev/.claude:/home/dev/services/lateshift/workspaces/%i/home/.claude
+BindPaths=/home/dev/.claude.json:/home/dev/services/lateshift/workspaces/%i/home/.claude.json
+BindPaths=/home/dev/.codex:/home/dev/services/lateshift/workspaces/%i/home/.codex
+# NOTE: /home/dev/.cache is deliberately NOT shared any more. The legacy
+# t3code@.service gave every instance write access to one npm/pnpm/uv cache,
+# which is a cross-workspace code-execution path: poison a cached package in
+# one workspace, get executed in another. Each workspace now gets its own
+# <base>/home/.cache. Cost is disk and cold installs; the isolation is the point.
+
+# Read-only: the server bundle it executes and the user-facing helper bin.
+BindReadOnlyPaths=/home/dev/services/lateshift/checkout
+BindReadOnlyPaths=/home/dev/services/lateshift/instance-bin
+
+# Defence in depth. With ProtectHome=tmpfs these paths are already absent, but
+# an accidental future BindPaths must not resurrect them.
+InaccessiblePaths=/home/dev/services/lateshift/secrets
+InaccessiblePaths=/home/dev/.config/gh
+InaccessiblePaths=/home/dev/.gitconfig
+
+# Private /tmp and /var/tmp per instance (no cross-instance tmp leakage).
+PrivateTmp=yes
+
+# Kernel/host hardening: block module loading, kernel-tunable and clock writes,
+# cgroup tampering, raw kernel-log access, hostname changes, and new SUID/SGID
+# or realtime privileges. None of these are needed by the server or the agents.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+
+# Restrict syscalls to the service baseline (blocks @mount, @swap, @reboot,
+# @module, @raw-io, @obsolete, ...). node's JIT needs W^X-writable memory, so
+# MemoryDenyWriteExecute is deliberately NOT set.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# Carried over from t3code@.service: `dev` is a login user with a live
+# production process; do not reap its IPC on an instance stop. Workspace
+# accounts are dedicated so this is now belt-and-braces, but the property is
+# harmless and removing it would re-introduce the original hazard if a unit were
+# ever pointed back at `dev`.
+RemoveIPC=no
+
+[Install]
+WantedBy=multi-user.target

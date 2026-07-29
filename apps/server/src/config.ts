@@ -67,6 +67,11 @@ export class ServerConfig extends Context.Service<
     readonly otlpServiceName: string;
     readonly mode: RuntimeMode;
     readonly port: number;
+    /**
+     * LateShift Cloud: when set, the HTTP server binds this UNIX domain socket
+     * instead of a TCP port. `port`/`host` are then ignored by the bind site.
+     */
+    readonly socketPath: string | undefined;
     readonly host: string | undefined;
     readonly cwd: string;
     readonly baseDir: string;
@@ -183,6 +188,7 @@ const makeTest = Effect.fn("ServerConfig.makeTest")(function* (
     tailscaleServeEnabled: false,
     tailscaleServePort: 443,
     port: 0,
+    socketPath: undefined,
     host: undefined,
     desktopBootstrapToken: undefined,
     staticDir: undefined,

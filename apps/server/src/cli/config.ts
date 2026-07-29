@@ -26,6 +26,12 @@ export const portFlag = Flag.integer("port").pipe(
   Flag.withDescription("Port for the HTTP/WebSocket server."),
   Flag.optional,
 );
+export const socketFlag = Flag.string("socket").pipe(
+  Flag.withDescription(
+    "Bind a UNIX domain socket at this path instead of a TCP port. Wins over --port.",
+  ),
+  Flag.optional,
+);
 export const hostFlag = Flag.string("host").pipe(
   Flag.withDescription("Host/interface to bind (for example 127.0.0.1, 0.0.0.0, or a Tailnet IP)."),
   Flag.optional,
@@ -103,6 +109,10 @@ const EnvServerConfig = Config.all({
     Config.map(Option.getOrUndefined),
   ),
   port: Config.port("T3CODE_PORT").pipe(Config.option, Config.map(Option.getOrUndefined)),
+  socketPath: Config.string("T3CODE_SOCKET").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
   host: Config.string("T3CODE_HOST").pipe(Config.option, Config.map(Option.getOrUndefined)),
   t3Home: Config.string("T3CODE_HOME").pipe(Config.option, Config.map(Option.getOrUndefined)),
   devUrl: Config.url("VITE_DEV_SERVER_URL").pipe(Config.option, Config.map(Option.getOrUndefined)),
@@ -135,6 +145,7 @@ const EnvServerConfig = Config.all({
 export interface CliServerFlags {
   readonly mode: Option.Option<ServerConfig.RuntimeMode>;
   readonly port: Option.Option<number>;
+  readonly socketPath: Option.Option<string>;
   readonly host: Option.Option<string>;
   readonly baseDir: Option.Option<string>;
   readonly cwd: Option.Option<string>;
@@ -164,6 +175,7 @@ export const projectLocationFlags = {
 export const sharedServerCommandFlags = {
   mode: modeFlag,
   port: portFlag,
+  socketPath: socketFlag,
   host: hostFlag,
   baseDir: baseDirFlag,
   cwd: Argument.string("cwd").pipe(
@@ -214,6 +226,7 @@ export const resolveServerConfig = (
     const normalizedFlags = {
       mode: flags.mode ?? Option.none(),
       port: flags.port ?? Option.none(),
+      socketPath: flags.socketPath ?? Option.none(),
       host: flags.host ?? Option.none(),
       baseDir: flags.baseDir ?? Option.none(),
       cwd: flags.cwd ?? Option.none(),
@@ -241,6 +254,16 @@ export const resolveServerConfig = (
       () => "web",
     );
 
+    // LateShift Cloud: a unix socket replaces the TCP bind entirely. When one is
+    // requested we must NOT probe for a free port -- there is no port to allocate,
+    // and findAvailablePort would bind/close a socket for nothing.
+    const socketPath = Option.getOrUndefined(
+      resolveOptionPrecedence(
+        normalizedFlags.socketPath,
+        Option.fromUndefinedOr(env.socketPath),
+      ).pipe(Option.filter((value) => value.trim().length > 0)),
+    );
+
     const port = yield* Option.match(
       resolveOptionPrecedence(
         normalizedFlags.port,
@@ -250,6 +273,9 @@ export const resolveServerConfig = (
       {
         onSome: (value) => Effect.succeed(value),
         onNone: () => {
+          if (socketPath !== undefined) {
+            return Effect.succeed(0);
+          }
           if (mode === "desktop") {
             return Effect.succeed(ServerConfig.DEFAULT_PORT);
           }
@@ -356,6 +382,7 @@ export const resolveServerConfig = (
       otlpServiceName: env.otlpServiceName,
       mode,
       port,
+      socketPath,
       cwd,
       baseDir,
       ...derivedPaths,
@@ -383,6 +410,7 @@ export const resolveCliAuthConfig = (
     {
       mode: Option.none(),
       port: Option.none(),
+      socketPath: Option.none(),
       host: Option.none(),
       baseDir: flags.baseDir,
       cwd: Option.none(),
