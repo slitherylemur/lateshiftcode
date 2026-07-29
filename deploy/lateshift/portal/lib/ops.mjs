@@ -80,6 +80,30 @@ function tail(r, n = 4000) {
   return `${r.stdout}${r.stderr ? `\n${r.stderr}` : ""}`.slice(-n);
 }
 
+// PATH for the isolated build stages (mirrors the dev login shell).
+const DEV_PATH = "/home/dev/.rokit/bin:/home/dev/.local/bin:/usr/local/bin:/usr/bin:/bin";
+
+/**
+ * Run ONE heavy build stage in a transient systemd unit as dev, OUTSIDE the
+ * portal's own cgroup. The portal unit has MemoryMax=256M / CPUQuota=50%, so
+ * running pnpm/vp as a portal child would OOM-kill the whole portal. systemd-run
+ * --wait --pipe runs it synchronously in a fresh (uncapped) cgroup and streams
+ * the output back; exit code reflects the child's result.
+ */
+function runIsolated(cwd, file, args, { timeoutMs = 15 * 60_000, extraEnv = {} } = {}) {
+  const env = { HOME: "/home/dev", PATH: DEV_PATH, ...extraEnv };
+  const setenv = Object.entries(env).map(([k, v]) => `--setenv=${k}=${v}`);
+  const unit = `lsc-rebuild-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const sdArgs = [
+    "-n", "systemd-run", "--wait", "--pipe", "--collect", "--quiet",
+    `--unit=${unit}`, "--uid=dev", "--gid=dev",
+    `--working-directory=${cwd}`,
+    ...setenv,
+    "--", file, ...args,
+  ];
+  return run("sudo", sdArgs, { timeoutMs });
+}
+
 // ---------------------------------------------------------------- guards
 
 /**
@@ -239,31 +263,37 @@ async function rebuildCheckout(body) {
   const branch = assertBranch(body?.branch);
   const stages = [];
   const vp = `${CHECKOUT}/node_modules/.bin/vp`;
-  const step = async (name, file, args, opts = {}) => {
+  // Light git stages run in-process (as dev); heavy build stages are isolated.
+  const light = async (name, file, args, opts = {}) => {
     const r = await run(file, args, { cwd: CHECKOUT, ...opts });
     stages.push({ stage: name, ok: r.ok, code: r.code, tail: tail(r, 3000) });
     return r.ok;
   };
+  const heavy = async (name, cwd, file, args, opts = {}) => {
+    const r = await runIsolated(cwd, file, args, opts);
+    stages.push({ stage: name, ok: r.ok, code: r.code, tail: tail(r, 3000) });
+    return r.ok;
+  };
 
-  if (!(await step("fetch", "git", ["-C", CHECKOUT, "fetch", "origin", branch], { timeoutMs: 180_000 })))
+  if (!(await light("fetch", "git", ["-C", CHECKOUT, "fetch", "origin", branch], { timeoutMs: 180_000 })))
     return { ok: false, stage: "fetch", stages };
-  if (!(await step("reset", "git", ["-C", CHECKOUT, "reset", "--hard", "FETCH_HEAD"], { timeoutMs: 60_000 })))
+  if (!(await light("reset", "git", ["-C", CHECKOUT, "reset", "--hard", "FETCH_HEAD"], { timeoutMs: 60_000 })))
     return { ok: false, stage: "reset", stages };
-  if (!(await step("install", "corepack", ["pnpm", "install", "--prefer-offline"], { timeoutMs: 15 * 60_000 })))
+  if (!(await heavy("install", CHECKOUT, "corepack", ["pnpm", "install", "--prefer-offline"])))
     return { ok: false, stage: "install", stages };
-  if (!(await step("pack-server", vp, ["pack"], { cwd: `${CHECKOUT}/apps/server`, timeoutMs: 15 * 60_000 })))
+  if (!(await heavy("pack-server", `${CHECKOUT}/apps/server`, vp, ["pack"])))
     return { ok: false, stage: "pack-server", stages };
   if (!existsSync(`${CHECKOUT}/apps/server/dist/bin.mjs`)) {
     stages.push({ stage: "verify-server", ok: false, code: 1, tail: "apps/server/dist/bin.mjs missing" });
     return { ok: false, stage: "verify-server", stages };
   }
-  if (!(await step("build-web", vp, ["run", "--filter", "./apps/web", "build"], { timeoutMs: 15 * 60_000 })))
+  if (!(await heavy("build-web", CHECKOUT, vp, ["run", "--filter", "./apps/web", "build"])))
     return { ok: false, stage: "build-web", stages };
   if (!existsSync(`${CHECKOUT}/apps/web/dist/index.html`)) {
     stages.push({ stage: "verify-web", ok: false, code: 1, tail: "apps/web/dist/index.html missing" });
     return { ok: false, stage: "verify-web", stages };
   }
-  if (!(await step("branding", "bash", [BRANDING, `${CHECKOUT}/apps/web/dist`], { timeoutMs: 120_000 })))
+  if (!(await heavy("branding", CHECKOUT, "bash", [BRANDING, `${CHECKOUT}/apps/web/dist`], { timeoutMs: 120_000 })))
     return { ok: false, stage: "branding", stages };
 
   return { ok: true, branch, commit: await gitShort(CHECKOUT), stages };

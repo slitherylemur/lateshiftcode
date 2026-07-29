@@ -170,7 +170,9 @@ to `…/ops-audit.log` (append, 600). Secrets are never logged.
    health bit, checkout branch+commit, portal branch+commit.
 2. `rebuild-checkout` `{branch}` (`[A-Za-z0-9._/-]{1,80}`) → in the build
    checkout: fetch origin `<branch>`, `reset --hard`, `pnpm install
-   --prefer-offline`, `vp pack` (apps/server), web build, branding. Synchronous
+   --prefer-offline`, `vp pack` (apps/server), web build, branding. The heavy stages run in a transient `systemd-run`
+   unit as dev (OUTSIDE the portal cgroup, whose `MemoryMax=256M` would
+   otherwise OOM-kill the build). Synchronous
    with generous timeouts; returns per-stage tail output; stops at first failure.
 3. `restart-instance` `{name, delaySeconds?}` → only `t3code@<name>`. For the
    **calling workspace** (`slither`) a bare call is refused; pass
