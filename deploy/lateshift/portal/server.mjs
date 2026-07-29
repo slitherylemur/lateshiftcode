@@ -33,6 +33,9 @@ import {
 import { readPoolStatus, DEFAULT_SNAPSHOT_DIR } from "./lib/rateLimits.mjs";
 import * as actions from "./lib/actions.mjs";
 import * as ops from "./lib/ops.mjs";
+import * as profiles from "./lib/profiles.mjs";
+import * as usage from "./lib/usage.mjs";
+import { LSC_PREFIX, p, normalizePath } from "./lib/paths.mjs";
 import * as views from "./views.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -140,7 +143,16 @@ function buildContext(req) {
   const users = loadRegistry();
   const session = sessionFrom(req, config);
   const principal = resolveIdentity({ ghLogin: session?.gh ?? null }, { users, config });
-  const identity = { login: session?.gh ?? null, name: null, profilePic: null };
+  // Presentation identity: GitHub display name + avatar, captured at the OAuth
+  // callback and persisted in profiles.json. Previously hardcoded to nulls
+  // because the only avatar source was the (now deleted) Tailscale header.
+  const profile = profiles.getProfile(session?.gh ?? null);
+  const identity = {
+    login: session?.gh ?? null,
+    name: profile.name,
+    profilePic: profile.avatarUrl,
+    displayName: profiles.displayName({ login: session?.gh ?? null, name: profile.name }),
+  };
   const fwdHost =
     typeof req.headers["x-forwarded-host"] === "string" ? req.headers["x-forwarded-host"] : "";
   const isPublic = fwdHost === "lateshiftcloud.com" || fwdHost.endsWith(".lateshiftcloud.com");
@@ -167,7 +179,12 @@ function consumptionLeaderboard(users) {
     .map((u) => {
       const usage = readMonthProviderTokenUsage(stateDbPath(u.baseDir));
       mergeProviderTokenUsage(totals, usage);
-      return { name: u.name, usage };
+      // `name` stays the internal short name because it is the row key the
+      // caller matches "you" against; `label` is what is actually rendered.
+      const label = u.githubLogin
+        ? profiles.displayName(profiles.getProfile(u.githubLogin))
+        : null;
+      return { name: u.name, label, usage };
     })
     .sort((a, b) => b.usage.total.billableTokens - a.usage.total.billableTokens);
 
@@ -184,6 +201,7 @@ function consumptionLeaderboard(users) {
     },
     rows: entries.map((e) => ({
       name: e.name,
+      label: e.label,
       billableTokens: e.usage.total.billableTokens,
       share: grand > 0 ? (e.usage.total.billableTokens / grand) * 100 : null,
       turns: e.usage.total.turns,
@@ -204,23 +222,67 @@ async function dashboardProps(ctx, csrf) {
     pool: readPoolStatus(SNAPSHOT_DIR),
     // Our attribution: who consumed what. Visible to every user.
     consumption: consumptionLeaderboard(ctx.users),
+    // Row key only — marks "you" in the leaderboard, never rendered.
+    consumptionHighlight: user.name,
     myUsage: readMonthProviderTokenUsage(dbPath),
     csrf,
-    identity: {
-      login: ctx.principal.login,
-      name: ctx.identity.name,
-      profilePic: ctx.identity.profilePic,
-    },
+    identity: identityProps(ctx),
     user: {
-      name: user.name,
+      // NOTE: `name` is the internal short name (UNIX account / systemd unit).
+      // It must not reach a user-visible surface — architecture-v2.md D12/§6.
+      // Views greet with identity.displayName instead.
       projectLimit: user.projectLimit,
       admin: user.admin,
     },
+    // Under the v2 single origin the apex IS the workspace (D2); W7 owns making
+    // Caddy route it. No per-user subdomain, so no short name in a URL.
+    workspaceUrl: ctx.config.publicBaseUrl ? `${ctx.config.publicBaseUrl}/` : "/",
     instanceStatus: await actions.instanceStatus(user.name),
     monthCostUsd: readCostThisMonth(dbPath),
     projects: readWorkHistory(dbPath),
     isAdmin: ctx.principal.isAdmin,
     github: githubStatusFor(user),
+  };
+}
+
+/** The identity block every view's nav needs. */
+function identityProps(ctx) {
+  return {
+    login: ctx.principal.login,
+    name: ctx.identity.name,
+    profilePic: ctx.identity.profilePic,
+    displayName: ctx.identity.displayName,
+  };
+}
+
+/**
+ * Account-page props. Sections mirror architecture-v2.md §6: identity, GitHub
+ * connection, workspace memberships, usage (pool + share), sign out.
+ */
+function accountProps(ctx, csrf) {
+  const user = ctx.principal.user;
+  // Memberships. Today the registry models exactly one workspace per user
+  // (their personal one). Team workspaces are W5; when the registry grows a
+  // membership list this is the single place that has to learn about it.
+  const memberships = [];
+  if (user) {
+    memberships.push({
+      kind: "personal",
+      label: "Personal workspace",
+      detail: "Only you can reach it.",
+      status: null,
+    });
+  }
+  const share = user ? usage.getUserShare(user.baseDir, usage.fleetMonthCost(ctx.users)) : null;
+  return {
+    csrf,
+    identity: identityProps(ctx),
+    isAdmin: ctx.principal.isAdmin,
+    hasWorkspace: Boolean(user),
+    github: user ? githubStatusFor(user) : { connected: false, login: ctx.principal.login },
+    memberships,
+    pool: usage.getPoolState(), // null → rendered as "unknown", never estimated
+    share,
   };
 }
 
@@ -252,8 +314,14 @@ async function adminProps(ctx, csrf, flash, selectedParam) {
     const isSelf = Boolean(
       u.githubLogin && adminLower && u.githubLogin.toLowerCase() === adminLower,
     );
+    const prof = profiles.getProfile(u.githubLogin);
     rows.push({
       name: u.name,
+      // Admin is an internal ops surface, so the short name stays visible here
+      // (it is the systemd unit name the admin acts on) — but the human is
+      // named by their GitHub identity first. W4-E.
+      displayName: u.githubLogin ? profiles.displayName(prof) : null,
+      avatarUrl: prof.avatarUrl,
       localPort: u.localPort,
       projectLimit: u.projectLimit,
       admin: u.admin,
@@ -282,11 +350,7 @@ async function adminProps(ctx, csrf, flash, selectedParam) {
 
   return {
     csrf,
-    identity: {
-      login: ctx.principal.login,
-      name: ctx.identity.name,
-      profilePic: ctx.identity.profilePic,
-    },
+    identity: identityProps(ctx),
     users: rows,
     self,
     selectedKey,
@@ -324,7 +388,7 @@ async function handleAuthz(req, res) {
   const apex = config.publicBaseUrl
     ? new URL(config.publicBaseUrl).host.toLowerCase()
     : "lateshiftcloud.com";
-  const loginUrl = `${config.publicBaseUrl || "https://lateshiftcloud.com"}/auth/github/login`;
+  const loginUrl = `${config.publicBaseUrl || "https://lateshiftcloud.com"}${p("/auth/github/login")}`;
 
   const done = (status, headers = {}) => {
     res.writeHead(status, headers);
@@ -355,8 +419,13 @@ async function handleAuthz(req, res) {
   return done(403);
 }
 
-// GET /auth/github/login — 302 to GitHub's authorize endpoint.
-async function handleGithubLogin(req, res) {
+// GET /auth/github/login — 302 to GitHub's authorize endpoint, identity scope
+// only (read:user). This is first contact with a stranger; it must not ask for
+// write access to their repositories. See auth.SCOPE_SIGNIN.
+//
+// GET /auth/github/connect — the explicitly-consented upgrade to SCOPE_PUSH,
+// reachable only from the account page and only with a valid session.
+async function handleGithubLogin(req, res, { intent = auth.INTENT_SIGNIN } = {}) {
   const config = loadConfig();
   if (!config.githubClientId || !config.sessionSecret || !config.publicBaseUrl) {
     html(
@@ -372,8 +441,9 @@ async function handleGithubLogin(req, res) {
     );
     return;
   }
-  const { state, cookie } = auth.makeOAuthState(config.sessionSecret);
-  redirect(res, auth.githubAuthorizeUrl(config, state), { "set-cookie": cookie });
+  const scope = intent === auth.INTENT_CONNECT ? auth.SCOPE_PUSH : auth.SCOPE_SIGNIN;
+  const { state, cookie } = auth.makeOAuthState(config.sessionSecret, intent);
+  redirect(res, auth.githubAuthorizeUrl(config, state, scope), { "set-cookie": cookie });
 }
 
 // GET /auth/github/callback — verify state, exchange code, mint session.
@@ -401,7 +471,8 @@ async function handleGithubCallback(req, res, url) {
   const code = url.searchParams.get("code");
   const state = url.searchParams.get("state");
   if (!code) return fail("Missing code", "No authorization code was returned.");
-  if (!auth.verifyOAuthState(state, cookies[auth.STATE_COOKIE], config.sessionSecret)) {
+  const intent = auth.verifyOAuthState(state, cookies[auth.STATE_COOKIE], config.sessionSecret);
+  if (!intent) {
     return fail("Invalid state", "The OAuth state check failed. Please try signing in again.");
   }
 
@@ -411,6 +482,20 @@ async function handleGithubCallback(req, res, url) {
   } catch (e) {
     return fail("GitHub error", e?.message ?? String(e));
   }
+
+  // W4-A: persist the GitHub display name and avatar. This is the ONLY place
+  // they are captured; everything else reads profiles.json.
+  profiles.saveProfile({
+    login: profile.login,
+    name: profile.name,
+    avatarUrl: profile.avatar_url,
+  });
+
+  // A token only ever reaches a workspace when GitHub actually granted `repo`
+  // — i.e. the user came through the account page's explicit "connect push
+  // access" upgrade. A bare sign-in token (read:user) can neither push nor be
+  // mistaken for a connected store.
+  const pushGranted = auth.hasPushScope(profile.scopes);
 
   const principal = resolveIdentity({ ghLogin: profile.login }, { users, config });
   const sessionValue = auth.signSession(
@@ -423,28 +508,45 @@ async function handleGithubCallback(req, res, url) {
   ];
 
   if (principal.user) {
-    // Known user: install the OAuth token into their workspace gh store the
-    // first time (or if their store isn't authenticated yet — the re-auth
-    // path). Never overwrite an already-connected store; never log the token.
-    try {
-      const status = auth.githubIdentityStatus(principal.user.baseDir);
-      if (!status.authenticated) {
-        auth.installGithubIdentity(principal.user.baseDir, {
-          login: profile.login,
-          id: profile.id,
-          token: profile.token,
-        });
+    // Install the OAuth token into the workspace gh store only when it carries
+    // push scope AND the store isn't already connected. Never overwrite an
+    // already-connected store (its token may hold a wider grant); never log the
+    // token.
+    let connectFailed = false;
+    if (pushGranted) {
+      try {
+        const status = auth.githubIdentityStatus(principal.user.baseDir);
+        if (!status.authenticated) {
+          auth.installGithubIdentity(principal.user.baseDir, {
+            login: profile.login,
+            id: profile.id,
+            token: profile.token,
+          });
+        }
+      } catch (e) {
+        // Sign-in must never break on identity-install failure.
+        connectFailed = true;
+        console.error(`identity install failed for ${principal.user.name}: ${e?.message ?? e}`);
       }
-    } catch (e) {
-      // Sign-in must never break on identity-install failure.
-      console.error(`identity install failed for ${principal.user.name}: ${e?.message ?? e}`);
     }
-    res.writeHead(302, { location: "/", "set-cookie": setCookie });
+    // The upgrade flow lands back on the account page so the user sees the
+    // result of what they just consented to; a plain sign-in lands in the app.
+    const location =
+      intent === auth.INTENT_CONNECT
+        ? `${p("/account")}?flash=${encodeURIComponent(
+            connectFailed
+              ? "Could not store your GitHub credential — try again."
+              : pushGranted
+                ? "GitHub push access connected."
+                : "GitHub did not grant repository access, so nothing changed.",
+          )}`
+        : "/";
+    res.writeHead(302, { location, "set-cookie": setCookie });
     res.end();
     return;
   }
   if (principal.isAdmin) {
-    res.writeHead(302, { location: "/admin", "set-cookie": setCookie });
+    res.writeHead(302, { location: p("/admin"), "set-cookie": setCookie });
     res.end();
     return;
   }
@@ -458,7 +560,13 @@ async function handleGithubCallback(req, res, url) {
   // Stash the captured token (unless the login was denied) so provisioning can
   // install it into the workspace immediately after admin approval. Refreshed
   // on every repeat sign-in while still pending. Never logged.
-  if (result.reason !== "denied") {
+  //
+  // With the reduced sign-in scope this is normally a no-op: a stranger's
+  // first-contact token is read:user and carries no push grant worth keeping,
+  // so nothing is stored and the approved user connects push access themselves
+  // from the account page. The branch stays for tokens that DO carry `repo`
+  // (a user who signed in through the upgrade flow before being approved).
+  if (result.reason !== "denied" && pushGranted) {
     auth.setPendingToken(profile.login, { id: profile.id, token: profile.token });
   }
   html(
@@ -467,7 +575,9 @@ async function handleGithubCallback(req, res, url) {
     views.renderAwaitingApproval({
       login: profile.login,
       name: profile.name,
-      avatar: profile.avatar_url,
+      // Validated host-side: this value goes straight into an <img src>, and
+      // esc() alone does not constrain the scheme or origin.
+      avatar: profiles.sanitizeAvatarUrl(profile.avatar_url),
       denied: result.reason === "denied",
     }),
     { "set-cookie": setCookie },
@@ -476,21 +586,27 @@ async function handleGithubCallback(req, res, url) {
 
 async function handleGet(req, res, url) {
   const cookies = parseCookies(req);
+  // Portal routes are written bare and served under the reserved root too;
+  // see lib/paths.mjs for why the root exists and when the bare aliases die.
+  const { path: pathname } = normalizePath(url.pathname);
 
-  if (url.pathname === "/healthz") {
+  if (pathname === "/healthz") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, service: "lateshift-portal", version: VERSION }));
     return;
   }
 
-  if (url.pathname === "/static/logo.png" || url.pathname === "/favicon.ico") {
-    for (const p of LOGO_PATHS) {
-      if (existsSync(p)) {
+  // W0-C finding 1: /favicon.ico belongs to T3 under the single origin (its
+  // dist serves one and index.html links it). The portal no longer claims it;
+  // its own logo lives under the reserved root.
+  if (pathname === "/static/logo.png") {
+    for (const logoPath of LOGO_PATHS) {
+      if (existsSync(logoPath)) {
         res.writeHead(200, {
           "content-type": "image/png",
           "cache-control": "public, max-age=86400",
         });
-        res.end(readFileSync(p));
+        res.end(readFileSync(logoPath));
         return;
       }
     }
@@ -498,10 +614,20 @@ async function handleGet(req, res, url) {
     return;
   }
 
-  if (url.pathname === "/authz") return handleAuthz(req, res);
-  if (url.pathname === "/auth/github/login") return handleGithubLogin(req, res);
-  if (url.pathname === "/auth/github/callback") return handleGithubCallback(req, res, url);
-  if (url.pathname === "/auth/logout") {
+  if (pathname === "/authz") return handleAuthz(req, res);
+  if (pathname === "/auth/github/login") return handleGithubLogin(req, res);
+  if (pathname === "/auth/github/connect") {
+    // The consented push-access upgrade. Requires an existing session — this
+    // is never a sign-in entry point.
+    const config = loadConfig();
+    if (!sessionFrom(req, config)) return redirect(res, p("/auth/github/login"));
+    return handleGithubLogin(req, res, { intent: auth.INTENT_CONNECT });
+  }
+  if (pathname === "/auth/github/callback") return handleGithubCallback(req, res, url);
+  if (pathname === "/auth/logout") {
+    // GET sign-out is kept only for the links already rendered in the wild
+    // (the awaiting-approval page). The account page signs out with a
+    // CSRF-protected POST; see handlePost.
     const config = loadConfig();
     res.writeHead(302, { location: "/", "set-cookie": auth.clearSessionCookies(req, config) });
     res.end();
@@ -511,7 +637,14 @@ async function handleGet(req, res, url) {
   const ctx = buildContext(req);
   const csrf = ensureCsrf(cookies, res);
 
-  if (url.pathname === "/") {
+  if (pathname === "/account") {
+    if (!ctx.principal.login) return redirect(res, p("/auth/github/login"));
+    const flash = url.searchParams.get("flash")?.slice(0, 300) ?? null;
+    html(res, 200, views.renderAccount({ ...accountProps(ctx, csrf), flash }));
+    return;
+  }
+
+  if (pathname === "/") {
     if (!ctx.principal.user && !ctx.principal.isAdmin) {
       html(
         res,
@@ -525,14 +658,14 @@ async function handleGet(req, res, url) {
     }
     if (!ctx.principal.user && ctx.principal.isAdmin) {
       // Admin without their own workspace: send them to the panel.
-      redirect(res, "/admin");
+      redirect(res, p("/admin"));
       return;
     }
     html(res, 200, views.renderDashboard(await dashboardProps(ctx, csrf)));
     return;
   }
 
-  if (url.pathname === "/admin") {
+  if (pathname === "/admin") {
     if (!ctx.principal.isAdmin) {
       html(res, 403, views.renderForbidden({ identity: { login: ctx.principal.login } }));
       return;
@@ -628,6 +761,8 @@ async function handleRobloxCreate(req, res) {
 async function handlePost(req, res, url) {
   // Machine broker endpoint — handled before any CSRF/form logic (see
   // handleRobloxCreate for the CSRF-exemption and X-Forwarded-Host rejection).
+  // Deliberately NOT prefix-normalized: these are loopback-only RPCs and must
+  // never become reachable under a public, gateway-routed path.
   if (url.pathname.startsWith("/internal/ops/")) {
     return handleOps(req, res, url);
   }
@@ -635,6 +770,7 @@ async function handlePost(req, res, url) {
     return handleRobloxCreate(req, res);
   }
 
+  const { path: pathname } = normalizePath(url.pathname);
   const cookies = parseCookies(req);
   const ctx = buildContext(req);
   const form = parseForm(await readBody(req));
@@ -655,8 +791,20 @@ async function handlePost(req, res, url) {
   }
   const csrf = cookies[CSRF_COOKIE];
 
+  // ---- sign out --------------------------------------------------------
+  // POST, CSRF-checked above: signing out is a state change and must not be
+  // triggerable by a cross-site <img src> or a link prefetch.
+  if (pathname === "/auth/logout") {
+    res.writeHead(302, {
+      location: "/",
+      "set-cookie": auth.clearSessionCookies(req, ctx.config),
+    });
+    res.end();
+    return;
+  }
+
   // ---- admin actions ---------------------------------------------------
-  if (!url.pathname.startsWith("/admin/")) {
+  if (!pathname.startsWith("/admin/")) {
     html(
       res,
       404,
@@ -681,7 +829,7 @@ async function handlePost(req, res, url) {
   const flashTo = (msg) =>
     redirect(
       res,
-      `/admin?${validName ? `u=${encodeURIComponent(name)}&` : ""}flash=${encodeURIComponent(msg)}`,
+      `${p("/admin")}?${validName ? `u=${encodeURIComponent(name)}&` : ""}flash=${encodeURIComponent(msg)}`,
     );
   const errPage = (heading, detail) =>
     html(
@@ -691,13 +839,13 @@ async function handlePost(req, res, url) {
         title: "Error",
         heading,
         bodyHtml: `<pre>${views.esc(detail || "unknown error")}</pre>`,
-        backHref: "/admin",
+        backHref: p("/admin"),
         error: true,
       }),
     );
 
   try {
-    switch (url.pathname) {
+    switch (pathname) {
       case "/admin/add-user": {
         if (!validName) return errPage("Invalid user name", "Names must match [a-z0-9-]{2,20}.");
         const limit = actions.assertLimit(form.projectLimit ?? 3);
@@ -722,7 +870,7 @@ async function handlePost(req, res, url) {
                 `This updates <code>instance.env</code> and <strong>restarts ` +
                 `t3code@${views.esc(name)}</strong>. Any in-flight work on that ` +
                 `instance will be interrupted for a few seconds.`,
-              action: "/admin/set-limit",
+              action: p("/admin/set-limit"),
               fields: [
                 { name: "name", value: name },
                 { name: "limit", value: String(limit) },
@@ -761,7 +909,7 @@ async function handlePost(req, res, url) {
               detailHtml:
                 `This stops <code>t3code@${views.esc(name)}</code> and archives ` +
                 `its data (never deleted).`,
-              action: "/admin/remove-user",
+              action: p("/admin/remove-user"),
               fields: [{ name: "name", value: name }],
               confirmLabel: "Remove user",
               danger: true,
@@ -784,7 +932,7 @@ async function handlePost(req, res, url) {
                 `<pre>${views.esc((r.stderr || r.stdout).slice(0, 2000))}</pre>` +
                 `You can retry with <code>--force</code>, which skips the failing ` +
                 `stop/cleanup steps.`,
-              action: "/admin/remove-user",
+              action: p("/admin/remove-user"),
               fields: [
                 { name: "name", value: name },
                 { name: "force", value: "1" },
@@ -797,7 +945,7 @@ async function handlePost(req, res, url) {
         }
         return redirect(
           res,
-          `/admin?flash=${encodeURIComponent(`User '${name}' removed (data archived).`)}`,
+          `${p("/admin")}?flash=${encodeURIComponent(`User '${name}' removed (data archived).`)}`,
         );
       }
 
@@ -825,7 +973,11 @@ async function handlePost(req, res, url) {
             ghNote = ` (GitHub token install failed: ${String(e?.message ?? e).slice(0, 120)})`;
           }
         } else {
-          ghNote = " (no captured token — user must sign in again to connect GitHub).";
+          // Expected under the reduced sign-in scope (W4-D): a first-contact
+          // token is read:user only and is never stored, so there is nothing to
+          // install. The user grants push access themselves, once, from the
+          // account page.
+          ghNote = " (no push token captured — the user connects push access from their account page).";
         }
         auth.removePendingToken(login);
         if (!g.ok) {
@@ -847,7 +999,7 @@ async function handlePost(req, res, url) {
       }
 
       default:
-        return errPage("Unknown action", url.pathname);
+        return errPage("Unknown action", pathname);
     }
   } catch (err) {
     return errPage("Action failed", err?.message ?? String(err));
@@ -876,5 +1028,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`lateshift-portal v${VERSION} listening on 127.0.0.1:${PORT}`);
+  console.log(
+    `lateshift-portal v${VERSION} listening on 127.0.0.1:${PORT} (reserved root ${LSC_PREFIX})`,
+  );
 });

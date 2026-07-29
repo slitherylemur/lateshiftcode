@@ -121,11 +121,24 @@ export function clearSessionCookies(req, config) {
 
 // ---------------------------------------------------------------- OAuth state
 
-/** Create a signed OAuth state and its short-lived cookie. */
-export function makeOAuthState(secret) {
+// OAuth intents. The state carries which flow the user consented to, signed,
+// so the callback cannot be tricked into treating a bare sign-in as a grant of
+// push access (see githubAuthorizeUrl for why the two are separate).
+export const INTENT_SIGNIN = "signin";
+export const INTENT_CONNECT = "connect";
+const INTENTS = new Set([INTENT_SIGNIN, INTENT_CONNECT]);
+
+/**
+ * Create a signed OAuth state and its short-lived cookie.
+ * State is `${nonce}~${intent}.${sig}` with sig = HMAC(secret, nonce~intent),
+ * so the intent is tamper-evident.
+ */
+export function makeOAuthState(secret, intent = INTENT_SIGNIN) {
+  const kind = INTENTS.has(intent) ? intent : INTENT_SIGNIN;
   const nonce = crypto.randomBytes(16).toString("hex");
-  const sig = b64urlEncode(hmac(secret || "", nonce));
-  const state = `${nonce}.${sig}`;
+  const body = `${nonce}~${kind}`;
+  const sig = b64urlEncode(hmac(secret || "", body));
+  const state = `${body}.${sig}`;
   const cookie = `${STATE_COOKIE}=${state}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${STATE_TTL_S}`;
   return { state, cookie };
 }
@@ -135,33 +148,69 @@ export function clearStateCookie() {
   return `${STATE_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
 }
 
-/** Verify the callback state against the cookie and its signature. */
+/**
+ * Verify the callback state against the cookie and its signature.
+ * Returns the signed intent ("signin" | "connect") on success, or null.
+ * A state minted before intents existed (`nonce.sig`, no `~`) verifies as
+ * "signin" so logins already in flight across a deploy are not broken.
+ */
 export function verifyOAuthState(stateParam, cookieValue, secret) {
-  if (typeof stateParam !== "string" || typeof cookieValue !== "string") return false;
-  if (!safeStrEq(stateParam, cookieValue)) return false;
+  if (typeof stateParam !== "string" || typeof cookieValue !== "string") return null;
+  if (!safeStrEq(stateParam, cookieValue)) return null;
   const dot = stateParam.indexOf(".");
-  if (dot <= 0) return false;
-  const nonce = stateParam.slice(0, dot);
+  if (dot <= 0) return null;
+  const body = stateParam.slice(0, dot);
   const sig = stateParam.slice(dot + 1);
-  const expected = b64urlEncode(hmac(secret || "", nonce));
-  return safeStrEq(sig, expected);
+  if (!safeStrEq(sig, b64urlEncode(hmac(secret || "", body)))) return null;
+  const tilde = body.indexOf("~");
+  if (tilde < 0) return INTENT_SIGNIN; // legacy state, pre-intent
+  const intent = body.slice(tilde + 1);
+  return INTENTS.has(intent) ? intent : null;
 }
 
 // ---------------------------------------------------------------- GitHub flow
 
-/** Build the github.com authorize URL for the standard web flow. */
-export function githubAuthorizeUrl(config, state) {
+// ---- OAuth scopes ---------------------------------------------------------
+//
+// Sign-in used to request "read:user repo workflow" — a broad repo-WRITE grant
+// taken at FIRST CONTACT, from a stranger, before the admin has even seen the
+// access request. architecture-v2.md §6 splits it:
+//
+//   SCOPE_SIGNIN — identity only. Enough to know who you are and show your
+//                  avatar; cannot read private code and cannot push.
+//   SCOPE_PUSH   — the upgrade, requested separately and only when the user
+//                  explicitly clicks "connect push access" on the account page.
+//                  `repo` grants git push/pull over HTTPS; `workflow` is
+//                  required so pushes touching .github/workflows/** aren't
+//                  rejected by GitHub.
+//
+// Existing installed workspace credentials are untouched: tokens already in a
+// workspace's hosts.yml keep their original grant, and installGithubIdentity()
+// is only ever called with a token that actually carries `repo` (see
+// hasPushScope), so a narrow sign-in token can never overwrite a wide one.
+export const SCOPE_SIGNIN = "read:user";
+export const SCOPE_PUSH = "read:user repo workflow";
+
+/**
+ * Build the github.com authorize URL for the standard web flow.
+ * `scope` defaults to identity-only; pass SCOPE_PUSH for the consented upgrade.
+ */
+export function githubAuthorizeUrl(config, state, scope = SCOPE_SIGNIN) {
   const redirectUri = `${config.publicBaseUrl}/auth/github/callback`;
   const q = new URLSearchParams({
     client_id: config.githubClientId,
     redirect_uri: redirectUri,
-    // `repo` grants git push/pull over HTTPS; `workflow` is required so pushes
-    // that touch .github/workflows/** aren't rejected by GitHub.
-    scope: "read:user repo workflow",
+    scope,
     state,
     allow_signup: "false",
   });
   return `https://github.com/login/oauth/authorize?${q.toString()}`;
+}
+
+/** True when a granted-scope list actually permits git push over HTTPS. */
+export function hasPushScope(scopes) {
+  const list = Array.isArray(scopes) ? scopes : [];
+  return list.includes("repo");
 }
 
 /** Exchange the code for an access token, then fetch the user profile. */
@@ -200,6 +249,16 @@ export async function githubExchange(config, code) {
     id: Number.isFinite(u.id) ? u.id : null,
     name: typeof u.name === "string" ? u.name : null,
     avatar_url: typeof u.avatar_url === "string" ? u.avatar_url : null,
+    // Scopes GitHub actually granted (comma- or space-separated in the token
+    // response). Authoritative: the user may have declined part of what we
+    // asked for, so never infer the grant from what we requested.
+    scopes:
+      typeof tokenJson.scope === "string"
+        ? tokenJson.scope
+            .split(/[,\s]+/)
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : [],
     // Access token for provisioning the per-workspace gh credential store.
     // NEVER log this value; callers install it into hosts.yml then discard it.
     token: accessToken,
