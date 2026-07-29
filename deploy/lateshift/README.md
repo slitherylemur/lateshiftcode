@@ -391,3 +391,52 @@ Production's `EnvironmentFile=/home/dev/.t3-env` is currently empty; no shared
 secrets are required by instances. Provider credentials are configured per user
 inside each instance's own `userdata`. If shared keys are ever introduced, add a
 second `EnvironmentFile=` line to the template.
+
+## Team workspaces (W6)
+
+A team workspace (`t3ws@t-<project>`) is **admin-created, at creation time
+only** (architecture-v2 D9). Repos are cloned **fresh from GitHub** into it;
+there is no promotion path and no thread migration.
+
+```sh
+# 1. mint a FINE-GRAINED PAT on GitHub, scoped to this team's repos ONLY,
+#    then create the workspace (members must already be provisioned users):
+printf '%s\n' "$TOKEN" > /root/team-pat.tmp
+lsw team add demo --member alice --member bob \
+    --repo owner/repo-a --repo https://github.com/owner/repo-b \
+    --pat-file /root/team-pat.tmp
+rm /root/team-pat.tmp
+
+# membership
+lsw member add demo carol
+lsw member remove demo bob            # retires the local PAT; see below
+lsw team verify demo                  # registry vs UNIX group vs instance list
+
+# PAT lifecycle (install and rotate are the same operation)
+lsw team pat install demo             # reads the token from stdin, never argv
+lsw team pat rotate demo --pat-file F
+```
+
+Facts that keep this safe:
+
+- **One token per team, never one across teams, never the host `dev` `gh`
+  credential.** The value lands in exactly one file,
+  `<base>/identity/git-credentials` (0600, owned by `t-<project>`), read via
+  `credential.helper=store` from `<base>/identity/gitconfig`. `identity/` is
+  0700 and *not* in the members' group, so a member's personal workspace
+  cannot read it.
+- Commits/pushes are authored as the **admin's GitHub identity** (D14); the
+  author is taken from `portal.config.json` `adminGithubLogins[0]` unless
+  overridden with `--git-name`/`--git-email`.
+- `lsw member remove` deletes the local credential file (the removed member
+  may have cached the token) and prints the two mandatory follow-ups: revoke
+  the old PAT **on GitHub** and install a fresh one (`--new-pat-file F` does
+  the install in the same transaction).
+- Creation is all-or-nothing: PAT install, gitconfig, clones, first start,
+  health, socket-ownership check and instance project registration all run
+  inside the provisioning rollback trap; any failure removes the workspace
+  and leaves the registry untouched.
+- Membership has three representations — registry, UNIX group `w-t-<project>`,
+  and the team instance's project list. `lsw member` changes the first two
+  atomically (revert on failure) and never needs to touch the third, which is
+  fixed at creation; `lsw team verify` re-checks all three on demand.

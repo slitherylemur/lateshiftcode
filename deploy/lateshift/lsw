@@ -15,9 +15,12 @@
 #   lsw user add <github-login> [--project-limit N] [--admin]
 #   lsw user remove <github-login> [--force]
 #   lsw team add <project> [--project-limit N] [--member LOGIN]...
+#                [--repo OWNER/REPO|URL]... [--pat-file F|--pat-stdin]
 #   lsw team remove <project> [--force]
+#   lsw team pat install|rotate <project> [--pat-file F]   install/rotate the per-team PAT
+#   lsw team verify <project>                    check registry, UNIX group and instance agree
 #   lsw member add <project> <github-login>
-#   lsw member remove <project> <github-login>
+#   lsw member remove <project> <github-login> [--new-pat-file F]
 #   lsw set <github-login> <key> <value>         keys: projectLimit, admin, status
 #
 # Every subcommand accepts --dry-run: it prints the exact privileged commands it
@@ -74,7 +77,7 @@ die() { echo "lsw: $*" >&2; exit 1; }
 info() { echo "lsw: $*"; }
 
 usage() {
-    sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -125,6 +128,35 @@ unix_user_for_login() {
 
 unix_user_for_team() { printf 't-%s' "$1"; }
 group_for_team()     { printf 'w-t-%s' "$1"; }
+
+# Team repos are always cloned fresh from GitHub over HTTPS (architecture-v2
+# D9/D14). Accept "owner/repo" or a full https://github.com/owner/repo[.git]
+# URL and normalize to the canonical https form. Everything else is refused:
+# ssh remotes would bypass the per-team PAT, and non-GitHub hosts are out of
+# scope for the team-identity model.
+normalize_repo_url() {
+    local raw="$1" owner_repo
+    case "${raw}" in
+        https://github.com/*)
+            owner_repo="${raw#https://github.com/}"
+            owner_repo="${owner_repo%.git}"
+            ;;
+        *"://"*|git@*) die "unsupported repo '${raw}': only https://github.com/OWNER/REPO or OWNER/REPO" ;;
+        */*) owner_repo="${raw%.git}" ;;
+        *) die "invalid repo '${raw}': expected OWNER/REPO or a github.com https URL" ;;
+    esac
+    [[ "${owner_repo}" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*/[A-Za-z0-9._-]+$ ]] \
+        || die "invalid repo '${raw}': '${owner_repo}' is not OWNER/REPO"
+    [[ "${owner_repo}" == */..* || "${owner_repo}" == ..* ]] && die "invalid repo '${raw}'"
+    printf 'https://github.com/%s.git' "${owner_repo}"
+}
+
+repo_dir_name() {
+    local url="$1" name
+    name="${url##*/}"
+    name="${name%.git}"
+    printf '%s' "${name}"
+}
 
 # ---------------------------------------------------------------------------
 # Registry (python3; there is no jq on this box)
@@ -274,6 +306,8 @@ elif op == "commit-team":
         "projectLimit": project_limit,
         "owner": None,
         "members": [reg["users"][m.lower()]["githubLogin"] for m in members],
+        # Repos cloned fresh at creation (D9). URLs only, never tokens.
+        "repos": json.loads(os.environ.get("LSW_TEAM_REPOS", "[]")),
         "createdAt": now(),
     }
     save()
@@ -648,6 +682,202 @@ start_and_verify() {
 }
 
 # ---------------------------------------------------------------------------
+# Team GitHub identity (per-team fine-grained PAT; architecture-v2 D14 / R4)
+# ---------------------------------------------------------------------------
+
+team_credentials_path() { printf '%s/%s/identity/git-credentials' "${WORKSPACES_DIR}" "$1"; }
+team_gitconfig_path()   { printf '%s/%s/identity/gitconfig' "${WORKSPACES_DIR}" "$1"; }
+
+# Read a PAT from --pat-file or stdin without ever putting the value in argv,
+# the environment of a child, or a log line. Fine-grained PATs start with
+# "github_pat_"; classic "ghp_" is accepted but warned about because it cannot
+# be repo-scoped.
+read_pat() {
+    local pat_file="$1" token=""
+    if [[ -n "${pat_file}" ]]; then
+        [[ -f "${pat_file}" ]] || die "PAT file ${pat_file} not found"
+        token="$(< "${pat_file}")"
+    else
+        if [[ -t 0 ]]; then
+            echo "Paste the team's fine-grained PAT (input hidden), then Enter:" >&2
+            read -rs token
+        else
+            read -r token
+        fi
+    fi
+    token="${token//[$'\r\n\t ']/}"
+    [[ -n "${token}" ]] || die "empty PAT"
+    case "${token}" in
+        github_pat_*) : ;;
+        ghp_*) echo "lsw: WARNING classic PAT supplied; use a FINE-GRAINED PAT scoped to this team's repos only (D14)." >&2 ;;
+        *) die "that does not look like a GitHub PAT (expected github_pat_* or ghp_*)" ;;
+    esac
+    printf '%s' "${token}"
+}
+
+# Install (or rotate -- same operation) the team PAT. The token value lands in
+# exactly one file: <base>/identity/git-credentials, 0600, owned by the team's
+# UNIX account. identity/ itself is 0700 team-owned and is NOT in the members'
+# group, so no member's personal workspace can read it; members exercise the
+# token only through the team instance.
+install_team_pat() {
+    local ws="$1" pat_file="$2" base_dir="${WORKSPACES_DIR}/$1" token tmp
+    token="$(read_pat "${pat_file}")"
+    if ${DRY_RUN}; then
+        echo "DRY-RUN: write $(team_credentials_path "${ws}") (0600 ${ws}:${ws}; token value not shown)"
+        return 0
+    fi
+    [[ -d "${base_dir}/identity" ]] || die "identity dir ${base_dir}/identity missing; is '${ws}' a provisioned team workspace?"
+    tmp="$(mktemp "${base_dir}/identity/.git-credentials.tmp.XXXXXX")"
+    printf 'https://x-access-token:%s@github.com\n' "${token}" > "${tmp}"
+    chown "${ws}:${ws}" "${tmp}"
+    chmod 0600 "${tmp}"
+    mv -f "${tmp}" "$(team_credentials_path "${ws}")"
+    info "team PAT installed at $(team_credentials_path "${ws}") (0600 ${ws})"
+}
+
+# The team's git identity: commits and pushes are authored as the ADMIN's
+# GitHub identity (D14), and the credential helper reads ONLY the per-team
+# store written by install_team_pat. run-workspace.sh skips writing its default
+# gitconfig when this file already exists, so this wins for team workspaces.
+write_team_gitconfig() {
+    local ws="$1" git_name="$2" git_email="$3" base_dir="${WORKSPACES_DIR}/$1"
+    if ${DRY_RUN}; then
+        echo "DRY-RUN: write $(team_gitconfig_path "${ws}") (author '${git_name} <${git_email}>')"
+        return 0
+    fi
+    local tmp
+    tmp="$(mktemp "${base_dir}/identity/.gitconfig.tmp.XXXXXX")"
+    cat > "${tmp}" <<EOF
+[user]
+	name = ${git_name}
+	email = ${git_email}
+[credential "https://github.com"]
+	helper =
+	helper = store --file=$(team_credentials_path "${ws}")
+EOF
+    chown "${ws}:${ws}" "${tmp}"
+    chmod 0600 "${tmp}"
+    mv -f "${tmp}" "$(team_gitconfig_path "${ws}")"
+}
+
+# Fresh clones from GitHub into <base>/projects/<repo> as the team account.
+# Runs before the unit ever starts; a failure aborts the provision and the
+# rollback removes the whole base dir, so a half-cloned workspace cannot
+# survive (task rule: never leave a half-created workspace).
+clone_team_repos() {
+    local ws="$1"; shift
+    local base_dir="${WORKSPACES_DIR}/${ws}" url dest
+    for url in "$@"; do
+        dest="${base_dir}/projects/$(repo_dir_name "${url}")"
+        [[ -e "${dest}" ]] && die "clone destination ${dest} already exists (duplicate repo?)"
+        info "cloning ${url} -> ${dest}"
+        # HOME points at the (not yet started) workspace home; GIT_CONFIG_GLOBAL
+        # selects the team gitconfig so the credential helper -- and therefore
+        # the team PAT -- is used. Private repos without an installed PAT fail
+        # here, which is the correct outcome.
+        if ! run sudo -u "${ws}" \
+                env -i HOME="${base_dir}/home" PATH=/usr/local/bin:/usr/bin:/bin \
+                GIT_CONFIG_GLOBAL="$(team_gitconfig_path "${ws}")" \
+                GIT_TERMINAL_PROMPT=0 \
+                git clone --config "core.sharedRepository=group" "${url}" "${dest}"; then
+            die "git clone ${url} failed (private repo without an installed team PAT?)"
+        fi
+        # Keep the group-share invariants of <base>/projects (2750 ws:w-t-*):
+        # members read the tree through the group; only the team account writes.
+        run chgrp -R "$(group_for_team "${ws#t-}")" "${dest}"
+        run chmod -R g+rX "${dest}"
+        run find "${dest}" -type d -exec chmod g+s {} +
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Instance project registration (the third membership representation)
+# ---------------------------------------------------------------------------
+
+# Mint an access token for the freshly-started team instance by exchanging the
+# STARTUP pairing token the server logs exactly once at boot. This is the
+# machine-facing use of pairing; the user-facing pairing flow stays deleted.
+instance_access_token() {
+    local ws="$1" sock pairing_url token
+    sock="$(socket_path_for "${ws}")"
+    pairing_url="$(journalctl -u "t3ws@${ws}.service" --no-pager -n 400 2>/dev/null \
+        | grep -oE 'https?://[^" ]*#token=[A-Za-z0-9._~-]+' | tail -n 1 || true)"
+    token="${pairing_url##*#token=}"
+    [[ -n "${pairing_url}" && -n "${token}" ]] || {
+        echo "lsw: could not find a startup pairing URL in t3ws@${ws}'s journal" >&2
+        return 1
+    }
+    curl -fsS --max-time 10 --unix-socket "${sock}" \
+        -X POST 'http://localhost/oauth/token' \
+        -H 'content-type: application/x-www-form-urlencoded' \
+        --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:token-exchange' \
+        --data-urlencode "subject_token=${token}" \
+        --data-urlencode 'subject_token_type=urn:t3:params:oauth:token-type:environment-bootstrap' \
+        --data-urlencode 'requested_token_type=urn:ietf:params:oauth:token-type:access_token' \
+        --data-urlencode 'client_label=lsw-provisioning' \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
+}
+
+# List the instance's live project roots (used by team verify and idempotent
+# registration). One line per project: "<workspaceRoot>".
+instance_project_roots() {
+    local ws="$1" access_token="$2"
+    curl -fsS --max-time 10 --unix-socket "$(socket_path_for "${ws}")" \
+        -H "authorization: Bearer ${access_token}" \
+        'http://localhost/api/orchestration/shell' \
+        | python3 -c 'import json,sys; [print(p["workspaceRoot"]) for p in json.load(sys.stdin).get("projects", [])]'
+}
+
+# Register each cloned repo as a T3 project in the team instance via the HTTP
+# dispatch endpoint (POST /api/orchestration/dispatch), so members see the
+# repos in the project list immediately. Idempotent: roots already registered
+# are skipped.
+register_team_projects() {
+    local ws="$1"; shift
+    local base_dir="${WORKSPACES_DIR}/${ws}" access_token existing url dest name payload
+    if ${DRY_RUN}; then
+        echo "DRY-RUN: register ${#} repo clone(s) as projects in t3ws@${ws}"
+        return 0
+    fi
+    (( $# > 0 )) || return 0
+    access_token="$(instance_access_token "${ws}")" || return 1
+    existing="$(instance_project_roots "${ws}" "${access_token}")" || return 1
+    for url in "$@"; do
+        name="$(repo_dir_name "${url}")"
+        dest="${base_dir}/projects/${name}"
+        if grep -qxF "${dest}" <<< "${existing}"; then
+            info "project ${name} already registered in t3ws@${ws}; skipping"
+            continue
+        fi
+        payload="$(python3 - "${name}" "${dest}" <<'PYEOF'
+import datetime, json, sys, uuid
+name, root = sys.argv[1], sys.argv[2]
+print(json.dumps({
+    "type": "project.create",
+    "commandId": str(uuid.uuid4()),
+    "projectId": str(uuid.uuid4()),
+    "title": name,
+    "workspaceRoot": root,
+    "createWorkspaceRootIfMissing": False,
+    "createdAt": datetime.datetime.now(datetime.timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+}))
+PYEOF
+)"
+        if ! curl -fsS --max-time 20 --unix-socket "$(socket_path_for "${ws}")" \
+                -X POST 'http://localhost/api/orchestration/dispatch' \
+                -H "authorization: Bearer ${access_token}" \
+                -H 'content-type: application/json' \
+                --data "${payload}" > /dev/null; then
+            echo "lsw: project.create for '${name}' was rejected by t3ws@${ws}" >&2
+            return 1
+        fi
+        info "registered project ${name} in t3ws@${ws}"
+    done
+}
+
+# ---------------------------------------------------------------------------
 # Personal workspaces
 # ---------------------------------------------------------------------------
 
@@ -726,19 +956,56 @@ cmd_user_remove() {
 # Team workspaces
 # ---------------------------------------------------------------------------
 
+# The commit/push author for a team workspace: the admin's GitHub identity
+# (D14). Read from portal.config.json's adminGithubLogins[0]; overridable with
+# --git-name/--git-email at team add time.
+admin_git_login() {
+    python3 -c '
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+    logins = cfg.get("adminGithubLogins") or []
+    print(logins[0] if logins else "")
+except Exception:
+    print("")
+' "${LATESHIFT_ROOT}/portal.config.json" 2>/dev/null || true
+}
+
 cmd_team_add() {
     require_root
-    local project="" project_limit="${DEFAULT_PROJECT_LIMIT}" members=()
+    local project="" project_limit="${DEFAULT_PROJECT_LIMIT}" members=() repos_raw=()
+    local pat_file="" pat_stdin=false git_name="" git_email=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --project-limit) project_limit="${2:?--project-limit needs a value}"; shift 2 ;;
             --member) members+=("${2:?--member needs a value}"); shift 2 ;;
+            --repo) repos_raw+=("${2:?--repo needs a value}"); shift 2 ;;
+            --pat-file) pat_file="${2:?--pat-file needs a path}"; shift 2 ;;
+            --pat-stdin) pat_stdin=true; shift ;;
+            --git-name) git_name="${2:?--git-name needs a value}"; shift 2 ;;
+            --git-email) git_email="${2:?--git-email needs a value}"; shift 2 ;;
             -*) die "unknown flag for 'team add': $1" ;;
             *) [[ -n "${project}" ]] && die "unexpected argument: $1"; project="$1"; shift ;;
         esac
     done
-    [[ -n "${project}" ]] || die "usage: lsw team add <project> [--project-limit N] [--member LOGIN]..."
+    [[ -n "${project}" ]] || die "usage: lsw team add <project> [--project-limit N] [--member LOGIN]... [--repo OWNER/REPO]... [--pat-file F|--pat-stdin]"
     validate_project "${project}"
+
+    # Normalize and validate every repo BEFORE creating anything.
+    local repos=() r
+    for r in "${repos_raw[@]:-}"; do
+        [[ -n "${r}" ]] || continue
+        repos+=("$(normalize_repo_url "${r}")")
+    done
+
+    # Resolve the git author identity for the team (admin's GitHub identity).
+    if [[ -z "${git_name}" || -z "${git_email}" ]]; then
+        local admin_login
+        admin_login="$(admin_git_login)"
+        [[ -n "${admin_login}" ]] || die "cannot resolve the admin GitHub login from portal.config.json; pass --git-name and --git-email"
+        git_name="${git_name:-${admin_login}}"
+        git_email="${git_email:-${admin_login}@users.noreply.github.com}"
+    fi
     [[ "${project_limit}" =~ ^[0-9]{1,3}$ ]] || die "--project-limit must be an integer 0-999"
 
     local ws unix_user group base_dir
@@ -794,13 +1061,38 @@ cmd_team_add() {
         run usermod -aG "${group}" "$(registry_py get user "${m}" unixUser)"
     done
 
+    # GitHub identity + fresh clones happen BEFORE first start, all inside the
+    # armed rollback: any failure removes the whole workspace (base dir, unit,
+    # account) and the registry is never touched.
+    if [[ -n "${pat_file}" ]] || ${pat_stdin}; then
+        install_team_pat "${ws}" "${pat_file}"
+    elif (( ${#repos[@]} > 0 )); then
+        echo "lsw: NOTE no --pat-file/--pat-stdin: cloning anonymously (public repos only)." >&2
+        echo "     Install the team PAT later with: lsw team pat install ${project}" >&2
+    fi
+    write_team_gitconfig "${ws}" "${git_name}" "${git_email}"
+    if (( ${#repos[@]} > 0 )); then
+        clone_team_repos "${ws}" "${repos[@]}"
+    fi
+
     info "provisioning team workspace '${ws}' (group ${group})"
     if ! start_and_verify "${ws}" "${unix_user}"; then
         rollback_provision "${ws}" "${unix_user}" "${group}" "${base_dir}" "${created_account}" "${created_group}"
         die "provision failed; rolled back (registry untouched)"
     fi
 
-    if ! registry_py commit-team "${project}" "${unix_user}" "${group}" "${ws}" "${project_limit}" "${members[@]:-}"; then
+    # Third representation: the instance's own project list. Register every
+    # clone; a failure here fails the whole creation (no half-created state).
+    if (( ${#repos[@]} > 0 )) && ! register_team_projects "${ws}" "${repos[@]}"; then
+        rollback_provision "${ws}" "${unix_user}" "${group}" "${base_dir}" "${created_account}" "${created_group}"
+        die "instance project registration failed; rolled back (registry untouched)"
+    fi
+
+    local repos_json="[]"
+    if (( ${#repos[@]} > 0 )); then
+        repos_json="$(printf '%s\n' "${repos[@]}" | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')"
+    fi
+    if ! LSW_TEAM_REPOS="${repos_json}" registry_py commit-team "${project}" "${unix_user}" "${group}" "${ws}" "${project_limit}" "${members[@]:-}"; then
         rollback_provision "${ws}" "${unix_user}" "${group}" "${base_dir}" "${created_account}" "${created_group}"
         die "registry commit failed; rolled back"
     fi
@@ -866,7 +1158,20 @@ cmd_member() {
     require_root
     local action="${1:?usage: lsw member add|remove <project> <github-login>}"; shift
     [[ "${action}" == "add" || "${action}" == "remove" ]] || die "usage: lsw member add|remove <project> <github-login>"
-    local project="${1:?project required}" login="${2:?github login required}"
+    local project="" login="" new_pat_file=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --new-pat-file) new_pat_file="${2:?--new-pat-file needs a path}"; shift 2 ;;
+            -*) die "unknown flag for 'member ${action}': $1" ;;
+            *)
+                if [[ -z "${project}" ]]; then project="$1"
+                elif [[ -z "${login}" ]]; then login="$1"
+                else die "unexpected argument: $1"; fi
+                shift ;;
+        esac
+    done
+    [[ -n "${project}" && -n "${login}" ]] || die "usage: lsw member ${action} <project> <github-login>"
+    [[ "${action}" == "remove" || -z "${new_pat_file}" ]] || die "--new-pat-file only applies to 'member remove'"
     validate_project "${project}"
     validate_github_login "${login}"
 
@@ -896,13 +1201,126 @@ cmd_member() {
 
     ${DRY_RUN} || assert_membership_consistent "${ws}" "${group}"
     info "membership updated: ${action} ${login} -> ${ws}"
-    echo "lsw: TWO steps remain and are NOT done by this tool yet (W6-B):" >&2
-    echo "     1. reconcile the team instance's project list" >&2
-    echo "     2. restart t3ws@${ws} -- supplementary group changes only take" >&2
-    echo "        effect for processes started after the change" >&2
+
+    # The third representation -- the team instance's project list -- is
+    # per-WORKSPACE, fixed at creation (D9): membership changes never alter it,
+    # so registry + UNIX group + instance are consistent by construction here.
+    # `lsw team verify ${project}` re-checks all three on demand.
+
+    # Supplementary group changes only affect processes started afterwards.
+    echo "lsw: NOTE restart the MEMBER's personal workspace for the group change" >&2
+    echo "     to reach their shell/agent processes: systemctl restart t3ws@$(registry_py get user "${login}" personalWorkspace 2>/dev/null || echo '<their-ws>')" >&2
+
     if [[ "${action}" == "remove" ]]; then
-        echo "     3. rotate the team's fine-grained PAT (architecture-v2 open question 2)" >&2
+        # The removed member may have cached the team PAT (e.g. in their own
+        # git credential store after running git inside the team workspace's
+        # terminal). Rotate it: retire the old credential locally NOW, and
+        # install the replacement if one was supplied.
+        local cred
+        cred="$(team_credentials_path "${ws}")"
+        if [[ -f "${cred}" ]]; then
+            if ${DRY_RUN}; then
+                echo "DRY-RUN: shred/remove ${cred}"
+            else
+                shred -u "${cred}" 2>/dev/null || rm -f "${cred}"
+            fi
+            info "old team PAT removed from ${cred}"
+        fi
+        if [[ -n "${new_pat_file}" ]]; then
+            install_team_pat "${ws}" "${new_pat_file}"
+        fi
+        echo "lsw: PAT ROTATION REQUIRED (a removed member may hold the old token):" >&2
+        echo "     1. REVOKE the old fine-grained PAT at github.com/settings/personal-access-tokens" >&2
+        echo "        (deleting the local file does NOT invalidate the token)" >&2
+        if [[ -z "${new_pat_file}" ]]; then
+            echo "     2. mint a new PAT scoped to this team's repos only and install it:" >&2
+            echo "        lsw team pat install ${project}" >&2
+        else
+            echo "     2. new PAT already installed from ${new_pat_file}; delete that file." >&2
+        fi
     fi
+}
+
+# lsw team pat install|rotate <project> [--pat-file F]
+cmd_team_pat() {
+    require_root
+    local sub="${1:?usage: lsw team pat install|rotate <project> [--pat-file F]}"; shift
+    [[ "${sub}" == "install" || "${sub}" == "rotate" ]] || die "usage: lsw team pat install|rotate <project>"
+    local project="" pat_file=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pat-file) pat_file="${2:?--pat-file needs a path}"; shift 2 ;;
+            -*) die "unknown flag for 'team pat': $1" ;;
+            *) [[ -n "${project}" ]] && die "unexpected argument: $1"; project="$1"; shift ;;
+        esac
+    done
+    [[ -n "${project}" ]] || die "usage: lsw team pat ${sub} <project> [--pat-file F]"
+    validate_project "${project}"
+    local ws
+    ws="$(unix_user_for_team "${project}")"
+    registry_py ws-exists "${ws}" || die "team workspace '${ws}' not found"
+    if [[ "${sub}" == "rotate" && ! -f "$(team_credentials_path "${ws}")" ]]; then
+        echo "lsw: NOTE no PAT currently installed; 'rotate' behaves as 'install'." >&2
+    fi
+    install_team_pat "${ws}" "${pat_file}"
+    if [[ "${sub}" == "rotate" ]]; then
+        echo "lsw: REVOKE the previous PAT at github.com/settings/personal-access-tokens" >&2
+        echo "     -- overwriting the local file does not invalidate the old token." >&2
+    fi
+}
+
+# lsw team verify <project> -- check the three membership representations
+# (registry, UNIX group, instance project list) and the PAT file agree with
+# each other. Read-only; exits non-zero on any disagreement.
+cmd_team_verify() {
+    local project="${1:?usage: lsw team verify <project>}"
+    validate_project "${project}"
+    local ws group failed=0
+    ws="$(unix_user_for_team "${project}")"
+    group="$(group_for_team "${project}")"
+    registry_py ws-exists "${ws}" || die "team workspace '${ws}' not found"
+    unix_group_exists "${group}" || die "UNIX group '${group}' is missing; registry and host disagree"
+
+    assert_membership_consistent "${ws}" "${group}"
+    info "registry membership and UNIX group '${group}' agree"
+
+    local cred
+    cred="$(team_credentials_path "${ws}")"
+    if [[ -f "${cred}" ]]; then
+        local perms
+        perms="$(stat -c '%U:%G %a' "${cred}")"
+        if [[ "${perms}" != "${ws}:${ws} 600" ]]; then
+            echo "lsw: PAT file ${cred} is '${perms}', expected '${ws}:${ws} 600'" >&2
+            failed=1
+        else
+            info "team PAT present with correct ownership (${perms})"
+        fi
+    else
+        echo "lsw: NOTE no team PAT installed (pushes will fail; anonymous fetch only)" >&2
+    fi
+
+    if [[ "$(systemctl is-active "t3ws@${ws}.service" 2>/dev/null)" == "active" ]]; then
+        local access_token roots dir
+        if access_token="$(instance_access_token "${ws}")" \
+           && roots="$(instance_project_roots "${ws}" "${access_token}")"; then
+            info "instance project roots:"
+            printf '     %s\n' ${roots:-"(none)"}
+            for dir in "${WORKSPACES_DIR}/${ws}/projects"/*/; do
+                [[ -d "${dir}" ]] || continue
+                if ! grep -qxF "${dir%/}" <<< "${roots}"; then
+                    echo "lsw: clone ${dir%/} is NOT registered in the instance project list" >&2
+                    failed=1
+                fi
+            done
+        else
+            echo "lsw: could not query the instance project list (no startup pairing URL in the journal?)" >&2
+            failed=1
+        fi
+    else
+        echo "lsw: NOTE t3ws@${ws} is not active; skipped the instance project-list check" >&2
+    fi
+    (( failed == 0 )) || die "team '${project}' has inconsistencies (see above)"
+    info "team '${project}' is consistent"
 }
 
 # ---------------------------------------------------------------------------
@@ -1040,14 +1458,26 @@ main() {
             registry_py ensure
             "cmd_${cmd}" "$@"
             ;;
-        user|team)
-            local sub="${1:?usage: lsw ${cmd} add|remove ...}"; shift
-            [[ "${sub}" == "add" || "${sub}" == "remove" ]] || die "usage: lsw ${cmd} add|remove ..."
+        user)
+            local sub="${1:?usage: lsw user add|remove ...}"; shift
+            [[ "${sub}" == "add" || "${sub}" == "remove" ]] || die "usage: lsw user add|remove ..."
             mkdir -p "${LATESHIFT_ROOT}"
             exec 9> "${LOCK_FILE}"
             flock 9
             registry_py ensure
-            "cmd_${cmd}_${sub}" "$@"
+            "cmd_user_${sub}" "$@"
+            ;;
+        team)
+            local sub="${1:?usage: lsw team add|remove|pat|verify ...}"; shift
+            case "${sub}" in
+                add|remove|pat|verify) : ;;
+                *) die "usage: lsw team add|remove|pat|verify ..." ;;
+            esac
+            mkdir -p "${LATESHIFT_ROOT}"
+            exec 9> "${LOCK_FILE}"
+            flock 9
+            registry_py ensure
+            "cmd_team_${sub}" "$@"
             ;;
         member)
             mkdir -p "${LATESHIFT_ROOT}"
