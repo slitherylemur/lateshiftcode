@@ -8,6 +8,8 @@
 //     PRE-ESCAPED by the caller (callers must run their own values through
 //     esc() before assembling that HTML).
 
+import { p } from "./lib/paths.mjs";
+
 export function esc(v) {
   return String(v ?? "")
     .replaceAll("&", "&amp;")
@@ -145,22 +147,56 @@ const CSS = `
     border-radius: 999px; padding: 6px 12px; display: inline-flex; align-items: center; gap: 6px;
   }
   .theme-toggle:hover { color: var(--text); border-color: var(--border-strong); }
-  .identity-chip {
+  /* Account control: avatar + GitHub display name, a link to the account page.
+     Deliberately NO GitHub mark here — the logo belongs only on the signed-out
+     hero button. */
+  a.identity-chip, .identity-chip {
     display: flex; align-items: center; gap: 8px;
-    padding: 5px 12px 5px 6px;
+    padding: 4px 12px 4px 4px;
     border: 1px solid var(--border);
     border-radius: 999px;
     background: var(--surface);
-    color: var(--muted);
+    color: var(--text);
     font-size: 13px;
+    font-weight: 550;
+    max-width: 220px;
   }
-  .identity-chip img { width: 24px; height: 24px; border-radius: 50%; display: block; }
+  a.identity-chip:hover { text-decoration: none; background: var(--btn-hover); border-color: var(--border-strong); }
+  .identity-chip .who { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .identity-chip img { width: 26px; height: 26px; border-radius: 50%; display: block; object-fit: cover; }
   .identity-chip .avatar-fallback {
-    width: 24px; height: 24px; border-radius: 50%;
+    width: 26px; height: 26px; border-radius: 50%;
     background: var(--surface-2); border: 1px solid var(--border);
     display: inline-flex; align-items: center; justify-content: center;
-    color: var(--muted); font-size: 11px; font-weight: 600;
+    color: var(--muted); font-size: 12px; font-weight: 600;
   }
+  @media (max-width: 560px) {
+    /* Mobile: avatar only — the admin asked that the header not get crowded. */
+    .identity-chip { max-width: none; padding: 4px; }
+    .identity-chip .who { display: none; }
+  }
+
+  /* Account page */
+  .acct-head { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .acct-head img, .acct-head .avatar-lg {
+    width: 64px; height: 64px; border-radius: 50%; display: block; object-fit: cover; flex: none;
+  }
+  .acct-head .avatar-lg {
+    background: var(--surface-2); border: 1px solid var(--border);
+    display: inline-flex; align-items: center; justify-content: center;
+    color: var(--muted); font-size: 24px; font-weight: 600;
+  }
+  .acct-head h1 { margin: 0; font-size: 22px; }
+  .acct-head .handle { color: var(--muted); font-size: 14px; }
+  .kv { display: flex; align-items: baseline; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 13.5px; }
+  .kv:last-child { border-bottom: none; }
+  .kv .k { color: var(--muted); min-width: 132px; flex: none; }
+  .kv .v { flex: 1; min-width: 0; }
+  .ws-list { list-style: none; margin: 0; padding: 0; }
+  .ws-list li { padding: 9px 0; border-bottom: 1px solid var(--border); }
+  .ws-list li:last-child { border-bottom: none; }
+  .ws-list .ws-name { font-weight: 600; }
+  .unknown { color: var(--muted); font-style: italic; }
 
   /* Footer */
   footer { border-top: 1px solid var(--border); padding: 20px 0; }
@@ -418,17 +454,36 @@ function hiddenInput(name, value) {
   return `<input type="hidden" name="${esc(name)}" value="${esc(value)}">`;
 }
 
+/** Initial used by the avatar fallback: display name first, then login. */
+function initialOf(identity) {
+  const src = identity?.displayName || identity?.name || identity?.login || "?";
+  return String(src).trim().slice(0, 1).toUpperCase() || "?";
+}
+
+/**
+ * Avatar <img> (or a lettered fallback) for a GitHub identity.
+ * referrerpolicy=no-referrer so loading the avatar does not leak which portal
+ * page the user is on to githubusercontent.com. The URL itself is validated
+ * host-side in lib/profiles.mjs — esc() alone would not stop a `javascript:` src.
+ */
+function avatarImg(identity, { cls = "", fallbackCls = "avatar-fallback" } = {}) {
+  const attrs = cls ? ` class="${esc(cls)}"` : "";
+  if (identity?.profilePic) {
+    return `<img${attrs} src="${esc(identity.profilePic)}" alt="" referrerpolicy="no-referrer" loading="lazy">`;
+  }
+  return `<span class="${esc(fallbackCls)}">${esc(initialOf(identity))}</span>`;
+}
+
+/**
+ * The header account control (W4-B): avatar + GitHub display name, linking to
+ * the account page. Was a grey one-letter circle that was not even a link.
+ */
 function identityChip(identity) {
-  if (!identity) return "";
-  const login = esc(identity.login);
-  const avatar = identity.profilePic
-    ? `<img src="${esc(identity.profilePic)}" alt="">`
-    : `<span class="avatar-fallback">${esc(
-        String(identity.login || "?")
-          .slice(0, 1)
-          .toUpperCase(),
-      )}</span>`;
-  return `<span class="identity-chip">${avatar}<span>${login}</span></span>`;
+  if (!identity || !identity.login) return "";
+  const label = identity.displayName || identity.name || `@${identity.login}`;
+  return `<a class="identity-chip" href="${esc(p("/account"))}" title="${esc(label)} — account">
+    ${avatarImg(identity)}<span class="who">${esc(label)}</span>
+  </a>`;
 }
 
 function themeToggle() {
@@ -445,7 +500,7 @@ function nav({ identity = null, links = [] } = {}) {
     .join("");
   return `<header class="nav">
     <div class="container nav-inner">
-      <a class="brand" href="/"><img src="/static/logo.png" alt="">LateShift Cloud</a>
+      <a class="brand" href="/"><img src="${esc(p("/static/logo.png"))}" alt="">LateShift Cloud</a>
       <span class="nav-spacer"></span>
       ${linkHtml}
       ${themeToggle()}
@@ -495,7 +550,7 @@ function layout({ title, body, navHtml = "", extraScript = "" }) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
-<link rel="icon" type="image/png" href="/static/logo.png">
+<link rel="icon" type="image/png" href="${esc(p("/static/logo.png"))}">
 ${THEME_SCRIPT}
 <style>${CSS}</style>
 </head>
@@ -514,11 +569,11 @@ export function renderHero({ identityLogin, githubEnabled } = {}) {
       ? `Signed in as ${esc(identityLogin)} — this account has no workspace yet.`
       : "Access is invite-only.";
   const githubBtn = githubEnabled
-    ? `<p style="margin:0 0 22px"><a class="btn btn-primary btn-big" href="/auth/github/login">${GITHUB_ICON}Sign in with GitHub</a></p>`
+    ? `<p style="margin:0 0 22px"><a class="btn btn-primary btn-big" href="${esc(p("/auth/github/login"))}">${GITHUB_ICON}Sign in with GitHub</a></p>`
     : "";
   const body = `<main class="hero">
     <div>
-      <img src="/static/logo.png" alt="LateShift Cloud logo">
+      <img src="${esc(p("/static/logo.png"))}" alt="LateShift Cloud logo">
       <h1>LateShift Cloud</h1>
       <p class="subhead">Your AI dev workspace</p>
       <p class="body">Access is invite-only. Sign in with GitHub to request a workspace, or contact your administrator.</p>
@@ -529,28 +584,63 @@ export function renderHero({ identityLogin, githubEnabled } = {}) {
   return layout({ title: "LateShift Cloud", body, navHtml: nav() });
 }
 
-// 2) User dashboard.
-export function renderDashboard(props) {
-  const { identity, user, instanceStatus, projects, usage, isAdmin, github } = props;
+/**
+ * W4-E: greet with the GitHub display name, never the internal short name
+ * (the registry key / UNIX account). First word only, so "Welcome back, Sam"
+ * rather than "Welcome back, Samuel Q. Example".
+ */
+function firstName(identity) {
+  const full = identity?.displayName || identity?.name;
+  if (full) return String(full).trim().split(/\s+/)[0];
+  return identity?.login ? `@${identity.login}` : "there";
+}
 
-  const githubCard = `<div class="card">
+/** A friendly project name; never an absolute server path. */
+function projectLabel(pr) {
+  const t = typeof pr?.title === "string" ? pr.title.trim() : "";
+  if (t) return t;
+  // Last resort when a project row has no title: the directory's basename,
+  // which is the folder the user themselves named. Never the full path.
+  const root = typeof pr?.workspaceRoot === "string" ? pr.workspaceRoot : "";
+  const base = root.split("/").filter(Boolean).pop();
+  return base || "Untitled project";
+}
+
+/**
+ * The GitHub connection card, shared by the dashboard and the account page.
+ * "Connect" now points at the CONSENTED SCOPE UPGRADE (/auth/github/connect),
+ * not at a re-run of sign-in: signing in no longer asks for repo access at all
+ * (W4-D), so the old "sign out and sign in again" advice would never work.
+ */
+function githubCardHtml(github) {
+  const connected = Boolean(github && github.connected);
+  return `<div class="card">
     <h2>GitHub</h2>
     ${
-      github && github.connected
-        ? `<p style="margin:0">Connected as <strong>@${esc(github.login || "")}</strong>. Your workspace can push and pull private repositories.</p>`
-        : `<p style="margin:0 0 12px">Not connected — your workspace can't push to GitHub yet.
-             <a href="/auth/github/login">Sign out and sign in again</a> to grant repository access.</p>
-           <p style="margin:0"><a class="btn btn-sm" href="/auth/github/login">Connect GitHub</a></p>`
+      connected
+        ? `<p style="margin:0">Push access connected as <strong>@${esc(github.login || "")}</strong>. Your workspace can push and pull private repositories.</p>`
+        : `<p style="margin:0 0 12px">Signed in with GitHub, but your workspace cannot push yet.
+             Connecting asks GitHub for repository write access — a separate, explicit grant.</p>
+           <p style="margin:0"><a class="btn btn-sm btn-primary" href="${esc(p("/auth/github/connect"))}">Connect push access</a></p>`
     }
   </div>`;
+}
+
+// 2) User dashboard.
+export function renderDashboard(props) {
+  const { identity, instanceStatus, projects, usage, isAdmin, github, workspaceUrl } = props;
+
+  const githubCard = githubCardHtml(github);
 
   const navHtml = nav({
     identity,
-    links: isAdmin ? [{ href: "/admin", label: "Admin" }] : [],
+    links: isAdmin ? [{ href: p("/admin"), label: "Admin" }] : [],
   });
 
+  // No subdomain and no short name: under the v2 single origin the apex serves
+  // the workspace itself (architecture-v2.md D2).
   const openLink = `<div class="actions-row">
-    <a class="btn btn-primary btn-big" href="https://${esc(user.name)}.lateshiftcloud.com/">Open my workspace</a>
+    <a class="btn btn-primary btn-big" href="${esc(workspaceUrl || "/")}">Open my workspace</a>
   </div>`;
 
   const usageHtml = usage
@@ -566,9 +656,9 @@ export function renderDashboard(props) {
     projects.length === 0
       ? `<div class="card"><p class="muted" style="margin:0">No projects yet — open your workspace to create one.</p></div>`
       : projects
-          .map((p) => {
-            const deleted = Boolean(p.deletedAt);
-            const threads = (p.threads || [])
+          .map((pr) => {
+            const deleted = Boolean(pr.deletedAt);
+            const threads = (pr.threads || [])
               .map((t) => {
                 const dim = Boolean(t.deletedAt || t.archivedAt);
                 const tag = t.deletedAt
@@ -583,13 +673,16 @@ export function renderDashboard(props) {
                 </div>`;
               })
               .join("");
+            // W4-E: no absolute server path. `workspaceRoot` is an internal
+            // filesystem location (/home/dev/services/lateshift/users/<short
+            // name>/...) and leaks the short name; the project's own name is
+            // the only thing the user needs.
             return `<div class="card project${deleted ? " deleted" : ""}">
               <div class="project-head">
-                <span class="title">${esc(p.title)}</span>
+                <span class="title">${esc(projectLabel(pr))}</span>
                 ${deleted ? `<span class="tag">deleted</span>` : ""}
-                ${p.costUsd != null ? `<span class="cost">${esc(money(p.costUsd))} spent</span>` : ""}
+                ${pr.costUsd != null ? `<span class="cost">${esc(money(pr.costUsd))} spent</span>` : ""}
               </div>
-              <div class="root mono">${esc(p.workspaceRoot)}</div>
               ${threads ? `<div class="threads">${threads}</div>` : ""}
             </div>`;
           })
@@ -597,7 +690,7 @@ export function renderDashboard(props) {
 
   const body = `<main class="container">
     <div class="greeting">
-      <h1 style="margin:0">Welcome back, ${esc(user.name)}</h1>
+      <h1 style="margin:0">Welcome back, ${esc(firstName(identity))}</h1>
       ${statusChip(instanceStatus)}
     </div>
 
@@ -620,6 +713,143 @@ export function renderDashboard(props) {
   return layout({ title: "Dashboard — LateShift Cloud", body, navHtml });
 }
 
+// ---- account page (W4-C) -------------------------------------------------
+//
+// Sections, per architecture-v2.md §6: identity, GitHub connection, workspace
+// memberships, usage (pool state + your share), sign out. Deliberately compact
+// — the admin asked that it not be crowded on mobile, so each section is a
+// short card and the usage block degrades to two lines when there is no data.
+
+/**
+ * Pool remaining — PROVIDER TRUTH. Rendered from W3's collector via
+ * lib/usage.getPoolState(). Principle 3: when no rate-limit event has been
+ * seen, this says "unknown". It must never show an extrapolation, and it must
+ * never be blended with the attribution numbers below it.
+ */
+function poolHtml(pool) {
+  const providers = pool && Array.isArray(pool.providers) ? pool.providers : [];
+  if (!providers.length) {
+    return `<p class="unknown" style="margin:0">Unknown — no rate-limit update has been received from the providers yet.</p>`;
+  }
+  const blocks = providers
+    .map((prov) => {
+      const rows = (prov.windows || [])
+        .map((w) => {
+          const util =
+            typeof w.utilization === "number" && Number.isFinite(w.utilization)
+              ? `${w.utilization.toFixed(0)}% used`
+              : `<span class="unknown">unknown</span>`;
+          // resetsAt is surfaced VERBATIM: §4 forbids relabelling windows,
+          // because both providers' reset behaviour contradicts their labels.
+          const resets = w.resetsAt ? ` · resets ${esc(w.resetsAt)}` : "";
+          const status = w.status ? ` · ${esc(w.status)}` : "";
+          return `<div class="kv"><span class="k mono">${esc(w.label)}</span><span class="v">${util}${resets}${status}</span></div>`;
+        })
+        .join("");
+      return `<h3 style="margin-top:14px">${esc(prov.provider)}</h3>${rows || `<p class="unknown" style="margin:0">Unknown.</p>`}`;
+    })
+    .join("");
+  return `${blocks}<p class="muted" style="font-size:12px;margin:12px 0 0">Provider-reported, subscription-wide${
+    pool.asOf ? ` · as of ${esc(relTime(pool.asOf))}` : ""
+  }.</p>`;
+}
+
+/**
+ * Share of consumption — OUR ATTRIBUTION, from the turn_usage ledger. Never
+ * presented as "how much is left". The dollar figure is a de-emphasised
+ * API-equivalent estimate, never spend against a cap (§4).
+ */
+function shareHtml(share) {
+  if (!share) {
+    return `<p class="muted" style="margin:0">No usage recorded for your workspace yet.</p>`;
+  }
+  const pct =
+    typeof share.sharePct === "number" && Number.isFinite(share.sharePct)
+      ? `${share.sharePct.toFixed(1)}%`
+      : "—";
+  return `<div class="stats">
+      <div class="stat"><div class="label">Your share (MTD)</div><div class="value">${esc(pct)}</div></div>
+      <div class="stat"><div class="label">Turns</div><div class="value">${esc(intFmt(share.turns))}</div></div>
+      <div class="stat"><div class="label">Input tokens</div><div class="value">${esc(intFmt(share.inputTokens))}</div></div>
+      <div class="stat"><div class="label">Output tokens</div><div class="value">${esc(intFmt(share.outputTokens))}</div></div>
+    </div>
+    <p class="muted" style="font-size:12px;margin:12px 0 0">
+      Share of this month's recorded consumption across all workspaces.
+      API-equivalent estimate ${esc(money(share.monthCostUsd))} — not a bill and not a cap.
+    </p>`;
+}
+
+function membershipsHtml(memberships) {
+  const list = Array.isArray(memberships) ? memberships : [];
+  if (!list.length) {
+    return `<p class="muted" style="margin:0">No workspace yet.</p>`;
+  }
+  const items = list
+    .map(
+      (m) => `<li>
+        <div class="ws-name">${esc(m.label)}${m.kind === "team" ? ' <span class="tag">shared</span>' : ""}</div>
+        ${m.detail ? `<div class="muted" style="font-size:12.5px">${esc(m.detail)}</div>` : ""}
+      </li>`,
+    )
+    .join("");
+  return `<ul class="ws-list">${items}</ul>`;
+}
+
+export function renderAccount(props) {
+  const { csrf, identity, isAdmin, hasWorkspace, github, memberships, pool, share, flash } = props;
+
+  const navHtml = nav({
+    identity,
+    links: [
+      { href: "/", label: "Dashboard" },
+      ...(isAdmin ? [{ href: p("/admin"), label: "Admin" }] : []),
+    ],
+  });
+
+  const name = identity.displayName || identity.name || `@${identity.login}`;
+
+  const body = `<main class="container">
+    ${flash ? `<div class="banner banner-success">${esc(flash)}</div>` : ""}
+
+    <div class="card">
+      <div class="acct-head">
+        ${avatarImg(identity, { fallbackCls: "avatar-lg" })}
+        <div>
+          <h1>${esc(name)}</h1>
+          <div class="handle">@${esc(identity.login)}${isAdmin ? '<span class="badge-admin">admin</span>' : ""}</div>
+        </div>
+      </div>
+    </div>
+
+    ${githubCardHtml(github)}
+
+    <div class="card">
+      <h2>Workspaces</h2>
+      ${membershipsHtml(memberships)}
+    </div>
+
+    <div class="card">
+      <h2>Pool remaining</h2>
+      ${poolHtml(pool)}
+    </div>
+
+    <div class="card">
+      <h2>Your usage</h2>
+      ${hasWorkspace ? shareHtml(share) : `<p class="muted" style="margin:0">No workspace yet.</p>`}
+    </div>
+
+    <div class="card">
+      <h2>Sign out</h2>
+      <form method="POST" action="${esc(p("/auth/logout"))}">
+        ${hiddenInput("csrf", csrf)}
+        <button type="submit" class="btn btn-danger">Sign out</button>
+      </form>
+    </div>
+  </main>`;
+
+  return layout({ title: "Account — LateShift Cloud", body, navHtml });
+}
+
 // ---- admin sub-renderers ------------------------------------------------
 
 function userSdot(u) {
@@ -634,7 +864,7 @@ function renderUserList(users, self, selectedKey, csrf) {
   // Synthetic "you" entry when the admin has no registry user of their own.
   if (!self.present) {
     const active = selectedKey === "@self";
-    items.push(`<li><a class="${active ? "active" : ""}" href="/admin?u=%40self">
+    items.push(`<li><a class="${active ? "active" : ""}" href="${esc(p("/admin"))}?u=%40self">
       <span class="sdot self"></span>
       <span class="u-name">${esc(self.login || "You")}</span>
       <span class="u-edit">You</span>
@@ -645,9 +875,15 @@ function renderUserList(users, self, selectedKey, csrf) {
     const badge = u.isSelf
       ? '<span class="u-edit" style="color:var(--info)">You</span>'
       : '<span class="u-edit">Edit</span>';
-    items.push(`<li><a class="${active ? "active" : ""}" href="/admin?u=${encodeURIComponent(u.name)}">
+    // Human first, internal short name second (muted, monospace) — the admin
+    // panel is the one surface where the short name legitimately stays, since
+    // it is the systemd unit / UNIX account the admin acts on.
+    const who = u.displayName
+      ? `${esc(u.displayName)} <span class="muted mono" style="font-weight:400">${esc(u.name)}</span>`
+      : esc(u.name);
+    items.push(`<li><a class="${active ? "active" : ""}" href="${esc(p("/admin"))}?u=${encodeURIComponent(u.name)}">
       <span class="sdot ${userSdot(u)}"></span>
-      <span class="u-name">${esc(u.name)}${u.admin ? '<span class="badge-admin">admin</span>' : ""}</span>
+      <span class="u-name">${who}${u.admin ? '<span class="badge-admin">admin</span>' : ""}</span>
       ${badge}
     </a></li>`);
   }
@@ -663,7 +899,7 @@ function userSettingsCard(u, csrf) {
     <div class="setting-grid">
       <div class="setting">
         <span class="k">Project limit</span>
-        <form method="POST" action="/admin/set-limit" class="row" style="gap:8px">
+        <form method="POST" action="${esc(p("/admin/set-limit"))}" class="row" style="gap:8px">
           ${hiddenInput("name", u.name)}
           ${hiddenInput("csrf", csrf)}
           <input type="number" name="limit" min="0" max="999" value="${esc(u.projectLimit)}" class="narrow">
@@ -674,7 +910,7 @@ function userSettingsCard(u, csrf) {
         <span class="k">Flags</span>
         <div class="row" style="gap:8px">
           <span class="yesno">Admin: <strong>${u.admin ? "yes" : "no"}</strong></span>
-          <form method="POST" action="/admin/toggle-admin" class="inline">
+          <form method="POST" action="${esc(p("/admin/toggle-admin"))}" class="inline">
             ${hiddenInput("name", u.name)}
             ${hiddenInput("csrf", csrf)}
             <button type="submit" class="btn btn-sm">Toggle</button>
@@ -689,7 +925,7 @@ function lifecycleCard(u, csrf) {
   return `<div class="card">
     <h2>Lifecycle</h2>
     <div class="row" style="gap:12px">
-      <form method="POST" action="/admin/remove-user" class="inline">
+      <form method="POST" action="${esc(p("/admin/remove-user"))}" class="inline">
         ${hiddenInput("name", u.name)}
         ${hiddenInput("csrf", csrf)}
         <button type="submit" class="btn btn-danger">Remove user…</button>
@@ -731,7 +967,9 @@ function renderDetail(props) {
 
   return `<div>
     <div class="detail-title">
-      <h2>${esc(u.name)}</h2>${adminBadge}${selfBadge}${statusHtml}
+      <h2>${esc(u.displayName || u.name)}</h2>${
+        u.displayName ? `<span class="muted mono">${esc(u.name)}</span>` : ""
+      }${adminBadge}${selfBadge}${statusHtml}
     </div>
     ${githubStatusLine(u.github)}
     ${userSettingsCard(u, csrf)}
@@ -767,7 +1005,7 @@ function renderLeaderboard(leaderboard) {
 function addUserCard(csrf) {
   return `<div class="card">
     <h2>Add user</h2>
-    <form method="POST" action="/admin/add-user">
+    <form method="POST" action="${esc(p("/admin/add-user"))}">
       ${hiddenInput("csrf", csrf)}
       <div class="row" style="align-items:flex-end">
         <div class="field">
@@ -802,7 +1040,7 @@ export function renderAwaitingApproval({ login, name, avatar, denied } = {}) {
     <div class="card center-page">
       ${avatarHtml}
       ${inner}
-      <p style="margin-top:20px"><a href="/auth/logout">Sign out</a></p>
+      <p style="margin-top:20px"><a href="${esc(p("/auth/logout"))}">Sign out</a></p>
     </div>
   </main>`;
   return layout({ title: "Awaiting approval — LateShift Cloud", body, navHtml: nav() });
@@ -829,13 +1067,13 @@ function renderPending(pending, csrf) {
         <div class="pend-login">@${login}</div>
         <div class="muted" style="font-size:12.5px">${pReq.name ? esc(pReq.name) + " · " : ""}${esc(relTime(pReq.requestedAt))}</div>
       </div></div>
-      <form method="POST" action="/admin/approve" class="pend-actions">
+      <form method="POST" action="${esc(p("/admin/approve"))}" class="pend-actions">
         ${hiddenInput("csrf", csrf)}${hiddenInput("login", pReq.login)}
         <input type="text" name="name" value="${esc(suggested)}" pattern="[a-z0-9-]{2,20}" required class="narrow" aria-label="workspace name">
         <input type="number" name="projectLimit" value="3" min="0" max="999" class="narrow" aria-label="project limit">
         <button type="submit" class="btn btn-sm btn-primary">Approve</button>
       </form>
-      <form method="POST" action="/admin/deny" class="pend-actions">
+      <form method="POST" action="${esc(p("/admin/deny"))}" class="pend-actions">
         ${hiddenInput("csrf", csrf)}${hiddenInput("login", pReq.login)}
         <button type="submit" class="btn btn-sm btn-danger">Deny</button>
       </form>
@@ -911,7 +1149,7 @@ export function renderConfirm({
         ${hiddenInput("csrf", csrf)}
         ${hiddenInput("confirm", "1")}
         <button type="submit" class="btn ${danger ? "btn-danger" : "btn-primary"}">${esc(confirmLabel)}</button>
-        <a class="nav-link" href="/admin">Cancel</a>
+        <a class="nav-link" href="${esc(p("/admin"))}">Cancel</a>
       </form>
     </div>
   </main>`;

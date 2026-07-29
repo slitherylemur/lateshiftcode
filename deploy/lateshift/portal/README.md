@@ -14,6 +14,50 @@ POST, `execFile`-only shell-outs, `assertSafeUnit`).
 - `lib/actions.mjs`  — validated shell-outs (`t3user`, `systemctl`).
 - `lib/history.mjs`  — read-only usage/history readers over each instance's
   `state.sqlite` (`turn_usage`), including provider bucketing.
+- `lib/paths.mjs`    — the reserved URL root (`/~lsc`) and the prefix-stripping
+  helper every route goes through.
+- `lib/profiles.mjs` — GitHub avatar + display-name cache (`profiles.json`),
+  captured at the OAuth callback. Contains no secrets.
+- `lib/usage.mjs`    — the account page's usage seam: the interface W3's
+  rate-limit collector must satisfy (pool state), plus the turn_usage-derived
+  share-of-consumption that exists today.
+- `test/w4-smoke.mjs` — dependency-free assertions over paths, OAuth scope /
+  state-intent handling, avatar-URL sanitising and view escaping.
+  Run: `node test/w4-smoke.mjs`.
+
+## Reserved URL root — `/~lsc`
+
+Under the v2 single-origin design the apex serves the *workspace*, not the
+portal, so every portal-owned URL lives under one reserved root:
+
+```
+/~lsc/account                       account page (identity, GitHub, usage, sign out)
+/~lsc/admin, /~lsc/admin/*          admin console (GET + all POSTs)
+/~lsc/auth/github/login|connect|callback, /~lsc/auth/logout
+/~lsc/authz                         forward_auth target (loopback only)
+/~lsc/static/logo.png, /~lsc/healthz
+```
+
+Spike W0-C established why one odd root beats several plausible top-level
+names: the T3 server's `GET *` catch-all never 404s and its
+`/$environmentId/$threadId` client route claims every two-segment path, so a
+future upstream `/account` would silently render the chat SPA instead of the
+portal page. `'~'` is a character upstream will never start a route with.
+
+`lib/paths.mjs` strips the prefix, so the route table in `server.mjs` is still
+written in bare form and **unprefixed paths keep working**. Those bare aliases
+are transitional — they exist because the deployed gateway and the GitHub OAuth
+app's registered `redirect_uri` still point at `/auth/github/callback`. Delete
+them once W7's gateway and the OAuth app both use the prefix.
+
+`/favicon.ico` is **no longer served by the portal**: under a single origin it
+belongs to T3, whose `index.html` links it (W0-C finding 1). Portal branding
+lives at `/~lsc/static/logo.png`.
+
+Every link out of the T3 shell into `/~lsc/*` must be a real document
+navigation (a plain `<a>`, not a TanStack `<Link>`) and every admin form a real
+form POST — otherwise the SPA router swallows it. That constraint belongs to
+the fork work, not to this app.
 
 ## Admin portal
 
@@ -61,13 +105,49 @@ signed session cookie; there is no other identity path.
   and the JSON pending-approval store. All crypto via `node:crypto`, all
   outbound HTTP via the Node global `fetch`.
 
-**OAuth flow.** `GET /auth/github/login` → 302 to `github.com/login/oauth/authorize`
-(`scope=read:user`, `state` = signed random nonce in a short-lived HttpOnly
-cookie). `GET /auth/github/callback` verifies `state` (constant-time + signature),
-exchanges the code for a token (`Accept: application/json`), fetches
-`api.github.com/user`, then mints the session and routes: known+approved user →
-dashboard, admin → `/admin`, unknown login → recorded in `pending.json` and an
-awaiting-approval page. `GET /auth/logout` clears the session.
+**OAuth flow.** `GET /~lsc/auth/github/login` → 302 to
+`github.com/login/oauth/authorize` with **`scope=read:user`** and a signed
+`state` (random nonce **plus the intent**, HMAC'd, mirrored in a short-lived
+HttpOnly cookie). `GET /~lsc/auth/github/callback` verifies `state`
+(constant-time + signature), exchanges the code for a token
+(`Accept: application/json`), fetches `api.github.com/user`, persists the
+avatar + display name to `profiles.json`, then mints the session and routes:
+known+approved user → workspace, admin → `/~lsc/admin`, unknown login →
+recorded in `pending.json` + an awaiting-approval page. `GET /~lsc/auth/logout`
+clears the session; the account page signs out with a **CSRF-protected POST** to
+the same path.
+
+**Two scopes, two consents.** Sign-in used to request
+`read:user repo workflow` — repo *write* access, taken at first contact from a
+stranger the admin had not yet approved. It is now split:
+
+| Flow | Route | Scope |
+|---|---|---|
+| Sign in | `/~lsc/auth/github/login` | `read:user` |
+| Connect push access | `/~lsc/auth/github/connect` | `read:user repo workflow` |
+
+`/…/connect` requires an existing session and is reachable only from the
+account page's GitHub card. The callback reads the **granted** scopes off the
+token response (never what we asked for) and installs a credential into a
+workspace's `gh` store **only** when `repo` was actually granted — so a narrow
+sign-in token can never masquerade as, or overwrite, a connected store.
+Credentials installed before this change are untouched and keep working; the
+intent is optional in the signed state, so sign-ins already in flight across a
+deploy still verify.
+
+**Account page** (`/~lsc/account`): avatar + name + `@login`, GitHub connection,
+workspace memberships, usage, and sign out. The header control on every page is
+an avatar + GitHub display name linking here — no GitHub mark (that stays on
+the signed-out hero button only). Internal short names do not appear on any
+user-visible surface; they survive as UNIX account and systemd unit names, and
+in the admin panel where the admin acts on the unit.
+
+**Usage on the account page** shows the two §4 displays and never blends them:
+*Pool remaining* is provider truth from W3's rate-limit collector — currently
+`null`, which renders as **"unknown"**, and must never be an estimate; *your
+share* is our own `turn_usage` attribution, as a percentage of the fleet's
+month-to-date recorded consumption. The interface W3 must satisfy is documented
+at the top of `lib/usage.mjs`.
 
 **Session cookie.** `lsc_session = base64url(payload).sig`, payload
 `{v:1, gh:<login>, iat, exp}` (7 days). `Secure; HttpOnly; SameSite=Lax`;
