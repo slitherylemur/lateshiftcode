@@ -77,6 +77,7 @@ const caddy = spawn("caddy", ["run", "--config", join(__dirname, "Caddyfile"), "
     ...process.env,
     LSC_HTTP_PORT: "8881",
     LSC_PORTAL_UPSTREAM: `127.0.0.1:${PORTAL_PORT}`,
+    LSC_LOG_FILE: join(root, "caddy-smoke.log"),
   },
   stdio: ["ignore", "ignore", "inherit"],
 });

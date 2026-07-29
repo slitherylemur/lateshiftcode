@@ -41,7 +41,7 @@
 	default_bind 127.0.0.1
 	http_port {$LSC_HTTP_PORT:8880}
 	log {
-		output file /var/log/caddy/lsc-gateway-v2.log
+		output file {$LSC_LOG_FILE:/var/log/caddy/lsc-gateway-v2.log}
 		level INFO
 	}
 }
