@@ -49,6 +49,14 @@ EnvironmentFile=/home/dev/services/lateshift/workspaces/%i/instance.env
 # SUBSCRIPTION, not of a workspace, so every instance shares the directory and
 # last writer wins. Unset in desktop/dev builds, where the store is a no-op.
 Environment=T3CODE_RATE_LIMIT_SNAPSHOT_DIR=/home/dev/services/lateshift/state/rate-limits
+# Message attribution sidecar (W6-D, architecture-v2 section 6). Presentation
+# only: the server records WHO sent each user message (from the gateway's
+# X-Lsc-User header) as JSON files here, keyed by message id, and serves them
+# back at /api/lsc/thread-attribution. The identity never enters the
+# orchestration command or the prompt. Workspace-private (inside the base dir,
+# already writable via BindPaths); the store mkdirs it on first write and is a
+# no-op when the variable is unset (desktop/dev builds).
+Environment=T3CODE_LSC_ATTRIBUTION_DIR=/home/dev/services/lateshift/workspaces/%i/userdata/lsc-attribution
 ExecStart=/home/dev/services/lateshift/bin/run-workspace.sh %i
 Restart=on-failure
 RestartSec=5

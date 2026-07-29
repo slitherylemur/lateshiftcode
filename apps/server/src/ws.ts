@@ -92,6 +92,12 @@ import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
 import * as WorkspaceFileSystem from "./workspace/WorkspaceFileSystem.ts";
 import * as WorkspacePaths from "./workspace/WorkspacePaths.ts";
 import * as VcsStatusBroadcaster from "./vcs/VcsStatusBroadcaster.ts";
+// LateShift W6-D: presentation-only sender attribution (sidecar, never in the command).
+import {
+  MessageAttribution,
+  MessageAttributionLayer,
+  normalizeSenderLogin,
+} from "./lateshift/MessageAttribution.ts";
 import * as VcsProvisioningService from "./vcs/VcsProvisioningService.ts";
 import * as GitWorkflowService from "./git/GitWorkflowService.ts";
 import * as ReviewService from "./review/ReviewService.ts";
@@ -403,6 +409,10 @@ function toAuthAccessStreamEvent(
 const makeWsRpcLayer = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
+  // LateShift W6-D: the gateway-authenticated GitHub login of this connection
+  // (X-Lsc-User at upgrade). Null off-gateway; used ONLY for the attribution
+  // sidecar -- it is never attached to any orchestration command.
+  lscSenderLogin: string | null = null,
 ) =>
   WsRpcGroup.toLayer(
     Effect.gen(function* () {
@@ -1103,6 +1113,10 @@ const makeWsRpcLayer = (
         };
       });
 
+      // LateShift W6-D: optional so upstream test harnesses that build this
+      // layer without the sidecar keep working unchanged.
+      const lscMessageAttribution = yield* Effect.serviceOption(MessageAttribution);
+
       const refreshGitStatus = (cwd: string) =>
         vcsStatusBroadcaster
           .refreshStatus(cwd)
@@ -1114,6 +1128,20 @@ const makeWsRpcLayer = (
             ORCHESTRATION_WS_METHODS.dispatchCommand,
             Effect.gen(function* () {
               const normalizedCommand = yield* normalizeDispatchCommand(command);
+              // LateShift W6-D: record WHO sent this user message, keyed by
+              // message id, in the sidecar table only. The command itself is
+              // untouched, so the fact can never reach prompt construction.
+              if (
+                normalizedCommand.type === "thread.turn.start" &&
+                lscSenderLogin !== null &&
+                Option.isSome(lscMessageAttribution)
+              ) {
+                yield* lscMessageAttribution.value.record({
+                  messageId: normalizedCommand.message.messageId,
+                  threadId: normalizedCommand.threadId,
+                  senderLogin: lscSenderLogin,
+                });
+              }
               const shouldStopSessionAfterArchive =
                 normalizedCommand.type === "thread.archive"
                   ? yield* projectionSnapshotQuery
@@ -2115,9 +2143,14 @@ export const websocketRpcRouteLayer = Layer.unwrap(
           disableTracing: true,
         }).pipe(
           Effect.provide(
-            makeWsRpcLayer(session, previewAutomationBroker).pipe(
+            makeWsRpcLayer(
+              session,
+              previewAutomationBroker,
+              normalizeSenderLogin(request.headers["x-lsc-user"]),
+            ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(ProviderMaintenanceRunner.layer),
+              Layer.provide(MessageAttributionLayer),
               Layer.provide(Layer.succeed(ServerSelfUpdate.ServerSelfUpdate, serverSelfUpdate)),
               Layer.provide(
                 SourceControlDiscovery.layer.pipe(
