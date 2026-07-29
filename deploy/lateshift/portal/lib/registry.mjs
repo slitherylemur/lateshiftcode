@@ -6,7 +6,9 @@
 
 import { readFileSync } from "node:fs";
 
-export const LATESHIFT_ROOT = "/home/dev/services/lateshift";
+// Overridable ONLY so the authz test matrix can run against a scratch tree;
+// production never sets LSC_ROOT.
+export const LATESHIFT_ROOT = process.env.LSC_ROOT || "/home/dev/services/lateshift";
 export const REGISTRY_PATH = `${LATESHIFT_ROOT}/users.json`;
 export const CONFIG_PATH = `${LATESHIFT_ROOT}/portal.config.json`;
 
@@ -20,7 +22,6 @@ export const GH_LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
  *   githubClientSecret string    — GitHub OAuth app client secret
  *   sessionSecret      string    — HMAC key for the lsc_session cookie (hex)
  *   publicBaseUrl      string    — public origin, e.g. https://lateshiftcloud.com
- *   cookieDomain       string    — e.g. .lateshiftcloud.com (session cookie Domain)
  *   adminGithubLogins  string[]  — GitHub logins that are portal admins
  */
 export function loadConfig() {
@@ -31,7 +32,6 @@ export function loadConfig() {
     githubClientSecret: raw.githubClientSecret || null,
     sessionSecret: raw.sessionSecret || null,
     publicBaseUrl: raw.publicBaseUrl ? String(raw.publicBaseUrl).replace(/\/+$/, "") : null,
-    cookieDomain: raw.cookieDomain || null,
     adminGithubLogins: Array.isArray(raw.adminGithubLogins) ? raw.adminGithubLogins : [],
   };
 }
