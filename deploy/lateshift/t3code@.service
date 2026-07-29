@@ -8,6 +8,12 @@ User=dev
 WorkingDirectory=/home/dev/services/t3code-production
 Environment=PATH=/home/dev/.local/bin:/home/dev/.rokit/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=/home/dev/services/lateshift/users/%i/instance.env
+# Real usage telemetry (architecture-v2 section 4): the server writes the
+# latest provider rate-limit snapshot here, one JSON file per provider, and the
+# portal reads it. Rate limits are a property of the shared SUBSCRIPTION, not
+# of a user, so the directory is shared by every instance and last writer wins.
+# Unset in desktop/dev builds, where the store is a no-op.
+Environment=T3CODE_RATE_LIMIT_SNAPSHOT_DIR=/home/dev/services/lateshift/state/rate-limits
 ExecStart=/home/dev/services/lateshift/bin/run-instance.sh %i
 Restart=on-failure
 RestartSec=5
@@ -45,6 +51,17 @@ ProtectHome=read-only
 #   - the shared agent credential/state dirs (claude/codex write sessions,
 #     caches and refreshed OAuth tokens here — see README tradeoffs)
 ReadWritePaths=/home/dev/services/lateshift/users/%i
+# Shared subscription rate-limit snapshots (see T3CODE_RATE_LIMIT_SNAPSHOT_DIR
+# above). Writes here are small JSON files describing the provider account, not
+# user data; every instance sees the same facts.
+#
+# The `-` prefix is deliberate: if the directory has not been created on the
+# host yet, the instance must still start. It then degrades to read-only there,
+# the snapshot write fails, and the store logs a warning and carries on — the
+# portal shows "unknown". A missing telemetry directory must never take a
+# workspace down. Create it once with:
+#   install -d -o dev -g dev -m 0755 /home/dev/services/lateshift/state/rate-limits
+ReadWritePaths=-/home/dev/services/lateshift/state/rate-limits
 ReadWritePaths=/home/dev/.claude
 ReadWritePaths=/home/dev/.claude.json
 ReadWritePaths=/home/dev/.codex

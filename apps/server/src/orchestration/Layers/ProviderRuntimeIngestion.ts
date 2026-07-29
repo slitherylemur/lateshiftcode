@@ -34,6 +34,14 @@ import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionT
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 import { TurnUsageRepository } from "../../persistence/Services/TurnUsage.ts";
 import { TurnUsageRepositoryLive } from "../../persistence/Layers/TurnUsage.ts";
+// LateShift (architecture-v2 section 4 / W3-A): the only consumer of
+// `account.rate-limits.updated`. Both adapters already normalise real
+// provider rate-limit data into that event and upstream discards it.
+import { normalizeRateLimitsEvent } from "../../lateshift/rateLimitSnapshot.ts";
+import {
+  RateLimitSnapshotStore,
+  RateLimitSnapshotStoreLive,
+} from "../../lateshift/RateLimitSnapshotStore.ts";
 import { isGitRepository } from "../../git/Utils.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
@@ -729,6 +737,7 @@ const make = Effect.gen(function* () {
   const providerService = yield* ProviderService;
   const projectionTurnRepository = yield* ProjectionTurnRepository;
   const turnUsageRepository = yield* TurnUsageRepository;
+  const rateLimitSnapshotStore = yield* RateLimitSnapshotStore;
   const serverSettingsService = yield* ServerSettingsService;
   const providerCommandId = (event: ProviderRuntimeEvent, tag: string) =>
     crypto.randomUUIDv4.pipe(
@@ -1329,6 +1338,18 @@ const make = Effect.gen(function* () {
 
   const processRuntimeEvent = (event: ProviderRuntimeEvent) =>
     Effect.gen(function* () {
+      // LateShift: rate-limit state describes the *subscription*, not the
+      // thread, so it is handled before thread resolution - a snapshot must
+      // not be lost just because its thread shell is gone. The store is a
+      // no-op unless T3CODE_RATE_LIMIT_SNAPSHOT_DIR is set, and it never
+      // fails, so this cannot affect ingestion.
+      if (event.type === "account.rate-limits.updated") {
+        yield* rateLimitSnapshotStore.record(
+          normalizeRateLimitsEvent(event.provider, event.payload, event.createdAt),
+        );
+        return;
+      }
+
       const thread = yield* resolveThreadShell(event.threadId);
       if (!thread) return;
 
@@ -1521,6 +1542,15 @@ const make = Effect.gen(function* () {
               "cached_input_tokens",
               "cachedInputTokens",
               "cacheReadInputTokens",
+            ]),
+            // LateShift: cache *writes* are billed differently from cache reads
+            // and were previously dropped on the floor - no alias list matched
+            // them, so they only survived inside usage_json.
+            cacheCreationInputTokens: readUsageInteger(usageRecord, [
+              "cache_creation_input_tokens",
+              "cacheCreationInputTokens",
+              "cache_write_input_tokens",
+              "cacheWriteInputTokens",
             ]),
             reasoningOutputTokens: readUsageInteger(usageRecord, [
               "reasoning_output_tokens",
@@ -1917,4 +1947,10 @@ const make = Effect.gen(function* () {
 export const ProviderRuntimeIngestionLive = Layer.effect(
   ProviderRuntimeIngestionService,
   make,
-).pipe(Layer.provide([ProjectionTurnRepositoryLive, TurnUsageRepositoryLive]));
+).pipe(
+  Layer.provide([
+    ProjectionTurnRepositoryLive,
+    TurnUsageRepositoryLive,
+    RateLimitSnapshotStoreLive,
+  ]),
+);
