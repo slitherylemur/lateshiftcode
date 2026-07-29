@@ -126,23 +126,24 @@ corepack pnpm build          # produces apps/server/dist/bin.mjs
 Read directly from each instance's `userdata/state.sqlite` by the portal
 (no API surface). One row per completed agent turn; append-only.
 
-| Column                    | Type    | Notes                                                        |
-| ------------------------- | ------- | ------------------------------------------------------------ |
-| `row_id`                  | INTEGER | primary key, autoincrement                                   |
-| `event_id`                | TEXT    | runtime event id; not null, UNIQUE (dedupes replayed events) |
-| `thread_id`               | TEXT    | not null                                                     |
-| `project_id`              | TEXT    | resolved from the thread projection; nullable                |
-| `turn_id`                 | TEXT    | nullable (not every provider reports it)                     |
-| `provider_name`           | TEXT    | e.g. `claude`, `codex`; nullable                             |
-| `model`                   | TEXT    | comma-joined keys of the provider `modelUsage` map; nullable |
-| `total_cost_usd`          | REAL    | nullable (claude reports it; codex does not)                 |
-| `input_tokens`            | INTEGER | nullable, best-effort parse of provider usage                |
-| `output_tokens`           | INTEGER | nullable                                                     |
-| `cached_input_tokens`     | INTEGER | nullable                                                     |
-| `reasoning_output_tokens` | INTEGER | nullable                                                     |
-| `duration_ms`             | INTEGER | nullable                                                     |
-| `usage_json`              | TEXT    | raw `{usage, modelUsage}` JSON from the provider; nullable   |
-| `completed_at`            | TEXT    | ISO timestamp, not null; indexed                             |
+| Column                        | Type    | Notes                                                        |
+| ----------------------------- | ------- | ------------------------------------------------------------ |
+| `row_id`                      | INTEGER | primary key, autoincrement                                   |
+| `event_id`                    | TEXT    | runtime event id; not null, UNIQUE (dedupes replayed events) |
+| `thread_id`                   | TEXT    | not null                                                     |
+| `project_id`                  | TEXT    | resolved from the thread projection; nullable                |
+| `turn_id`                     | TEXT    | nullable (not every provider reports it)                     |
+| `provider_name`               | TEXT    | e.g. `claude`, `codex`; nullable                             |
+| `model`                       | TEXT    | comma-joined keys of the provider `modelUsage` map; nullable |
+| `total_cost_usd`              | REAL    | nullable (claude reports it; codex does not)                 |
+| `input_tokens`                | INTEGER | nullable, best-effort parse of provider usage                |
+| `output_tokens`               | INTEGER | nullable                                                     |
+| `cached_input_tokens`         | INTEGER | nullable; cache _reads_                                      |
+| `cache_creation_input_tokens` | INTEGER | nullable; cache _writes_ (LateShift migration 036)           |
+| `reasoning_output_tokens`     | INTEGER | nullable                                                     |
+| `duration_ms`                 | INTEGER | nullable                                                     |
+| `usage_json`                  | TEXT    | raw `{usage, modelUsage}` JSON from the provider; nullable   |
+| `completed_at`                | TEXT    | ISO timestamp, not null; indexed                             |
 
 Indexes: `idx_turn_usage_event_id` (UNIQUE), `idx_turn_usage_completed_at`,
 `idx_turn_usage_thread_id`, `idx_turn_usage_project_id`. Inserts are
@@ -150,6 +151,56 @@ Indexes: `idx_turn_usage_event_id` (UNIQUE), `idx_turn_usage_completed_at`,
 never double-count. Ledger writes are fail-open: an insert failure is
 logged and never breaks turn ingestion, so gaps are possible if the DB is
 unhealthy.
+
+Codex turns: upstream's `turn.completed` for Codex carries no usage at all, so
+every Codex row would be all NULLs. The fork folds Codex's
+`thread/tokenUsage/updated` notification into the completing turn
+(`apps/server/src/lateshift/codexTurnUsage.ts`) so the token columns populate.
+`total_cost_usd` stays NULL for Codex: Codex reports no dollar figure and we do
+not invent one.
+
+## Provider rate limits: `state/rate-limits/`
+
+Two different things, deliberately never blended:
+
+- **Pool remaining** — provider truth. What Anthropic/OpenAI say is left of the
+  shared subscription.
+- **Share of consumption** — our attribution, from the `turn_usage` ledger
+  above. Who used it, according to us.
+
+Pool remaining comes from the `account.rate-limits.updated` runtime event that
+both adapters already emit (Claude's Agent SDK `rate_limit_event`, Codex's
+`account/rateLimits/updated`); upstream has no consumer for it. The fork
+normalises it in `apps/server/src/lateshift/` and writes one JSON file per
+provider:
+
+    /home/dev/services/lateshift/state/rate-limits/claude.json
+    /home/dev/services/lateshift/state/rate-limits/codex.json
+
+The directory is shared by every instance and is last-writer-wins: rate limits
+describe the subscription, not the user, so every instance observes the same
+facts. Storing them per-instance would mean N copies of one fact and the portal
+guessing which is freshest. Create the directory once — the unit deliberately
+does not:
+
+    sudo install -d -o dev -g dev -m 0755 /home/dev/services/lateshift/state/rate-limits
+
+Operational notes:
+
+- Enabled only by `T3CODE_RATE_LIMIT_SNAPSHOT_DIR` in `t3code@.service`. Unset
+  (desktop, upstream dev) the store is a no-op, so this cannot affect upstream.
+- `ReadWritePaths=-...` in the unit is prefixed with `-` on purpose: a missing
+  telemetry directory must never stop a workspace from starting. It degrades to
+  a logged warning and the portal shows "unknown".
+- Writes are write-tmp-then-rename, so a reader never sees a torn file.
+- Window labels are the providers' own (`five_hour`, `seven_day`, `primary`,
+  `secondary`). Do **not** rename them in any UI: both providers' reset
+  behaviour is inconsistent with their own labels. `resetsAt` is stored raw
+  alongside a best-effort ISO rendering.
+- Nothing is ever extrapolated. A window not reported in the last hour renders
+  as "unknown", never as a stale percentage.
+- Any dollar figure in the portal is an API-equivalent estimate and is labelled
+  as such. It is never spend against a cap; the subscription is a flat fee.
 
 ## `/home/dev/shared`
 
@@ -172,15 +223,15 @@ production `t3code.service` is a separate unit and is **not** affected.
 
 ### What is blocked (verified)
 
-| Attempt                                             | Result   | Mechanism                         |
-| --------------------------------------------------- | -------- | --------------------------------- |
-| `sudo` / any setuid escalation                      | blocked  | `NoNewPrivileges=yes`             |
-| write to `/etc`                                     | EROFS    | `ProtectSystem=strict`            |
-| write to `/home/dev/projects`, other users' data    | EROFS    | `ProtectSystem=strict` + `ProtectHome=read-only` |
-| write to `/home/dev/services/t3code-production`     | EROFS    | `ProtectSystem=strict`            |
-| read host `dev` GitHub token / gitconfig             | EACCES   | `InaccessiblePaths=/home/dev/.config/gh`, `InaccessiblePaths=/home/dev/.gitconfig` |
-| mount / new user namespace / kernel module load     | EPERM    | `RestrictNamespaces`, `SystemCallFilter=@system-service`, `ProtectKernelModules` |
-| clock / hostname / cgroup / kernel-tunable writes   | blocked  | `ProtectClock`, `ProtectHostname`, `ProtectControlGroups`, `ProtectKernelTunables` |
+| Attempt                                           | Result  | Mechanism                                                                          |
+| ------------------------------------------------- | ------- | ---------------------------------------------------------------------------------- |
+| `sudo` / any setuid escalation                    | blocked | `NoNewPrivileges=yes`                                                              |
+| write to `/etc`                                   | EROFS   | `ProtectSystem=strict`                                                             |
+| write to `/home/dev/projects`, other users' data  | EROFS   | `ProtectSystem=strict` + `ProtectHome=read-only`                                   |
+| write to `/home/dev/services/t3code-production`   | EROFS   | `ProtectSystem=strict`                                                             |
+| read host `dev` GitHub token / gitconfig          | EACCES  | `InaccessiblePaths=/home/dev/.config/gh`, `InaccessiblePaths=/home/dev/.gitconfig` |
+| mount / new user namespace / kernel module load   | EPERM   | `RestrictNamespaces`, `SystemCallFilter=@system-service`, `ProtectKernelModules`   |
+| clock / hostname / cgroup / kernel-tunable writes | blocked | `ProtectClock`, `ProtectHostname`, `ProtectControlGroups`, `ProtectKernelTunables` |
 
 ### What is allowed (writable carve-outs)
 
@@ -198,7 +249,7 @@ needs W^X memory, so `MemoryDenyWriteExecute` is deliberately **not** set.
 ### Credential exposure — tradeoffs
 
 All instances currently share **one** `dev`-level identity for each external
-service; the sandbox protects the *box*, not these shared secrets from an agent
+service; the sandbox protects the _box_, not these shared secrets from an agent
 that is already using them:
 
 - **Claude / Codex auth** (`~/.claude`, `~/.codex`) is exposed **read-write**,
