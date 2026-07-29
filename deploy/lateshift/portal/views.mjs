@@ -602,7 +602,19 @@ export function renderDashboard(props) {
     isAdmin,
     budgetPaused,
     monthCostUsd,
+    github,
   } = props;
+
+  const githubCard = `<div class="card">
+    <h2>GitHub</h2>
+    ${
+      github && github.connected
+        ? `<p style="margin:0">Connected as <strong>@${esc(github.login || "")}</strong>. Your workspace can push and pull private repositories.</p>`
+        : `<p style="margin:0 0 12px">Not connected — your workspace can't push to GitHub yet.
+             <a href="/auth/github/login">Sign out and sign in again</a> to grant repository access.</p>
+           <p style="margin:0"><a class="btn btn-sm" href="/auth/github/login">Connect GitHub</a></p>`
+    }
+  </div>`;
 
   const navHtml = nav({
     identity,
@@ -702,6 +714,8 @@ export function renderDashboard(props) {
       <h2>Workspace</h2>
       ${openForms}
     </div>
+
+    ${githubCard}
 
     ${sharedProjectsHtml}
 
@@ -968,6 +982,16 @@ function pairAndDangerCard(u, csrf) {
   </div>`;
 }
 
+// Admin user-detail: workspace GitHub-connection status.
+function githubStatusLine(github) {
+  if (github && github.connected) {
+    return `<p class="muted" style="margin:0 0 20px">GitHub: <strong>connected as @${esc(github.login || "")}</strong>.</p>`;
+  }
+  return `<p class="muted" style="margin:0 0 20px">GitHub: <strong>not connected</strong>${
+    github && github.login ? ` (login @${esc(github.login)})` : ""
+  } — the user must sign out and sign in again to grant repository access.</p>`;
+}
+
 function renderDetail(props) {
   const { users, self, selectedKey, sharedDirs, csrf } = props;
 
@@ -999,6 +1023,7 @@ function renderDetail(props) {
       <h2>${esc(u.name)}</h2>${adminBadge}${selfBadge}${statusHtml}
     </div>
     <p class="muted" style="margin:0 0 20px">${u.tsLogin ? `Tailnet: ${esc(u.tsLogin)}` : "No tailnet login mapped."}</p>
+    ${githubStatusLine(u.github)}
     ${selfWorkspace}
     ${userSettingsCard(u, csrf)}
     ${pairAndDangerCard(u, csrf)}

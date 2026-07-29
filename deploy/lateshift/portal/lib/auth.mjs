@@ -13,9 +13,13 @@
 //     t3user CLI). Writes here are atomic (temp file + rename).
 
 import crypto from "node:crypto";
-import { readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, chmodSync } from "node:fs";
 
 export const PENDING_PATH = "/home/dev/services/lateshift/pending.json";
+// Access tokens captured at sign-in for users still awaiting approval, kept
+// separate from pending.json (which is admin-facing) so the secret lives in a
+// 600 dev-owned file and can be installed into the workspace right after add.
+export const PENDING_TOKENS_PATH = "/home/dev/services/lateshift/pending-tokens.json";
 
 export const SESSION_COOKIE = "lsc_session";
 export const STATE_COOKIE = "lsc_oauth_state";
@@ -151,7 +155,9 @@ export function githubAuthorizeUrl(config, state) {
   const q = new URLSearchParams({
     client_id: config.githubClientId,
     redirect_uri: redirectUri,
-    scope: "read:user",
+    // `repo` grants git push/pull over HTTPS; `workflow` is required so pushes
+    // that touch .github/workflows/** aren't rejected by GitHub.
+    scope: "read:user repo workflow",
     state,
     allow_signup: "false",
   });
@@ -191,8 +197,12 @@ export async function githubExchange(config, code) {
   }
   return {
     login: u.login,
+    id: Number.isFinite(u.id) ? u.id : null,
     name: typeof u.name === "string" ? u.name : null,
     avatar_url: typeof u.avatar_url === "string" ? u.avatar_url : null,
+    // Access token for provisioning the per-workspace gh credential store.
+    // NEVER log this value; callers install it into hosts.yml then discard it.
+    token: accessToken,
   };
 }
 
@@ -259,6 +269,166 @@ export function denyPending(login) {
     store.denied.push({ login: String(login), name: entry?.name ?? null, deniedAt: new Date().toISOString() });
   }
   writePending(store);
+  return true;
+}
+
+// ------------------------------------------------ workspace GitHub identity
+
+/**
+ * Resolve the per-workspace identity store paths from a registry baseDir
+ * (e.g. /home/dev/services/lateshift/users/<name>). Mirrors the layout set up
+ * by bin/run-instance.sh: <base>/identity/{gh/hosts.yml, gitconfig}.
+ */
+export function identityPaths(baseDir) {
+  const dir = `${String(baseDir)}/identity`;
+  const ghDir = `${dir}/gh`;
+  return { dir, ghDir, hostsPath: `${ghDir}/hosts.yml`, gitconfigPath: `${dir}/gitconfig` };
+}
+
+/**
+ * Inspect a workspace's gh store. Returns { authenticated, login }.
+ * "authenticated" means hosts.yml exists AND carries a non-empty oauth_token
+ * (a bare/placeholder store with an empty token counts as NOT authenticated).
+ * Never returns or logs the token value.
+ */
+export function githubIdentityStatus(baseDir) {
+  try {
+    const { hostsPath } = identityPaths(baseDir);
+    if (!existsSync(hostsPath)) return { authenticated: false, login: null };
+    const raw = readFileSync(hostsPath, "utf8");
+    // Top-level `oauth_token:` under github.com (indented, not under users:).
+    const tok = raw.match(/^ {4}oauth_token:[ \t]*(\S.*)$/m);
+    const authenticated = Boolean(tok && tok[1] && tok[1].trim().length > 0);
+    const userM = raw.match(/^ {4}user:[ \t]*(\S+)\s*$/m);
+    return { authenticated, login: userM ? userM[1] : null };
+  } catch {
+    return { authenticated: false, login: null };
+  }
+}
+
+// Escape a value for safe inclusion as a YAML scalar (we only ever write
+// GitHub logins/tokens which are alphanumerics+`_-`, but stay defensive).
+function yamlScalar(v) {
+  const s = String(v);
+  return /^[A-Za-z0-9._-]+$/.test(s) ? s : JSON.stringify(s);
+}
+
+/**
+ * Write the GitHub OAuth token into a workspace's gh credential store in gh's
+ * expected hosts.yml shape, and stamp the workspace gitconfig author identity.
+ * Overwrites unconditionally — callers guard with githubIdentityStatus() so an
+ * already-connected store is never clobbered. dir 700 / file 600, dev-owned
+ * (the portal runs as dev). NEVER logs the token.
+ */
+export function installGithubIdentity(baseDir, { login, id, token }) {
+  if (!login || !GH_LOGIN_RE.test(login)) throw new Error("invalid github login for identity install");
+  if (!token || typeof token !== "string") throw new Error("missing token for identity install");
+  const { dir, ghDir, hostsPath, gitconfigPath } = identityPaths(baseDir);
+  mkdirSync(ghDir, { recursive: true });
+  chmodSync(dir, 0o700);
+  chmodSync(ghDir, 0o700);
+
+  const l = yamlScalar(login);
+  const t = yamlScalar(token);
+  const hosts =
+    `github.com:\n` +
+    `    user: ${l}\n` +
+    `    oauth_token: ${t}\n` +
+    `    git_protocol: https\n` +
+    `    users:\n` +
+    `        ${l}:\n` +
+    `            oauth_token: ${t}\n`;
+  const tmpHosts = `${hostsPath}.tmp.${process.pid}.${Date.now()}`;
+  writeFileSync(tmpHosts, hosts, { mode: 0o600 });
+  renameSync(tmpHosts, hostsPath);
+  chmodSync(hostsPath, 0o600);
+
+  // Stamp author identity: user.name = gh login, user.email = noreply alias.
+  const email = id != null ? `${id}+${login}@users.noreply.github.com` : `${login}@users.noreply.github.com`;
+  stampGitconfigIdentity(gitconfigPath, login, email);
+  return { ok: true };
+}
+
+/**
+ * Update user.name/user.email in an existing gitconfig's [user] section,
+ * preserving the credential-helper blocks. Creates a minimal file if absent.
+ */
+function stampGitconfigIdentity(gitconfigPath, name, email) {
+  let cfg;
+  try {
+    cfg = existsSync(gitconfigPath) ? readFileSync(gitconfigPath, "utf8") : null;
+  } catch {
+    cfg = null;
+  }
+  if (cfg && /\[user\]/.test(cfg)) {
+    // Replace name/email lines that live inside the [user] section only.
+    cfg = cfg.replace(/(\[user\][^[]*?\n\s*name\s*=)[^\n]*/, `$1 ${name}`);
+    cfg = cfg.replace(/(\[user\][^[]*?\n\s*email\s*=)[^\n]*/, `$1 ${email}`);
+  } else {
+    cfg =
+      `[user]\n\tname = ${name}\n\temail = ${email}\n` +
+      `[credential "https://github.com"]\n\thelper =\n\thelper = !/usr/bin/gh auth git-credential\n` +
+      `[credential "https://gist.github.com"]\n\thelper =\n\thelper = !/usr/bin/gh auth git-credential\n`;
+  }
+  const tmp = `${gitconfigPath}.tmp.${process.pid}.${Date.now()}`;
+  writeFileSync(tmp, cfg, { mode: 0o600 });
+  renameSync(tmp, gitconfigPath);
+  chmodSync(gitconfigPath, 0o600);
+}
+
+// -------------------------------------------- pending access-token store
+
+/** Read the pending-tokens map ({ [loginLower]: {login,id,token,at} }). */
+export function readPendingTokens() {
+  try {
+    if (!existsSync(PENDING_TOKENS_PATH)) return {};
+    const raw = JSON.parse(readFileSync(PENDING_TOKENS_PATH, "utf8"));
+    return raw && typeof raw === "object" ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+function writePendingTokens(map) {
+  const tmp = `${PENDING_TOKENS_PATH}.tmp.${process.pid}.${Date.now()}`;
+  writeFileSync(tmp, JSON.stringify(map, null, 2) + "\n", { mode: 0o600 });
+  renameSync(tmp, PENDING_TOKENS_PATH);
+  try {
+    chmodSync(PENDING_TOKENS_PATH, 0o600);
+  } catch {
+    /* best effort */
+  }
+}
+
+/** Store (or refresh) the captured token for a pending login. Never logs it. */
+export function setPendingToken(login, { id, token }) {
+  if (!login || !GH_LOGIN_RE.test(login) || !token) return false;
+  const map = readPendingTokens();
+  map[String(login).toLowerCase()] = {
+    login: String(login),
+    id: id != null ? Number(id) : null,
+    token: String(token),
+    at: new Date().toISOString(),
+  };
+  writePendingTokens(map);
+  return true;
+}
+
+/** Fetch a captured token for a login (or null). */
+export function getPendingToken(login) {
+  if (!login) return null;
+  const map = readPendingTokens();
+  return map[String(login).toLowerCase()] ?? null;
+}
+
+/** Delete a captured token (on approve or deny). Returns true if removed. */
+export function removePendingToken(login) {
+  if (!login) return false;
+  const map = readPendingTokens();
+  const key = String(login).toLowerCase();
+  if (!(key in map)) return false;
+  delete map[key];
+  writePendingTokens(map);
   return true;
 }
 
