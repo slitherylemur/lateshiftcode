@@ -109,10 +109,7 @@ const EnvServerConfig = Config.all({
     Config.map(Option.getOrUndefined),
   ),
   port: Config.port("T3CODE_PORT").pipe(Config.option, Config.map(Option.getOrUndefined)),
-  socketPath: Config.string("T3CODE_SOCKET").pipe(
-    Config.option,
-    Config.map(Option.getOrUndefined),
-  ),
+  socketPath: Config.string("T3CODE_SOCKET").pipe(Config.option, Config.map(Option.getOrUndefined)),
   host: Config.string("T3CODE_HOST").pipe(Config.option, Config.map(Option.getOrUndefined)),
   t3Home: Config.string("T3CODE_HOME").pipe(Config.option, Config.map(Option.getOrUndefined)),
   devUrl: Config.url("VITE_DEV_SERVER_URL").pipe(Config.option, Config.map(Option.getOrUndefined)),
@@ -145,7 +142,10 @@ const EnvServerConfig = Config.all({
 export interface CliServerFlags {
   readonly mode: Option.Option<ServerConfig.RuntimeMode>;
   readonly port: Option.Option<number>;
-  readonly socketPath: Option.Option<string>;
+  // Optional for the same reason as ServerConfig.socketPath: callers that
+  // predate the LateShift socket flag must keep compiling. `resolveServerConfig`
+  // already normalises an absent value with `flags.socketPath ?? Option.none()`.
+  readonly socketPath?: Option.Option<string>;
   readonly host: Option.Option<string>;
   readonly baseDir: Option.Option<string>;
   readonly cwd: Option.Option<string>;

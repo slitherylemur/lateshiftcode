@@ -70,8 +70,16 @@ export class ServerConfig extends Context.Service<
     /**
      * LateShift Cloud: when set, the HTTP server binds this UNIX domain socket
      * instead of a TCP port. `port`/`host` are then ignored by the bind site.
+     *
+     * OPTIONAL, not merely `| undefined`. Every consumer already branches on
+     * `!== undefined` (server.ts, EnvironmentAuthPolicy, SessionStore,
+     * auth/utils), and making it required forces every upstream test fixture
+     * that builds a ServerConfig by hand to name a LateShift-only field. That
+     * is exactly the kind of hot-file divergence the fork is supposed to avoid
+     * (architecture-v2 principle 5), and it is what broke the typecheck when
+     * W5 landed.
      */
-    readonly socketPath: string | undefined;
+    readonly socketPath?: string | undefined;
     readonly host: string | undefined;
     readonly cwd: string;
     readonly baseDir: string;

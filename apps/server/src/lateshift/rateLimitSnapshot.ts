@@ -1,3 +1,8 @@
+// @effect-diagnostics globalDate:off - resetsAtToIso converts a provider-
+// supplied epoch number to ISO-8601. It is a pure, total function over a
+// number with no notion of "now", so DateTime buys nothing here; the raw
+// value is stored alongside the rendering precisely because we do not trust
+// the providers' own reset semantics (architecture-v2 section 4).
 /**
  * LateShift: normalization of the `account.rate-limits.updated` runtime event.
  *

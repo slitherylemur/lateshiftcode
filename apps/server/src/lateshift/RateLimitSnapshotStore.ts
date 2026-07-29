@@ -1,3 +1,10 @@
+// @effect-diagnostics nodeBuiltinImport:off preferSchemaOverJson:off - This
+// store deliberately writes a plain JSON file with node:fs/promises rather
+// than through FileSystem/Schema. It is read by the PORTAL, an ordinary Node
+// process outside any Effect runtime, so the on-disk shape must stay a hand-
+// readable JSON document with no Effect encoding; and the write must survive
+// a read-only mount (missing telemetry must never take a workspace down),
+// which is handled by the local try/catch here.
 /**
  * LateShift: durable store for the latest provider rate-limit window snapshot.
  *
@@ -77,7 +84,7 @@ export interface RateLimitSnapshotStoreShape {
 export class RateLimitSnapshotStore extends Context.Service<
   RateLimitSnapshotStore,
   RateLimitSnapshotStoreShape
->()("lateshift/RateLimitSnapshotStore") {}
+>()("t3/lateshift/RateLimitSnapshotStore") {}
 
 /** File name for a provider. Constrained to the closed provider union. */
 export function snapshotFileName(provider: RateLimitProvider): string {

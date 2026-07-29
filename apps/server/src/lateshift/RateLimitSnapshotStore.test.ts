@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off - The test asserts the exact
+// bytes this store leaves on disk (the portal parses them), so it reads them
+// back with node:fs directly rather than through FileSystem.
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as NodeFS from "node:fs";

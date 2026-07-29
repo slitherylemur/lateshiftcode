@@ -1,3 +1,6 @@
+// @effect-diagnostics globalDate:off - Fixed epoch literals converted with
+// new Date() are the expected values these tests compare against; there is
+// no clock involved.
 import { describe, expect, it } from "vite-plus/test";
 
 import {
