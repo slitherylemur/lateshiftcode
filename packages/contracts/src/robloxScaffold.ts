@@ -5,31 +5,21 @@ import { RobloxProjectFile } from "./robloxProjectFile.ts";
 
 const PROJECT_NAME_MAX_LENGTH = 64;
 const LINK_MAX_LENGTH = 2048;
-const API_KEY_MAX_LENGTH = 8192;
-
-/**
- * A Roblox Open Cloud API key. Modelled as a plain trimmed string on the wire
- * (so it survives WebSocket JSON transport); the server wraps it in a
- * `Redacted` value the instant it is received so it is never logged, echoed
- * into progress output, or written anywhere except by `wire-roblox.sh` into
- * GitHub secrets.
- */
-export const RobloxApiKey = TrimmedNonEmptyString.check(Schema.isMaxLength(API_KEY_MAX_LENGTH));
-export type RobloxApiKey = typeof RobloxApiKey.Type;
 
 /**
  * Input for creating a new Roblox TypeScript project from the add-project
- * palette. The two links describe the dev/workplace experience (whose start
- * place doubles as the Test place) and the live production experience. The
- * test key wires the automatic deploy-test pipeline; the optional prod key
- * wires the manual Promote-to-production workflow.
+ * palette. The two inputs are the Workplace and Production **place IDs** (bare
+ * numeric ids; pasted create.roblox.com / roblox.com/games links are also
+ * tolerated by the resolver). The workplace place holds the Studio-built world
+ * and doubles as the joinable Test place; the production place is the live
+ * game. No API keys are collected: the privileged repo creation and Open Cloud
+ * secret wiring are performed entirely by the loopback portal broker using the
+ * group master key, so keys never travel over this RPC.
  */
 export const ProjectCreateRobloxInput = Schema.Struct({
   name: TrimmedNonEmptyString.check(Schema.isMaxLength(PROJECT_NAME_MAX_LENGTH)),
   workplaceLink: TrimmedNonEmptyString.check(Schema.isMaxLength(LINK_MAX_LENGTH)),
   productionLink: TrimmedNonEmptyString.check(Schema.isMaxLength(LINK_MAX_LENGTH)),
-  testApiKey: RobloxApiKey,
-  prodApiKey: Schema.optional(RobloxApiKey),
   shareWithStaff: Schema.Boolean,
 });
 export type ProjectCreateRobloxInput = typeof ProjectCreateRobloxInput.Type;

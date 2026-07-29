@@ -516,7 +516,8 @@ const buildAppUnderTest = (options?: {
         Layer.provide(FetchHttpClient.layer),
       ),
       RobloxProjectScaffolder.layer.pipe(
-        Layer.provide(RobloxProjectInputResolver.layer.pipe(Layer.provide(FetchHttpClient.layer))),
+        Layer.provide(RobloxProjectInputResolver.layer),
+        Layer.provide(FetchHttpClient.layer),
       ),
     );
     const gitWorkflowLayer = GitWorkflowService.layer.pipe(
@@ -708,31 +709,31 @@ const buildAppUnderTest = (options?: {
             listCompletedSince: () => Effect.succeed([]),
           }),
           Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
-          getCommandReadModel: () => Effect.succeed(makeDefaultOrchestrationReadModel()),
-          getSnapshot: () => Effect.succeed(makeDefaultOrchestrationReadModel()),
-          getShellSnapshot: () =>
-            Effect.succeed({
-              snapshotSequence: 0,
-              projects: [],
-              threads: [],
-              updatedAt: "1970-01-01T00:00:00.000Z",
-            }),
-          getArchivedShellSnapshot: () =>
-            Effect.succeed({
-              snapshotSequence: 0,
-              projects: [],
-              threads: [],
-              updatedAt: "1970-01-01T00:00:00.000Z",
-            }),
-          getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 0 }),
-          getProjectShellById: () => Effect.succeed(Option.none()),
-          getThreadShellById: () => Effect.succeed(Option.none()),
-          getThreadDetailById: () => Effect.succeed(Option.none()),
-          getThreadDetailSnapshot: () => Effect.succeed(Option.none()),
-          getCounts: () => Effect.succeed({ projectCount: 0, threadCount: 0 }),
-          getActiveProjectByWorkspaceRoot: () => Effect.succeed(Option.none()),
-          getFirstActiveThreadIdByProjectId: () => Effect.succeed(Option.none()),
-          getThreadCheckpointContext: () => Effect.succeed(Option.none()),
+            getCommandReadModel: () => Effect.succeed(makeDefaultOrchestrationReadModel()),
+            getSnapshot: () => Effect.succeed(makeDefaultOrchestrationReadModel()),
+            getShellSnapshot: () =>
+              Effect.succeed({
+                snapshotSequence: 0,
+                projects: [],
+                threads: [],
+                updatedAt: "1970-01-01T00:00:00.000Z",
+              }),
+            getArchivedShellSnapshot: () =>
+              Effect.succeed({
+                snapshotSequence: 0,
+                projects: [],
+                threads: [],
+                updatedAt: "1970-01-01T00:00:00.000Z",
+              }),
+            getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 0 }),
+            getProjectShellById: () => Effect.succeed(Option.none()),
+            getThreadShellById: () => Effect.succeed(Option.none()),
+            getThreadDetailById: () => Effect.succeed(Option.none()),
+            getThreadDetailSnapshot: () => Effect.succeed(Option.none()),
+            getCounts: () => Effect.succeed({ projectCount: 0, threadCount: 0 }),
+            getActiveProjectByWorkspaceRoot: () => Effect.succeed(Option.none()),
+            getFirstActiveThreadIdByProjectId: () => Effect.succeed(Option.none()),
+            getThreadCheckpointContext: () => Effect.succeed(Option.none()),
             ...options?.layers?.projectionSnapshotQuery,
           }),
         ),

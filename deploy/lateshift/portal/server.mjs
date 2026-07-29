@@ -121,6 +121,11 @@ function redirect(res, location, extraHeaders = {}) {
   res.end();
 }
 
+function json(res, status, payload) {
+  res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
+  res.end(JSON.stringify(payload));
+}
+
 function csrfOk(cookies, form) {
   const a = cookies[CSRF_COOKIE];
   const b = form.csrf;
@@ -176,7 +181,8 @@ function buildContext(req) {
   const identity = tsIdentity.login
     ? tsIdentity
     : { login: session?.gh ?? null, name: null, profilePic: null };
-  const fwdHost = typeof req.headers["x-forwarded-host"] === "string" ? req.headers["x-forwarded-host"] : "";
+  const fwdHost =
+    typeof req.headers["x-forwarded-host"] === "string" ? req.headers["x-forwarded-host"] : "";
   const isPublic = fwdHost === "lateshiftcloud.com" || fwdHost.endsWith(".lateshiftcloud.com");
   return { config, users, identity, principal, session, isPublic };
 }
@@ -347,7 +353,8 @@ async function handleAuthz(req, res) {
   const principal = resolveIdentity({ ghLogin: session.gh }, { users, config });
 
   if (label === "prod") {
-    if (principal.isAdmin) return done(200, { "x-lsc-user": principal.user?.name || principal.login });
+    if (principal.isAdmin)
+      return done(200, { "x-lsc-user": principal.user?.name || principal.login });
     return done(403);
   }
   const target = users[label];
@@ -363,13 +370,17 @@ async function handleAuthz(req, res) {
 async function handleGithubLogin(req, res) {
   const config = loadConfig();
   if (!config.githubClientId || !config.sessionSecret || !config.publicBaseUrl) {
-    html(res, 503, views.renderMessage({
-      title: "Unavailable",
-      heading: "GitHub sign-in not configured",
-      bodyHtml: "<p>OAuth is not configured on this server.</p>",
-      backHref: "/",
-      error: true,
-    }));
+    html(
+      res,
+      503,
+      views.renderMessage({
+        title: "Unavailable",
+        heading: "GitHub sign-in not configured",
+        bodyHtml: "<p>OAuth is not configured on this server.</p>",
+        backHref: "/",
+        error: true,
+      }),
+    );
     return;
   }
   const { state, cookie } = auth.makeOAuthState(config.sessionSecret);
@@ -382,13 +393,18 @@ async function handleGithubCallback(req, res, url) {
   const users = loadRegistry();
   const cookies = parseCookies(req);
   const fail = (heading, detail) =>
-    html(res, 400, views.renderMessage({
-      title: "Sign-in failed",
-      heading,
-      bodyHtml: `<p>${views.esc(detail)}</p>`,
-      backHref: "/",
-      error: true,
-    }), { "set-cookie": auth.clearStateCookie() });
+    html(
+      res,
+      400,
+      views.renderMessage({
+        title: "Sign-in failed",
+        heading,
+        bodyHtml: `<p>${views.esc(detail)}</p>`,
+        backHref: "/",
+        error: true,
+      }),
+      { "set-cookie": auth.clearStateCookie() },
+    );
 
   if (!config.githubClientId || !config.sessionSecret) {
     return fail("Not configured", "GitHub sign-in is not configured.");
@@ -408,7 +424,10 @@ async function handleGithubCallback(req, res, url) {
   }
 
   const principal = resolveIdentity({ ghLogin: profile.login }, { users, config });
-  const sessionValue = auth.signSession(auth.makeSessionPayload(profile.login), config.sessionSecret);
+  const sessionValue = auth.signSession(
+    auth.makeSessionPayload(profile.login),
+    config.sessionSecret,
+  );
   const setCookie = [
     auth.clearStateCookie(),
     auth.sessionCookie(sessionValue, req, config, { maxAgeS: 7 * 24 * 3600 }),
@@ -426,14 +445,23 @@ async function handleGithubCallback(req, res, url) {
   }
   // Unknown login → record a pending request (deduped, denied list honoured)
   // and optionally notify by email; then render an awaiting-approval page.
-  const result = auth.addPending({ login: profile.login, name: profile.name, avatar: profile.avatar_url });
-  if (result.added) auth.notifySignup(config, { login: profile.login, name: profile.name });
-  html(res, 200, views.renderAwaitingApproval({
+  const result = auth.addPending({
     login: profile.login,
     name: profile.name,
     avatar: profile.avatar_url,
-    denied: result.reason === "denied",
-  }), { "set-cookie": setCookie });
+  });
+  if (result.added) auth.notifySignup(config, { login: profile.login, name: profile.name });
+  html(
+    res,
+    200,
+    views.renderAwaitingApproval({
+      login: profile.login,
+      name: profile.name,
+      avatar: profile.avatar_url,
+      denied: result.reason === "denied",
+    }),
+    { "set-cookie": setCookie },
+  );
 }
 
 async function handleGet(req, res, url) {
@@ -475,10 +503,14 @@ async function handleGet(req, res, url) {
 
   if (url.pathname === "/") {
     if (!ctx.principal.user && !ctx.principal.isAdmin) {
-      html(res, 200, views.renderHero({
-        identityLogin: ctx.principal.login,
-        githubEnabled: Boolean(ctx.config.githubClientId && ctx.config.publicBaseUrl),
-      }));
+      html(
+        res,
+        200,
+        views.renderHero({
+          identityLogin: ctx.principal.login,
+          githubEnabled: Boolean(ctx.config.githubClientId && ctx.config.publicBaseUrl),
+        }),
+      );
       return;
     }
     if (!ctx.principal.user && ctx.principal.isAdmin) {
@@ -514,7 +546,55 @@ async function handleGet(req, res, url) {
   );
 }
 
+// POST /internal/roblox-create — loopback-only machine broker that performs the
+// entire privileged, keyless Roblox project creation on behalf of a sandboxed
+// instance. It is intentionally CSRF-EXEMPT: it is not a browser form endpoint
+// (no cookies, no ambient authority) but a JSON RPC the local t3code server
+// calls over 127.0.0.1; a CSRF token would be meaningless machine-to-machine.
+// Defense instead comes from (a) the portal binding only 127.0.0.1 and (b) the
+// explicit rejection below of anything bearing X-Forwarded-Host, so no request
+// proxied in via the public Tailscale/gateway path can ever reach it.
+async function handleRobloxCreate(req, res) {
+  if (req.headers["x-forwarded-host"] !== undefined) {
+    json(res, 403, { ok: false, stage: "validate", detail: "forwarded requests are not accepted" });
+    return;
+  }
+  let body;
+  try {
+    body = JSON.parse(await readBody(req, 32 * 1024));
+  } catch {
+    json(res, 400, { ok: false, stage: "validate", detail: "invalid JSON body" });
+    return;
+  }
+  if (!body || typeof body !== "object") {
+    json(res, 400, { ok: false, stage: "validate", detail: "body must be a JSON object" });
+    return;
+  }
+  let result;
+  try {
+    result = await actions.createRobloxProject({
+      name: body.name,
+      robloxJson: body.robloxJson,
+      targetDir: body.targetDir,
+      shareWithStaff: body.shareWithStaff === true,
+    });
+  } catch (err) {
+    json(res, 500, { ok: false, stage: "wire", detail: String(err?.message ?? err) });
+    return;
+  }
+  // Clean HTTP status for validation failures; 200 for everything else so the
+  // caller reads the typed stage/detail out of the body uniformly.
+  const status = result.ok === false && result.stage === "validate" ? 400 : 200;
+  json(res, status, result);
+}
+
 async function handlePost(req, res, url) {
+  // Machine broker endpoint — handled before any CSRF/form logic (see
+  // handleRobloxCreate for the CSRF-exemption and X-Forwarded-Host rejection).
+  if (url.pathname === "/internal/roblox-create") {
+    return handleRobloxCreate(req, res);
+  }
+
   const cookies = parseCookies(req);
   const ctx = buildContext(req);
   const form = parseForm(await readBody(req));
@@ -830,7 +910,8 @@ async function handlePost(req, res, url) {
 
       case "/admin/approve": {
         const login = typeof form.login === "string" ? form.login.trim() : "";
-        if (!auth.GH_LOGIN_RE.test(login)) return errPage("Invalid GitHub login", login || "(empty)");
+        if (!auth.GH_LOGIN_RE.test(login))
+          return errPage("Invalid GitHub login", login || "(empty)");
         if (!validName) return errPage("Invalid user name", "Names must match [a-z0-9-]{2,20}.");
         const limit = actions.assertLimit(form.projectLimit ?? 3);
         const r = await actions.addUser({ name, projectLimit: limit });
@@ -848,7 +929,8 @@ async function handlePost(req, res, url) {
 
       case "/admin/deny": {
         const login = typeof form.login === "string" ? form.login.trim() : "";
-        if (!auth.GH_LOGIN_RE.test(login)) return errPage("Invalid GitHub login", login || "(empty)");
+        if (!auth.GH_LOGIN_RE.test(login))
+          return errPage("Invalid GitHub login", login || "(empty)");
         auth.denyPending(login);
         return flashTo(`Denied access request from ${login}.`);
       }

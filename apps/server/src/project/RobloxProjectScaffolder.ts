@@ -1,16 +1,22 @@
 /**
  * RobloxProjectScaffolder - creates a new Roblox TypeScript project from the
- * add-project palette by resolving the pasted experience links, running the
- * cloud-project-maker `new-project.sh` script, and then wiring the resolved
- * ids + Open Cloud API keys into the fresh repo with `wire-roblox.sh` (which
- * creates the GitHub environments/secrets and pushes, triggering the first
- * deploy).
+ * add-project palette.
  *
- * The Open Cloud API keys are treated as sensitive: they are wrapped in a
- * `Redacted` value the instant they arrive, passed to `wire-roblox.sh` through
- * the child process environment (never argv, so they stay out of `ps` output),
- * never logged, and scrubbed from any script output that is surfaced in errors.
- * Only `wire-roblox.sh` ever persists them - into GitHub secrets.
+ * KEYLESS FLOW: this service no longer holds or forwards any Open Cloud API
+ * keys, and no longer runs the cloud-project-maker scripts itself. Instances
+ * run sandboxed and cannot read the group master key or create repos under the
+ * group owner's GitHub account. Instead the scaffolder:
+ *
+ *   1. resolves the two pasted place IDs (or links) into concrete universe +
+ *      place ids via the Roblox public APIs (unchanged), then
+ *   2. POSTs the resolved `roblox.json` values to the loopback portal broker
+ *      (`POST http://127.0.0.1:3790/internal/roblox-create`), which performs
+ *      the entire privileged creation — running new-project.sh + wire-roblox.sh
+ *      from the unsandboxed portal process with the master key — and returns
+ *      staged progress / typed stage errors.
+ *
+ * The caller (ws.ts) registers/opens the created project in the instance after
+ * this resolves, exactly as the old flow did.
  *
  * @module RobloxProjectScaffolder
  */
@@ -25,28 +31,24 @@ import {
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
-import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
-import * as Redacted from "effect/Redacted";
-import * as Stream from "effect/Stream";
-import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import * as Schema from "effect/Schema";
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
 
 import * as RobloxProjectInputResolver from "./RobloxProjectInputResolver.ts";
 
 /** Root under which "share with staff" projects are created (LateShift share). */
 const SHARED_PROJECTS_ROOT = process.env.T3_SHARED_PROJECTS_DIR ?? "/home/dev/shared";
-/** cloud-project-maker checkout holding new-project.sh / wire-roblox.sh. */
-const CLOUD_PROJECT_MAKER_DIR =
-  process.env.T3_CLOUD_PROJECT_MAKER_DIR ?? "/home/dev/projects/cloud-project-maker";
-/** new-project.sh always scaffolds under $HOME/projects. */
-const homeProjectsRoot = (): string =>
-  process.env.T3_HOME_PROJECTS_DIR ?? `${process.env.HOME ?? "/home/dev"}/projects`;
+/** Root under which each instance's own (non-shared) projects live. */
+const LATESHIFT_USERS_ROOT =
+  process.env.T3_LATESHIFT_USERS_ROOT ?? "/home/dev/services/lateshift/users";
+/** Loopback portal broker endpoint that performs the privileged creation. */
+const BROKER_URL =
+  process.env.T3_ROBLOX_BROKER_URL ?? "http://127.0.0.1:3790/internal/roblox-create";
 
 const PROJECT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
-const MAX_SCRIPT_OUTPUT_TAIL = 2000;
-/** Marker emitted by wire-roblox.sh when the empirical asset download fails. */
-const WIRE_DOWNLOAD_FAILED_MARKER = "WIRE_ASSET_DOWNLOAD_FAILED";
+const MAX_DETAIL_TAIL = 2000;
 
 /** Validate a project name; returns an error detail string or `null` if valid. */
 export function validateProjectName(name: string): string | null {
@@ -76,7 +78,7 @@ export function buildRobloxProjectFile(input: {
   };
 }
 
-/** Compact JSON for the scripts' `--roblox` / json argument (no JSON.stringify per lint). */
+/** Compact JSON for the scripts' json argument (no JSON.stringify per lint). */
 export function robloxProjectFileToScriptArg(file: RobloxProjectFile): string {
   return (
     `{"devUniverseId":${file.devUniverseId ?? 0},` +
@@ -95,32 +97,24 @@ export function buildJoinablePlaceLink(placeId: number): string | null {
 }
 
 /**
- * Parse the GitHub repository URL that new-project.sh prints (`Repo: <url>`).
- * Returns `null` when the line is absent.
+ * Response shape from the portal broker. `ok:false` carries a typed `stage`
+ * telling us which pipeline step failed so we can surface the right error.
  */
-export function parseRepositoryUrl(output: string): string | null {
-  const match = /Repo:\s*(https:\/\/\S+)/i.exec(output);
-  return match?.[1] ?? null;
-}
-
-/** Whether wire-roblox.sh reported that the empirical asset download failed. */
-export function wireReportedDownloadFailure(output: string): boolean {
-  return output.includes(WIRE_DOWNLOAD_FAILED_MARKER);
-}
-
-/**
- * Replace any secret values that appear in captured script output with
- * `<redacted>` before the output is surfaced in an error. Belt-and-suspenders:
- * the scripts do not echo the keys, but this guarantees they can never leak
- * through a diagnostic tail.
- */
-export function redactSecrets(output: string, secrets: ReadonlyArray<string>): string {
-  let scrubbed = output;
-  for (const secret of secrets) {
-    if (secret.length > 0) scrubbed = scrubbed.split(secret).join("<redacted>");
-  }
-  return scrubbed;
-}
+const BrokerResponse = Schema.Union([
+  Schema.Struct({
+    ok: Schema.Literal(true),
+    stages: Schema.optional(Schema.Array(Schema.String)),
+    repositoryUrl: Schema.optional(Schema.String),
+    output: Schema.optional(Schema.String),
+  }),
+  Schema.Struct({
+    ok: Schema.Literal(false),
+    stage: Schema.String,
+    detail: Schema.optional(Schema.String),
+    code: Schema.optional(Schema.Number),
+    repositoryUrl: Schema.optional(Schema.String),
+  }),
+]);
 
 /** Service tag for scaffolding a Roblox project from the add-project palette. */
 export class RobloxProjectScaffolder extends Context.Service<
@@ -134,38 +128,19 @@ export class RobloxProjectScaffolder extends Context.Service<
 
 export const make = Effect.gen(function* () {
   const inputResolver = yield* RobloxProjectInputResolver.RobloxProjectInputResolver;
-  const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const httpClient = yield* HttpClient.HttpClient;
 
-  const collectStream = <E>(stream: Stream.Stream<Uint8Array, E>) =>
-    Effect.gen(function* () {
-      const decoder = new TextDecoder();
-      let text = "";
-      yield* Stream.runForEach(stream, (chunk: Uint8Array) =>
-        Effect.sync(() => {
-          text += decoder.decode(chunk, { stream: true });
-          if (text.length > MAX_SCRIPT_OUTPUT_TAIL * 4) {
-            text = text.slice(-MAX_SCRIPT_OUTPUT_TAIL * 4);
-          }
-        }),
-      );
-      return text;
-    });
-
-  const runScript = (command: string, args: ReadonlyArray<string>, env: Record<string, string>) =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const child = yield* spawner.spawn(
-          ChildProcess.make(command, args, { cwd: CLOUD_PROJECT_MAKER_DIR, env }),
-        );
-        const [stdout, stderr, exitCode] = yield* Effect.all(
-          [collectStream(child.stdout), collectStream(child.stderr), child.exitCode],
-          { concurrency: "unbounded" },
-        );
-        return { code: Number(exitCode), output: `${stdout}${stderr}` };
-      }),
-    );
+  /** Directory the freshly created project should live at. */
+  const targetDirFor = (name: string, shareWithStaff: boolean): string => {
+    if (shareWithStaff) return path.join(SHARED_PROJECTS_ROOT, name);
+    const user = process.env.LSC_USER_NAME;
+    const base =
+      user !== undefined && user.length > 0
+        ? path.join(LATESHIFT_USERS_ROOT, user, "projects")
+        : path.join(process.env.HOME ?? "/home/dev", "projects");
+    return path.join(base, name);
+  };
 
   const scaffold: RobloxProjectScaffolder["Service"]["scaffold"] = Effect.fn(
     "RobloxProjectScaffolder.scaffold",
@@ -180,51 +155,8 @@ export const make = Effect.gen(function* () {
       });
     }
 
-    // Wrap the keys in Redacted immediately so they are never logged or
-    // stringified by accident; the raw values are only read when building the
-    // child process environment for wire-roblox.sh.
-    const testKey = Redacted.make(input.testApiKey);
-    const prodKey = input.prodApiKey !== undefined ? Redacted.make(input.prodApiKey) : undefined;
-    const secretValues = [
-      Redacted.value(testKey),
-      ...(prodKey !== undefined ? [Redacted.value(prodKey)] : []),
-    ];
-
-    const homeProjectPath = path.join(homeProjectsRoot(), name);
-    const finalPath = input.shareWithStaff
-      ? path.join(SHARED_PROJECTS_ROOT, name)
-      : homeProjectPath;
-
-    const failIfExists = (dir: string) =>
-      fileSystem.exists(dir).pipe(
-        Effect.mapError(
-          (cause) =>
-            new RobloxProjectScaffoldError({
-              operation: "already-exists",
-              name,
-              detail: `Failed to check whether ${dir} already exists.`,
-              cause,
-            }),
-        ),
-        Effect.flatMap((exists) =>
-          exists
-            ? Effect.fail(
-                new RobloxProjectScaffoldError({
-                  operation: "already-exists",
-                  name,
-                  detail: `A directory already exists at ${dir}.`,
-                }),
-              )
-            : Effect.void,
-        ),
-      );
-
-    yield* failIfExists(homeProjectPath);
-    if (input.shareWithStaff) {
-      yield* failIfExists(finalPath);
-    }
-
-    // Stage: resolve the pasted links into concrete universe + place ids.
+    // Stage: resolve the pasted place IDs / links into concrete universe +
+    // place ids. Bare numeric place IDs are the first-class input here.
     const [workplace, production] = yield* Effect.all(
       [
         inputResolver.resolveExperience({ link: input.workplaceLink, role: "workplace" }),
@@ -233,109 +165,81 @@ export const make = Effect.gen(function* () {
       { concurrency: 2 },
     );
     const roblox = buildRobloxProjectFile({ workplace, production });
-    const robloxArg = robloxProjectFileToScriptArg(roblox);
+    const robloxJson = robloxProjectFileToScriptArg(roblox);
+    const targetDir = targetDirFor(name, input.shareWithStaff);
     const stages: Array<RobloxScaffoldStage> = ["resolve"];
 
-    // Stage: scaffold + create the GitHub repo (new-project.sh).
-    const scaffoldRun = yield* runScript("./new-project.sh", [name, "--roblox", robloxArg], {
-      ...(process.env as Record<string, string>),
-    }).pipe(
+    // Stage: hand the whole privileged creation to the loopback portal broker.
+    // No secrets cross this boundary — the broker owns the master key. We read
+    // the body even on a non-2xx status so typed validation errors surface.
+    const response = yield* HttpClientRequest.post(BROKER_URL).pipe(
+      HttpClientRequest.bodyJsonUnsafe({
+        name,
+        robloxJson,
+        targetDir,
+        shareWithStaff: input.shareWithStaff,
+      }),
+      httpClient.execute,
+      Effect.flatMap(HttpClientResponse.schemaBodyJson(BrokerResponse)),
       Effect.mapError(
         (cause) =>
           new RobloxProjectScaffoldError({
             operation: "run-script",
             name,
-            detail: "Failed to run new-project.sh.",
+            detail: "Failed to reach the project-creation broker.",
             cause,
           }),
       ),
     );
-    if (scaffoldRun.code !== 0) {
-      return yield* new RobloxProjectScaffoldError({
-        operation: "run-script",
-        name,
-        detail: `new-project.sh exited with code ${scaffoldRun.code}.\n${redactSecrets(scaffoldRun.output, secretValues).slice(-MAX_SCRIPT_OUTPUT_TAIL)}`,
-      });
-    }
-    stages.push("scaffold", "repo");
-    const repositoryUrl = parseRepositoryUrl(scaffoldRun.output);
 
-    // Stage: wire ids + keys and push (wire-roblox.sh). Keys are passed through
-    // the environment, never argv, so they never appear in `ps` output.
-    const wireEnv: Record<string, string> = {
-      ...(process.env as Record<string, string>),
-      ROBLOX_TEST_API_KEY: Redacted.value(testKey),
-    };
-    if (prodKey !== undefined) {
-      wireEnv.ROBLOX_PROD_API_KEY = Redacted.value(prodKey);
-    }
-    const wireRun = yield* runScript("./wire-roblox.sh", [name, robloxArg], wireEnv).pipe(
-      Effect.mapError(
-        (cause) =>
-          new RobloxProjectWireError({
-            operation: "run-script",
-            name,
-            detail: "Failed to run wire-roblox.sh.",
-            cause,
-          }),
-      ),
-    );
-    if (wireRun.code !== 0) {
-      return yield* new RobloxProjectWireError({
-        operation: "run-script",
-        name,
-        detail: `wire-roblox.sh exited with code ${wireRun.code}.\n${redactSecrets(wireRun.output, secretValues).slice(-MAX_SCRIPT_OUTPUT_TAIL)}`,
-      });
-    }
-    if (wireReportedDownloadFailure(wireRun.output)) {
-      const retryHint =
-        repositoryUrl !== null
-          ? ` then re-run wire-roblox.sh for ${name}.`
-          : " then re-run wire-roblox.sh.";
-      return yield* new RobloxProjectWireError({
-        operation: "verify-download",
+    if (response.ok === false) {
+      const detail = (response.detail ?? "").slice(-MAX_DETAIL_TAIL);
+      if (response.stage === "verify-download") {
+        const retryHint =
+          response.repositoryUrl !== undefined
+            ? ` then re-run wiring for ${name}.`
+            : " then re-run the wiring step.";
+        return yield* new RobloxProjectWireError({
+          operation: "verify-download",
+          name,
+          detail:
+            `The repo and secrets were created, but the empirical asset-delivery download for the Test place failed: ` +
+            `the group master key is missing the "legacy-asset:manage" scope (Legacy Assets -> manage). ` +
+            `The plain "Assets" scope is NOT enough and returns 403 Forbidden. ` +
+            `Add that scope to the master key at https://create.roblox.com/dashboard/credentials,` +
+            retryHint,
+        });
+      }
+      if (response.stage === "wire") {
+        return yield* new RobloxProjectWireError({
+          operation: "run-script",
+          name,
+          detail: detail.length > 0 ? detail : "wire-roblox.sh failed in the broker.",
+        });
+      }
+      // "validate", "scaffold", or any other stage → scaffold error.
+      return yield* new RobloxProjectScaffoldError({
+        operation: response.stage === "validate" ? "validate-name" : "run-script",
         name,
         detail:
-          `The repo and secrets were created, but the empirical asset-delivery download for the Test place failed: ` +
-          `the test API key is missing the "legacy-asset:manage" scope (Legacy Assets -> manage). ` +
-          `The plain "Assets" scope is NOT enough and returns 403 Forbidden. ` +
-          `Add that scope to the test key at https://create.roblox.com/dashboard/credentials,` +
-          retryHint,
+          detail.length > 0 ? detail : `Broker rejected the request at stage "${response.stage}".`,
       });
     }
-    stages.push("wire", "deploy-triggered");
 
-    // Stage: relocate into the shared staff directory if requested. This runs
-    // after wire-roblox.sh, which operates on the $HOME/projects checkout.
-    if (input.shareWithStaff) {
-      yield* fileSystem
-        .makeDirectory(SHARED_PROJECTS_ROOT, { recursive: true })
-        .pipe(Effect.ignore);
-      yield* fileSystem.rename(homeProjectPath, finalPath).pipe(
-        Effect.mapError(
-          (cause) =>
-            new RobloxProjectScaffoldError({
-              operation: "relocate",
-              name,
-              detail: `Wired the project but failed to move it into ${SHARED_PROJECTS_ROOT}.`,
-              cause,
-            }),
-        ),
-      );
-    }
-
+    stages.push("scaffold", "repo", "wire", "deploy-triggered");
+    const repositoryUrl = response.repositoryUrl;
     const joinablePlaceLink = buildJoinablePlaceLink(roblox.workplacePlaceId ?? 0);
     const message =
-      `Roblox project "${name}" is fully wired at ${finalPath}. ` +
-      (repositoryUrl !== null ? `Repo: ${repositoryUrl}. ` : "") +
+      `Roblox project "${name}" is fully wired at ${targetDir}. ` +
+      (repositoryUrl !== undefined ? `Repo: ${repositoryUrl}. ` : "") +
       `The Test place will go live on the first deploy` +
       (joinablePlaceLink !== null ? ` — joinable at ${joinablePlaceLink}.` : ".");
 
     return {
-      projectPath: finalPath,
+      projectPath: targetDir,
       roblox,
       stages,
-      ...(repositoryUrl !== null ? { repositoryUrl } : {}),
+      ...(repositoryUrl !== undefined ? { repositoryUrl } : {}),
       ...(joinablePlaceLink !== null ? { joinablePlaceLink } : {}),
       message,
     };
