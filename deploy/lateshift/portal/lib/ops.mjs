@@ -55,7 +55,7 @@ const BRANCH_RE = /^[A-Za-z0-9._/-]{1,80}$/;
 // production unit t3code.service is deliberately ABSENT and also blocked by
 // PRODUCTION_UNITS below.
 const LOG_UNIT_RE =
-  /^(?:t3code@[a-z0-9-]{2,20}|lateshift-portal|caddy|lateshift-budget)\.service$/;
+  /^(?:t3code@[a-z0-9-]{2,20}|lateshift-portal|caddy)\.service$/;
 
 // ---------------------------------------------------------------- shell-out
 
@@ -227,10 +227,9 @@ async function status() {
   for (const name of Object.keys(users).sort()) {
     instances[name] = await isActive(`t3code@${name}.service`);
   }
-  const [portal, caddy, budgetTimer, prod, checkoutBranchR] = await Promise.all([
+  const [portal, caddy, prod, checkoutBranchR] = await Promise.all([
     isActive("lateshift-portal.service"),
     isActive("caddy.service"),
-    isActive("lateshift-budget.timer"),
     isActive("t3code.service"), // production — read-only health bit only
     run("git", ["-C", CHECKOUT, "rev-parse", "--abbrev-ref", "HEAD"], { timeoutMs: 10_000 }),
   ]);
@@ -240,7 +239,6 @@ async function status() {
       instances,
       "lateshift-portal": portal,
       caddy,
-      "lateshift-budget.timer": budgetTimer,
       "production(t3code.service)": prod, // read-only health bit, never a target
     },
     checkout: {

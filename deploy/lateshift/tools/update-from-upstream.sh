@@ -7,7 +7,7 @@
 #      On conflict the rebase is aborted and this script exits with instructions.
 #   2. Sync /home/dev/services/lateshift/checkout to the rebased branch.
 #   3. pnpm install + vp pack (apps/server) to rebuild dist/bin.mjs.
-#   4. Restart every t3code@<user> instance (skipping budget-paused ones) and
+#   4. Restart every t3code@<user> instance and
 #      health-check each on its local port.
 #
 # Run as dev:  bash /home/dev/services/lateshift/tools/update-from-upstream.sh
@@ -54,16 +54,12 @@ bash /home/dev/services/lateshift/tools/apply-branding.sh "${CHECKOUT}/apps/web/
 
 echo "== 4/4 restart instances =="
 python3 - <<'PYEOF'
-import json, os, subprocess, sys, time, urllib.request
+import json, subprocess, sys, time, urllib.request
 
 reg = json.load(open("/home/dev/services/lateshift/users.json"))
 failed = []
 for name, u in sorted(reg.get("users", {}).items()):
     unit = f"t3code@{name}.service"  # template instances only, never production
-    base = u.get("baseDir", "")
-    if os.path.exists(os.path.join(base, "BUDGET_PAUSED")):
-        print(f"{name}: budget-paused, leaving stopped")
-        continue
     r = subprocess.run(["sudo", "-n", "systemctl", "restart", unit], capture_output=True, text=True)
     if r.returncode != 0:
         print(f"{name}: restart FAILED: {r.stderr.strip()}", file=sys.stderr)
