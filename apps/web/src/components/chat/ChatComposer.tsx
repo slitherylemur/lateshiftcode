@@ -1012,7 +1012,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
    * and checked by `submitComposer` so a send can't race an image into the
    * next draft.
    */
-  const pendingImageCompressionsRef = useRef<Map<ThreadId, number>>(new Map());
+  const pendingImageCompressionsRef = useRef<Map<ThreadId | DraftId, number>>(new Map());
 
   // ------------------------------------------------------------------
   // Derived: composer send state
@@ -1832,7 +1832,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       // image: the turn snapshot wouldn't include it, and it would surface
       // in the *next* draft instead. Only oversized images hit this — small
       // files clear the pending counter within a microtask.
-      if (activeThreadId && (pendingImageCompressionsRef.current.get(activeThreadId) ?? 0) > 0) {
+      const imageCompressionTarget = activeThreadId ?? draftId;
+      if (
+        imageCompressionTarget &&
+        (pendingImageCompressionsRef.current.get(imageCompressionTarget) ?? 0) > 0
+      ) {
         event?.preventDefault();
         toastManager.add({
           type: "info",
@@ -1848,6 +1852,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     },
     [
       activeThreadId,
+      draftId,
       blurMobileComposerAfterSend,
       isSendDisabled,
       noProviderAvailable,
@@ -2295,7 +2300,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // Callbacks: images
   // ------------------------------------------------------------------
   const addComposerImages = async (files: File[]) => {
-    if (!activeThreadId || files.length === 0) return;
+    if (files.length === 0) return;
+    const attachmentTargetId = activeThreadId ?? draftId;
+    if (!attachmentTargetId) return;
     if (pendingUserInputs.length > 0) {
       toastManager.add({
         type: "error",
@@ -2303,15 +2310,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       });
       return;
     }
-    // Captured before the awaits below: the user may switch threads while a
-    // large image is being compressed, and the attachments and errors belong
-    // to the thread the paste happened in.
+    // Captured before the awaits below: the user may switch drafts/threads
+    // while a large image is being compressed. Draft composers do not have a
+    // thread id yet, so their draft id owns the pending-compression counter.
     const threadId = activeThreadId;
 
     // Validation happens synchronously so concurrent pastes see each other:
     // accepted files reserve their attachment slots (via the pending counter)
     // before the first await, keeping the total under the limit.
-    const pendingCount = pendingImageCompressionsRef.current.get(threadId) ?? 0;
+    const pendingCount = pendingImageCompressionsRef.current.get(attachmentTargetId) ?? 0;
     let reservedCount = composerImagesRef.current.length + pendingCount;
     const acceptedFiles: File[] = [];
     let error: string | null = null;
@@ -2327,10 +2334,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       acceptedFiles.push(file);
       reservedCount += 1;
     }
-    setThreadError(threadId, error);
+    if (threadId) setThreadError(threadId, error);
     if (acceptedFiles.length === 0) return;
 
-    pendingImageCompressionsRef.current.set(threadId, pendingCount + acceptedFiles.length);
+    pendingImageCompressionsRef.current.set(
+      attachmentTargetId,
+      pendingCount + acceptedFiles.length,
+    );
     try {
       const nextImages: ComposerImageAttachment[] = [];
       let compressionError: string | null = null;
@@ -2367,15 +2377,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       // thread error this call knows nothing about, and clearing it would
       // swallow that message.
       if (compressionError !== null) {
-        setThreadError(threadId, compressionError);
+        if (threadId) setThreadError(threadId, compressionError);
       }
     } finally {
       const remaining =
-        (pendingImageCompressionsRef.current.get(threadId) ?? 0) - acceptedFiles.length;
+        (pendingImageCompressionsRef.current.get(attachmentTargetId) ?? 0) - acceptedFiles.length;
       if (remaining > 0) {
-        pendingImageCompressionsRef.current.set(threadId, remaining);
+        pendingImageCompressionsRef.current.set(attachmentTargetId, remaining);
       } else {
-        pendingImageCompressionsRef.current.delete(threadId);
+        pendingImageCompressionsRef.current.delete(attachmentTargetId);
       }
     }
   };
