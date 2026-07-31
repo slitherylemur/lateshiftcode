@@ -4,6 +4,7 @@ import { useEffect, useRef } from "react";
 import type { PointerEvent } from "react";
 
 import { Button } from "../components/ui/button";
+import { toastManager } from "../components/ui/toast";
 import { readEnvironmentSupportsTranscription } from "../state/entities";
 import { useEnvironmentHttpBaseUrl } from "../state/environments";
 import { setTranscriptionBaseUrl } from "./transcriptionClient";
@@ -55,7 +56,30 @@ export function ComposerMicButton(props: ComposerMicButtonProps) {
     wasBrowserListeningRef.current = browserSpeech.isListening;
   }, [browserSpeech.isListening]);
 
-  if (!useServerRecorder && !browserSpeech.isSupported) return null;
+  if (!useServerRecorder && !browserSpeech.isSupported) {
+    return (
+      <Button
+        size="icon-sm"
+        variant="ghost"
+        className="rounded-full"
+        onPointerDown={preserveComposerFocus}
+        onClick={() =>
+          toastManager.add({
+            type: "error",
+            title: "Voice input unavailable",
+            description:
+              "This browser does not provide speech recognition. Open LateShift Cloud in Chrome or Edge to use dictation.",
+          })
+        }
+        disabled={disabled}
+        aria-label="Voice input unavailable in this browser"
+        title="Voice input requires Chrome or Edge"
+        data-chat-composer-voice="unsupported"
+      >
+        <MicIcon className="size-4" />
+      </Button>
+    );
+  }
 
   if (!useServerRecorder) {
     if (browserSpeech.isListening) {
