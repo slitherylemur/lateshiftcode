@@ -5,6 +5,7 @@ import { Button } from "../components/ui/button";
 import { readEnvironmentSupportsTranscription } from "../state/entities";
 import { useEnvironmentHttpBaseUrl } from "../state/environments";
 import { setTranscriptionBaseUrl } from "./transcriptionClient";
+import { useBrowserSpeechRecognition } from "./useBrowserSpeechRecognition";
 import { useVoiceRecording } from "./useVoiceRecording";
 
 function formatElapsed(ms: number): string {
@@ -20,28 +21,65 @@ export interface ComposerMicButtonProps {
   readonly disabled?: boolean;
 }
 
-/**
- * Voice-input control for the composer footer. Hidden entirely when the
- * environment server has no transcription credential configured (feature
- * detected via the environment descriptor capability) or when the browser
- * cannot record audio, so it never appears in a non-functional state.
- */
+/** Uses server transcription when advertised and browser dictation for stock servers. */
 export function ComposerMicButton(props: ComposerMicButtonProps) {
   const disabled = props.disabled ?? false;
-  const supported = readEnvironmentSupportsTranscription(props.environmentId);
+  const serverSupported = readEnvironmentSupportsTranscription(props.environmentId);
   const httpBaseUrl = useEnvironmentHttpBaseUrl(props.environmentId);
   setTranscriptionBaseUrl(httpBaseUrl);
-  const voice = useVoiceRecording({
+  const voice = useVoiceRecording({ onInsertTranscript: props.onInsertTranscript, disabled });
+  const browserSpeech = useBrowserSpeechRecognition({
     onInsertTranscript: props.onInsertTranscript,
     disabled,
   });
+  const useServerRecorder = serverSupported && voice.isSupported;
 
-  if (!supported || !voice.isSupported) {
-    return null;
+  if (!useServerRecorder && !browserSpeech.isSupported) return null;
+
+  if (!useServerRecorder) {
+    if (browserSpeech.isListening) {
+      return (
+        <div
+          className="flex items-center gap-1.5 rounded-full border border-input bg-popover py-0.5 pr-0.5 pl-2"
+          data-chat-composer-voice="recording"
+        >
+          <span
+            className="size-2 shrink-0 animate-pulse rounded-full bg-red-500"
+            aria-hidden="true"
+          />
+          <span className="text-xs tabular-nums text-muted-foreground" aria-live="polite">
+            {formatElapsed(browserSpeech.elapsedMs)}
+          </span>
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            className="rounded-full"
+            onClick={browserSpeech.stop}
+            aria-label="Stop voice input"
+            title="Stop voice input"
+          >
+            <SquareIcon className="size-3.5 fill-current" />
+          </Button>
+        </div>
+      );
+    }
+    return (
+      <Button
+        size="icon-sm"
+        variant="ghost"
+        className="rounded-full"
+        onClick={browserSpeech.start}
+        disabled={disabled}
+        aria-label="Dictate message"
+        title="Dictate message"
+        data-chat-composer-voice="idle"
+      >
+        <MicIcon className="size-4" />
+      </Button>
+    );
   }
 
   const { snapshot } = voice;
-
   if (snapshot.phase === "recording") {
     return (
       <div
@@ -123,9 +161,7 @@ export function ComposerMicButton(props: ComposerMicButtonProps) {
       size="icon-sm"
       variant="ghost"
       className="rounded-full"
-      onClick={() => {
-        void voice.start();
-      }}
+      onClick={() => void voice.start()}
       disabled={disabled}
       aria-label="Record voice message"
       title="Record voice message"
