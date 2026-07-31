@@ -25,6 +25,17 @@ interface SpeechRecognitionErrorEventLike extends Event {
   readonly message?: string;
 }
 
+function isSilenceError(event: SpeechRecognitionErrorEventLike): boolean {
+  const error = event.error?.toLowerCase().trim() ?? "";
+  const message = event.message?.toLowerCase().trim() ?? "";
+  return (
+    error === "no-speech" ||
+    error === "speech-timeout" ||
+    message.includes("no speech") ||
+    message.includes("speech timeout")
+  );
+}
+
 interface SpeechRecognitionLike extends EventTarget {
   continuous: boolean;
   interimResults: boolean;
@@ -114,7 +125,7 @@ export function useBrowserSpeechRecognition(options: {
     recognition.onerror = (event) => {
       // Silence is not a failure: Safari ends the current recognition window
       // and `onend` starts a fresh one while the user is still recording.
-      if (event.error === "no-speech") return;
+      if (isSilenceError(event)) return;
 
       const permissionDenied =
         event.error === "not-allowed" || event.error === "service-not-allowed";
