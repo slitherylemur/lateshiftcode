@@ -169,6 +169,7 @@ import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectValue } from "../ui/select";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
+import { ComposerMicButton } from "../../voice/ComposerMicButton";
 import {
   BotIcon,
   CircleAlertIcon,
@@ -3195,6 +3196,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     />
                   </>
                 )}
+                <ComposerMicButton
+                  environmentId={environmentId}
+                  onInsertTranscript={(text) =>
+                    insertComposerTextAtEnd(text, { ensureLeadingBoundary: true })
+                  }
+                  disabled={isConnecting || isComposerApprovalState}
+                />
               </div>
 
               {/* Right side: send / stop button */}

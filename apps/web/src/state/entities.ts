@@ -241,6 +241,17 @@ export function readEnvironmentSupportsSnooze(environmentId: EnvironmentId): boo
   );
 }
 
+/** Whether the environment server can transcribe recorded audio (an OpenAI
+    transcription credential is configured). Read defensively off the capability
+    bag so the fork needs no change to packages/contracts: a stock server that
+    does not advertise `speechTranscription` simply decodes to false and the
+    voice-input mic button stays hidden. */
+export function readEnvironmentSupportsTranscription(environmentId: EnvironmentId): boolean {
+  const capabilities = appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId)
+    ?.environment.capabilities as Record<string, unknown> | undefined;
+  return capabilities?.speechTranscription === true;
+}
+
 export function readThreadDetail(ref: ScopedThreadRef): EnvironmentThread | null {
   return appAtomRegistry.get(environmentThreadDetails.detailAtom(ref));
 }
