@@ -51,6 +51,7 @@ export function ComposerAttachButton(props: ComposerAttachButtonProps) {
         size="icon-sm"
         variant="ghost"
         className="rounded-full"
+        onPointerDown={(event) => event.preventDefault()}
         disabled={props.disabled ?? false}
         onClick={() => inputRef.current?.click()}
         aria-label="Attach a photo or file"
