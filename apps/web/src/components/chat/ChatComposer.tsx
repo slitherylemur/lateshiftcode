@@ -169,6 +169,7 @@ import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectValue } from "../ui/select";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
+import { ComposerAttachButton } from "../../attachments/ComposerAttachButton";
 import { ComposerMicButton } from "../../voice/ComposerMicButton";
 import {
   BotIcon,
@@ -3196,6 +3197,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     />
                   </>
                 )}
+                <ComposerAttachButton
+                  onFilesSelected={(files) => {
+                    void addComposerImages(files);
+                  }}
+                  disabled={isConnecting || isComposerApprovalState}
+                />
                 <ComposerMicButton
                   environmentId={environmentId}
                   onInsertTranscript={(text) =>
