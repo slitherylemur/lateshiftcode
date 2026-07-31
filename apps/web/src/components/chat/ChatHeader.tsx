@@ -19,6 +19,7 @@ import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useT3ProjectFileScripts } from "~/hooks/useT3ProjectFileScripts";
 import { ProjectFavicon } from "../ProjectFavicon";
 import { cn } from "~/lib/utils";
+import { projectTitleColor } from "~/projectTitleColor";
 
 interface ChatHeaderProps {
   activeThreadEnvironmentId: EnvironmentId;
@@ -26,6 +27,7 @@ interface ChatHeaderProps {
   draftId?: DraftId;
   activeThreadTitle: string;
   activeProjectName: string | undefined;
+  activeProjectColorKey: string | null;
   activeProjectCwd: string | null;
   openInCwd: string | null;
   activeProjectScripts: ReadonlyArray<ProjectScript> | undefined;
@@ -62,6 +64,7 @@ export const ChatHeader = memo(function ChatHeader({
   draftId,
   activeThreadTitle,
   activeProjectName,
+  activeProjectColorKey,
   activeProjectCwd,
   openInCwd,
   activeProjectScripts,
@@ -110,7 +113,16 @@ export const ChatHeader = memo(function ChatHeader({
                   cwd={activeProjectCwd ?? ""}
                   className="size-3.5"
                 />
-                <span className="max-w-40 truncate text-sm font-medium">{activeProjectName}</span>
+                <span
+                  className="max-w-40 truncate text-sm font-medium"
+                  style={
+                    activeProjectColorKey
+                      ? { color: projectTitleColor(activeProjectColorKey) }
+                      : undefined
+                  }
+                >
+                  {activeProjectName}
+                </span>
               </TooltipTrigger>
               <TooltipPopup side="top">New thread in {activeProjectName}</TooltipPopup>
             </Tooltip>

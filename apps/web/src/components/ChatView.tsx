@@ -1702,6 +1702,9 @@ function ChatViewContent(props: ChatViewProps) {
     [retryEnvironment],
   );
   const projectGroupingSettings = selectProjectGroupingSettings(settings);
+  const activeProjectColorKey = activeProject
+    ? deriveLogicalProjectKeyFromSettings(activeProject, projectGroupingSettings)
+    : null;
   const logicalProjectEnvironments = useMemo(() => {
     if (!activeProject) return [];
     const logicalKey = deriveLogicalProjectKeyFromSettings(activeProject, projectGroupingSettings);
@@ -5761,6 +5764,7 @@ function ChatViewContent(props: ChatViewProps) {
             {...(routeKind === "draft" && draftId ? { draftId } : {})}
             activeThreadTitle={activeThread.title}
             activeProjectName={activeProject?.title}
+            activeProjectColorKey={activeProjectColorKey}
             activeProjectCwd={activeProject?.workspaceRoot ?? null}
             openInCwd={gitCwd}
             activeProjectScripts={activeProject?.scripts}
