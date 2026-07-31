@@ -20,6 +20,7 @@ function formatElapsed(ms: number): string {
 export interface ComposerMicButtonProps {
   readonly environmentId: EnvironmentId;
   readonly onInsertTranscript: (text: string) => void;
+  readonly onRestoreComposerFocus?: () => void;
   readonly disabled?: boolean;
 }
 
@@ -34,6 +35,7 @@ export function ComposerMicButton(props: ComposerMicButtonProps) {
   const voice = useVoiceRecording({ onInsertTranscript: props.onInsertTranscript, disabled });
   const browserSpeech = useBrowserSpeechRecognition({
     onInsertTranscript: props.onInsertTranscript,
+    ...(props.onRestoreComposerFocus ? { onSessionEnd: props.onRestoreComposerFocus } : {}),
     disabled,
   });
   const useServerRecorder = serverSupported && voice.isSupported;

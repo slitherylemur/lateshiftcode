@@ -3218,6 +3218,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   onInsertTranscript={(text) =>
                     insertComposerTextAtEnd(text, { ensureLeadingBoundary: true })
                   }
+                  onRestoreComposerFocus={focusComposer}
                   disabled={isConnecting || isComposerApprovalState}
                 />
               </div>

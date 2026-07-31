@@ -72,12 +72,14 @@ export interface BrowserSpeechRecognitionApi {
 /** Browser-native dictation fallback for hosted clients paired to stock servers. */
 export function useBrowserSpeechRecognition(options: {
   readonly onInsertTranscript: (text: string) => void;
+  readonly onSessionEnd?: () => void;
   readonly disabled?: boolean;
 }): BrowserSpeechRecognitionApi {
   const [isListening, setIsListening] = useState(false);
   const [elapsedMs, setElapsedMs] = useState(0);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const transcriptRef = useRef("");
+  const interimTranscriptRef = useRef("");
   const startedAtRef = useRef(0);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const restartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -111,16 +113,24 @@ export function useBrowserSpeechRecognition(options: {
     recognition.interimResults = true;
     recognition.lang = navigator.language || "en-US";
     transcriptRef.current = "";
+    interimTranscriptRef.current = "";
     stopRequestedRef.current = false;
     recognitionRef.current = recognition;
 
     recognition.onresult = (event) => {
       let finalText = "";
+      let interimText = "";
       for (let index = event.resultIndex; index < event.results.length; index += 1) {
         const result = event.results[index];
-        if (result?.isFinal) finalText += result[0]?.transcript ?? "";
+        const text = result?.[0]?.transcript ?? "";
+        if (result?.isFinal) finalText += text;
+        else interimText += text;
       }
       transcriptRef.current += finalText;
+      // WebKit often never promotes its last hypothesis to `isFinal` when the
+      // user presses Stop. Preserve it so stopping dictation does not discard
+      // everything the user just said.
+      interimTranscriptRef.current = interimText;
     };
     recognition.onerror = (event) => {
       // Silence is not a failure: Safari ends the current recognition window
@@ -139,7 +149,7 @@ export function useBrowserSpeechRecognition(options: {
       });
     };
     recognition.onend = () => {
-      const transcript = transcriptRef.current.trim();
+      const transcript = `${transcriptRef.current} ${interimTranscriptRef.current}`.trim();
       if (!stopRequestedRef.current && !transcript) {
         restartTimeoutRef.current = setTimeout(() => {
           restartTimeoutRef.current = null;
@@ -163,7 +173,11 @@ export function useBrowserSpeechRecognition(options: {
       recognitionRef.current = null;
       setIsListening(false);
       transcriptRef.current = "";
+      interimTranscriptRef.current = "";
       if (transcript) options.onInsertTranscript(transcript);
+      // Restore through the composer's editor handle. document.activeElement
+      // is frequently body on iOS after WebKit closes speech recognition.
+      requestAnimationFrame(() => options.onSessionEnd?.());
     };
 
     try {
@@ -182,7 +196,7 @@ export function useBrowserSpeechRecognition(options: {
         description: "Could not start speech recognition in this browser.",
       });
     }
-  }, [clearTimer, options.disabled, options.onInsertTranscript]);
+  }, [clearTimer, options.disabled, options.onInsertTranscript, options.onSessionEnd]);
 
   useEffect(
     () => () => {
