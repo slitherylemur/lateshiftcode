@@ -1,5 +1,7 @@
 import type { EnvironmentId } from "@t3tools/contracts";
 import { Loader2Icon, MicIcon, RotateCcwIcon, SquareIcon, XIcon } from "lucide-react";
+import { useEffect, useRef } from "react";
+import type { PointerEvent } from "react";
 
 import { Button } from "../components/ui/button";
 import { readEnvironmentSupportsTranscription } from "../state/entities";
@@ -23,6 +25,8 @@ export interface ComposerMicButtonProps {
 
 /** Uses server transcription when advertised and browser dictation for stock servers. */
 export function ComposerMicButton(props: ComposerMicButtonProps) {
+  const focusTargetRef = useRef<HTMLElement | null>(null);
+  const wasBrowserListeningRef = useRef(false);
   const disabled = props.disabled ?? false;
   const serverSupported = readEnvironmentSupportsTranscription(props.environmentId);
   const httpBaseUrl = useEnvironmentHttpBaseUrl(props.environmentId);
@@ -33,6 +37,21 @@ export function ComposerMicButton(props: ComposerMicButtonProps) {
     disabled,
   });
   const useServerRecorder = serverSupported && voice.isSupported;
+
+  const preserveComposerFocus = (event: PointerEvent) => {
+    const activeElement = document.activeElement;
+    if (activeElement instanceof HTMLElement && activeElement !== document.body) {
+      focusTargetRef.current = activeElement;
+    }
+    event.preventDefault();
+  };
+
+  useEffect(() => {
+    if (wasBrowserListeningRef.current && !browserSpeech.isListening) {
+      requestAnimationFrame(() => focusTargetRef.current?.focus({ preventScroll: true }));
+    }
+    wasBrowserListeningRef.current = browserSpeech.isListening;
+  }, [browserSpeech.isListening]);
 
   if (!useServerRecorder && !browserSpeech.isSupported) return null;
 
@@ -54,7 +73,7 @@ export function ComposerMicButton(props: ComposerMicButtonProps) {
             size="icon-sm"
             variant="ghost"
             className="rounded-full"
-            onPointerDown={(event) => event.preventDefault()}
+            onPointerDown={preserveComposerFocus}
             onClick={browserSpeech.stop}
             aria-label="Stop voice input"
             title="Stop voice input"
@@ -69,7 +88,7 @@ export function ComposerMicButton(props: ComposerMicButtonProps) {
         size="icon-sm"
         variant="ghost"
         className="rounded-full"
-        onPointerDown={(event) => event.preventDefault()}
+        onPointerDown={preserveComposerFocus}
         onClick={browserSpeech.start}
         disabled={disabled}
         aria-label="Dictate message"
