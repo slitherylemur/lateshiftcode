@@ -54,6 +54,7 @@ export function ComposerMicButton(props: ComposerMicButtonProps) {
             size="icon-sm"
             variant="ghost"
             className="rounded-full"
+            onPointerDown={(event) => event.preventDefault()}
             onClick={browserSpeech.stop}
             aria-label="Stop voice input"
             title="Stop voice input"
@@ -68,6 +69,7 @@ export function ComposerMicButton(props: ComposerMicButtonProps) {
         size="icon-sm"
         variant="ghost"
         className="rounded-full"
+        onPointerDown={(event) => event.preventDefault()}
         onClick={browserSpeech.start}
         disabled={disabled}
         aria-label="Dictate message"
@@ -97,6 +99,7 @@ export function ComposerMicButton(props: ComposerMicButtonProps) {
           size="icon-sm"
           variant="ghost"
           className="rounded-full"
+          onPointerDown={(event) => event.preventDefault()}
           onClick={voice.stop}
           aria-label="Stop recording"
           title="Stop recording"
@@ -113,6 +116,7 @@ export function ComposerMicButton(props: ComposerMicButtonProps) {
         size="icon-sm"
         variant="ghost"
         className="rounded-full"
+        onPointerDown={(event) => event.preventDefault()}
         disabled
         aria-label="Transcribing recording"
         title="Transcribing…"
@@ -146,6 +150,7 @@ export function ComposerMicButton(props: ComposerMicButtonProps) {
           size="icon-sm"
           variant="ghost"
           className="rounded-full"
+          onPointerDown={(event) => event.preventDefault()}
           onClick={voice.discard}
           aria-label="Discard recording"
           title="Discard recording"
@@ -161,6 +166,7 @@ export function ComposerMicButton(props: ComposerMicButtonProps) {
       size="icon-sm"
       variant="ghost"
       className="rounded-full"
+      onPointerDown={(event) => event.preventDefault()}
       onClick={() => void voice.start()}
       disabled={disabled}
       aria-label="Record voice message"
