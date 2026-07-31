@@ -7,6 +7,7 @@ import {
 } from "@t3tools/contracts";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { memo } from "react";
+import { PlayIcon } from "lucide-react";
 import GitActionsControl from "../GitActionsControl";
 import { type DraftId } from "~/composerDraftStore";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
@@ -20,6 +21,29 @@ import { useT3ProjectFileScripts } from "~/hooks/useT3ProjectFileScripts";
 import { ProjectFavicon } from "../ProjectFavicon";
 import { cn } from "~/lib/utils";
 import { projectTitleColor } from "~/projectTitleColor";
+import { Button } from "../ui/button";
+
+const ROBLOX_PLACE_IDS: Readonly<Record<string, string>> = {
+  carball: "86507879847439",
+  skyjourney: "100961538595186",
+  "skyjourney-cloud": "100961538595186",
+  "ronopoly-game": "75270777594421",
+  "ronopoly-place": "87378746396232",
+  "ronopoly-menu": "87378746396232",
+};
+
+export function robloxPlaceIdForProject(
+  projectName: string | undefined,
+  projectCwd: string | null,
+): string | null {
+  const candidates = [projectName, projectCwd?.split(/[\\/]/).filter(Boolean).at(-1)];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const placeId = ROBLOX_PLACE_IDS[candidate.trim().toLowerCase()];
+    if (placeId) return placeId;
+  }
+  return null;
+}
 
 interface ChatHeaderProps {
   activeThreadEnvironmentId: EnvironmentId;
@@ -89,6 +113,10 @@ export const ChatHeader = memo(function ChatHeader({
     activeThreadEnvironmentId,
     primaryEnvironmentId,
   });
+  const robloxPlaceId = robloxPlaceIdForProject(activeProjectName, activeProjectCwd);
+  const robloxPlayUrl = robloxPlaceId
+    ? `https://www.roblox.com/games/start?placeId=${robloxPlaceId}`
+    : null;
   return (
     <div className="@container/header-actions flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
       <div className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden sm:gap-3">
@@ -153,16 +181,42 @@ export const ChatHeader = memo(function ChatHeader({
         )}
       >
         {activeProjectScripts && (
-          <ProjectScriptsControl
-            scripts={activeProjectScripts}
-            fileScripts={fileScripts}
-            keybindings={keybindings}
-            preferredScriptId={preferredScriptId}
-            onRunScript={onRunProjectScript}
-            onAddScript={onAddProjectScript}
-            onUpdateScript={onUpdateProjectScript}
-            onDeleteScript={onDeleteProjectScript}
-          />
+          <div className="max-md:portrait:hidden">
+            <ProjectScriptsControl
+              scripts={activeProjectScripts}
+              fileScripts={fileScripts}
+              keybindings={keybindings}
+              preferredScriptId={preferredScriptId}
+              onRunScript={onRunProjectScript}
+              onAddScript={onAddProjectScript}
+              onUpdateScript={onUpdateProjectScript}
+              onDeleteScript={onDeleteProjectScript}
+            />
+          </div>
+        )}
+        {robloxPlayUrl && (
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  size="xs"
+                  variant="outline"
+                  render={
+                    <a
+                      href={robloxPlayUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      aria-label={`Play ${activeProjectName ?? "Roblox place"}`}
+                    />
+                  }
+                />
+              }
+            >
+              <PlayIcon className="size-3.5" />
+              <span className="hidden @3xl/header-actions:inline">Play place</span>
+            </TooltipTrigger>
+            <TooltipPopup side="top">Open this place in Roblox</TooltipPopup>
+          </Tooltip>
         )}
         {showOpenInPicker && (
           <OpenInPicker
@@ -173,11 +227,13 @@ export const ChatHeader = memo(function ChatHeader({
           />
         )}
         {activeProjectName && (
-          <GitActionsControl
-            gitCwd={gitCwd}
-            activeThreadRef={scopeThreadRef(activeThreadEnvironmentId, activeThreadId)}
-            {...(draftId ? { draftId } : {})}
-          />
+          <div className="max-md:portrait:hidden">
+            <GitActionsControl
+              gitCwd={gitCwd}
+              activeThreadRef={scopeThreadRef(activeThreadEnvironmentId, activeThreadId)}
+              {...(draftId ? { draftId } : {})}
+            />
+          </div>
         )}
       </div>
     </div>
