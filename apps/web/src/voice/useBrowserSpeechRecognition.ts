@@ -69,15 +69,22 @@ export function useBrowserSpeechRecognition(options: {
   const transcriptRef = useRef("");
   const startedAtRef = useRef(0);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const restartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const stopRequestedRef = useRef(false);
 
   const clearTimer = useCallback(() => {
     if (intervalRef.current !== null) {
       clearInterval(intervalRef.current);
       intervalRef.current = null;
     }
+    if (restartTimeoutRef.current !== null) {
+      clearTimeout(restartTimeoutRef.current);
+      restartTimeoutRef.current = null;
+    }
   }, []);
 
   const stop = useCallback(() => {
+    stopRequestedRef.current = true;
     recognitionRef.current?.stop();
   }, []);
 
@@ -87,10 +94,13 @@ export function useBrowserSpeechRecognition(options: {
     if (Recognition === null) return;
 
     const recognition = new Recognition();
-    recognition.continuous = true;
+    // Safari frequently ends continuous recognition with `no-speech`. Short,
+    // automatically restarted sessions are more reliable on iOS.
+    recognition.continuous = false;
     recognition.interimResults = true;
     recognition.lang = navigator.language || "en-US";
     transcriptRef.current = "";
+    stopRequestedRef.current = false;
     recognitionRef.current = recognition;
 
     recognition.onresult = (event) => {
@@ -102,8 +112,13 @@ export function useBrowserSpeechRecognition(options: {
       transcriptRef.current += finalText;
     };
     recognition.onerror = (event) => {
+      // Silence is not a failure: Safari ends the current recognition window
+      // and `onend` starts a fresh one while the user is still recording.
+      if (event.error === "no-speech") return;
+
       const permissionDenied =
         event.error === "not-allowed" || event.error === "service-not-allowed";
+      stopRequestedRef.current = true;
       toastManager.add({
         type: "error",
         title: "Voice input failed",
@@ -113,10 +128,29 @@ export function useBrowserSpeechRecognition(options: {
       });
     };
     recognition.onend = () => {
+      const transcript = transcriptRef.current.trim();
+      if (!stopRequestedRef.current && !transcript) {
+        restartTimeoutRef.current = setTimeout(() => {
+          restartTimeoutRef.current = null;
+          try {
+            recognition.start();
+          } catch {
+            clearTimer();
+            recognitionRef.current = null;
+            setIsListening(false);
+            toastManager.add({
+              type: "error",
+              title: "Voice input failed",
+              description: "Could not restart speech recognition in this browser.",
+            });
+          }
+        }, 200);
+        return;
+      }
+
       clearTimer();
       recognitionRef.current = null;
       setIsListening(false);
-      const transcript = transcriptRef.current.trim();
       transcriptRef.current = "";
       if (transcript) options.onInsertTranscript(transcript);
     };
@@ -141,6 +175,7 @@ export function useBrowserSpeechRecognition(options: {
 
   useEffect(
     () => () => {
+      stopRequestedRef.current = true;
       clearTimer();
       recognitionRef.current?.abort();
       recognitionRef.current = null;
