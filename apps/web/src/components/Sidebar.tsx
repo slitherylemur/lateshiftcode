@@ -1,3 +1,4 @@
+import { projectTitleColor } from "../projectTitleColor";
 import {
   ArchiveIcon,
   ArrowUpDownIcon,
@@ -2259,7 +2260,10 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           )}
           <ProjectFavicon environmentId={project.environmentId} cwd={project.workspaceRoot} />
           <span className="flex min-w-0 flex-1 items-center gap-2">
-            <span className="truncate text-sm font-medium text-sidebar-foreground/90">
+            <span
+              className="truncate text-sm font-medium"
+              style={{ color: projectTitleColor(project.projectKey) }}
+            >
               {project.displayName}
             </span>
             {project.groupedProjectCount > 1 ? (

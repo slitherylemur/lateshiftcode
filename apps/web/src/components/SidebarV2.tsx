@@ -1,3 +1,4 @@
+import { projectTitleColor } from "../projectTitleColor";
 import { autoAnimate } from "@formkit/auto-animate";
 import { useAtomValue } from "@effect/atom-react";
 import {
@@ -2480,7 +2481,14 @@ export default function SidebarV2() {
                     ) : (
                       <FolderIcon className="size-4 shrink-0" />
                     )}
-                    <span className="min-w-0 flex-1 truncate">
+                    <span
+                      className="min-w-0 flex-1 truncate"
+                      style={
+                        scopedProjectGroup
+                          ? { color: projectTitleColor(scopedProjectGroup.projectKey) }
+                          : undefined
+                      }
+                    >
                       {scopedProjectGroup?.displayName ?? "All projects"}
                     </span>
                     <ChevronDownIcon className="-mr-px size-4 shrink-0" />
@@ -2514,7 +2522,12 @@ export default function SidebarV2() {
                               cwd={project.workspaceRoot}
                               className="size-4 shrink-0"
                             />
-                            <span className="min-w-0 truncate text-sm">{project.displayName}</span>
+                            <span
+                              className="min-w-0 truncate text-sm"
+                              style={{ color: projectTitleColor(project.projectKey) }}
+                            >
+                              {project.displayName}
+                            </span>
                             <button
                               type="button"
                               aria-label={`Project actions for ${project.displayName}`}
