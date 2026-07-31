@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { toastManager } from "../components/ui/toast";
 
+const MAX_RECORDING_MS = 10 * 60 * 1000;
+
 interface SpeechRecognitionAlternativeLike {
   readonly transcript: string;
 }
@@ -83,6 +85,7 @@ export function useBrowserSpeechRecognition(options: {
   const startedAtRef = useRef(0);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const restartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const maxTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stopRequestedRef = useRef(false);
 
   const clearTimer = useCallback(() => {
@@ -93,6 +96,10 @@ export function useBrowserSpeechRecognition(options: {
     if (restartTimeoutRef.current !== null) {
       clearTimeout(restartTimeoutRef.current);
       restartTimeoutRef.current = null;
+    }
+    if (maxTimeoutRef.current !== null) {
+      clearTimeout(maxTimeoutRef.current);
+      maxTimeoutRef.current = null;
     }
   }, []);
 
@@ -149,8 +156,12 @@ export function useBrowserSpeechRecognition(options: {
       });
     };
     recognition.onend = () => {
-      const transcript = `${transcriptRef.current} ${interimTranscriptRef.current}`.trim();
-      if (!stopRequestedRef.current && !transcript) {
+      if (!stopRequestedRef.current) {
+        // Safari ends recognition windows on its own after a phrase or a
+        // period of silence. Preserve any interim hypothesis, then keep the
+        // logical recording alive until the user stops it or the cap expires.
+        transcriptRef.current = `${transcriptRef.current} ${interimTranscriptRef.current}`.trim();
+        interimTranscriptRef.current = "";
         restartTimeoutRef.current = setTimeout(() => {
           restartTimeoutRef.current = null;
           try {
@@ -169,6 +180,7 @@ export function useBrowserSpeechRecognition(options: {
         return;
       }
 
+      const transcript = `${transcriptRef.current} ${interimTranscriptRef.current}`.trim();
       clearTimer();
       recognitionRef.current = null;
       setIsListening(false);
@@ -188,6 +200,10 @@ export function useBrowserSpeechRecognition(options: {
       intervalRef.current = setInterval(() => {
         setElapsedMs(Date.now() - startedAtRef.current);
       }, 250);
+      maxTimeoutRef.current = setTimeout(() => {
+        stopRequestedRef.current = true;
+        recognition.stop();
+      }, MAX_RECORDING_MS);
     } catch {
       recognitionRef.current = null;
       toastManager.add({
